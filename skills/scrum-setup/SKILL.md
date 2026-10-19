@@ -1,0 +1,18 @@
+---
+name: scrum-setup
+description: Install or repair Scrum Studio's bundled MCP and skills, or start its local website on Windows or macOS from an existing checkout.
+---
+
+Locate the user's existing Scrum Studio checkout; do not assume a machine-specific path. Requires Python 3.10+; MCP registration additionally requires Codex CLI on PATH. Use the checked-out `scripts/setup.py` with the selected Python interpreter: it backs up existing matching skills/config, installs bundled skills and registers the absolute interpreter/server paths, then probes stdio. Windows also offers setup.bat; macOS offers `bash setup.command` or `bash setup.sh`. Use --skills-only only when the user wants skills without MCP registration. Do not overwrite the whole Codex configuration manually.
+
+For a human-authorized repair of an installed legacy Codex skill blocked under CODEX_HOME/skills, use `--skills-only --client codex --repair-skill NAME` (for example codebase-memory). This verifies the entire skill/resources in ~/.agents/skills and archives the old copy outside discovery under the timestamped backup. It downloads nothing, rejects links and conflicting canonical content, and never changes the interpreter or broad filesystem permissions. Reopen/restart only affected idle workers so they discover the canonical path; do not interrupt unrelated active work. Missing skills remain missing; install them through their provider rather than fabricating instructions.
+
+Start the website with start.bat on Windows or `bash start.command` on macOS. These use scripts/launch.py and open the local browser after readiness. The website does not require Codex or a running chat. No OS login service is installed. Moving the checkout requires rerunning setup; close/reopen the Codex chat to load updated tools. Restart a running website after backend changes. Report actual probe results; preparing macOS files on Windows does not establish native Mac validation.
+
+Setup accepts --client codex (default), claude or both, copying skills into the appropriate client profile and registering the same stdio MCP. --skills-only can install the selected skills without the CLI. Claude quota telemetry uses an explicitly configured status-line feed via scripts/claude_usage.py; preserve existing settings/status-line behavior. CLI bridge execution requires separate human authorization and --allow-run; setup never launches workers.
+
+Distinguish an installed desktop app from a CLI detected in PATH. Do not infer that Claude is absent from a missing CLI lookup. On this workstation the Claude Windows app uses a separate shared account: do not open/probe/run that account or install/configure its client unless the human explicitly authorizes it later. Repository compatibility code and Codex-only setup can still be maintained.
+
+Stop the website with stop.bat (Windows) or bash stop.command/stop.sh (macOS), using the same SCRUM_PORT if customized. scripts/stop.py authenticates against the current checkout control record and waits for shutdown; never replace failure with broad process/port kills. MCP and agents continue independently. An older running server needs a manual restart once to support the control record. Native macOS behavior must be reported as unverified when testing only on Windows.
+
+The Agents page can create named managed CLI profiles from imported Markdown, a typed role or empty defaults. agent_manage supports the same operations through MCP; see scrum-agents. Profiles are local and ignored, require an already installed CLI, and honor usage/Stop. Install bundled updates through this setup script; no profile or worker is created by installation or a clean clone.

@@ -1,0 +1,25 @@
+# Local Scrum boards and machine-specific databases/backups
+.scrum/
+data/
+.scrum-migration-*/
+
+# Generated runtime files
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+/.playwright-cli/
+/output/playwright/
+
+# Local credentials and client configuration (keep examples in source)
+.env
+.env.*
+!.env.example
+/.codex/
+/.claude/
+/.agents/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

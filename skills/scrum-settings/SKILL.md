@@ -1,0 +1,20 @@
+---
+name: scrum-settings
+description: Read or change per-project Scrum Studio settings for agent work limits, workspace paths and evidence requirements through the MCP.
+---
+
+Use `project_settings(project)` to read settings unless session context already has them. Defaults: max_active_per_agent=1, require_evidence=true, workspace_root set to the registered project folder.
+
+- Apply changes only when requested by the human. Use the intended existing human profile as actor; resolve an ambiguous profile rather than inventing one or treating an agent profile as human. Call `project_settings(project,actor,...changed fields)` once, preserving other fields.
+- `max_active_per_agent` accepts 1..20. It counts unexpired In Progress task claims per agent in this project; humans are exempt. Renewing a current task does not consume another slot. Lowering below existing live usage fails; coordinate completion/release first rather than interrupting another worker.
+- `workspace_root` is the registered absolute project folder and is read-only in folder mode. To move a project, release its claims, move its folder, forget the old panel entry and open the new location. Legacy SCRUM_DB mode still permits human root changes after releasing live files.
+- `require_evidence` controls fresh verification evidence and a complete checklist on transitions to Done. Preserve it unless the user requests a change; an agent must not weaken policy to finish its own work.
+- Retain returned `settings_version` and pass it as `settings_seen` to subsequent `next_work` calls. Report the applied values briefly. The web exposes the same controls under Settings.
+
+Rulesets: task_sizing=Small|Balanced|Unrestricted (defaultSmall); session_stop_percent=92 and weekly_stop_percent=94 (consumed account quotas, configurable1..100); usage_guard=true pauses on unknown/stale quota; usage_check_seconds=60 (1..300). Change only for the human through project_settings and retain its settings_version. Explain that provider refresh delay and cooperative safe-stop latency prevent a strict provider-level hard cap. See scrum-rules and scrum-usage for execution.
+
+auto_resume_session_quota=false by default. Only a human-requested opt-in permits a connected CLI supervisor to continue previously authorized work after a recorded five-hour quota pause and a fresh verified new provider window below both stop thresholds. Manual pause/Stop, profile deletion and disabling the option cancel pending resume. Missing, stale or ambiguous telemetry keeps work paused even if usage_guard is off. A desktop chat or telemetry-only monitor cannot launch work; agent status reports that a compatible connected supervisor is required. Never enable this setting yourself or start a monitor solely because the option exists.
+
+workflow_mode=Auto|Light|Standard (default Auto), configurable by the human via project_settings or web Settings. Auto prefers Light for bounded Small single-agent tasks; Light expresses the same preference but never overrides eligibility. Both fall back to Standard for larger scope, dependencies/blockers or concurrent work. Standard always uses explicit selection/claim. workflow_status reports configured, effective and reason; the website shows the same operation status, recomputed from current task/project state. Empty projects show Standard / No actionable task, not proof of an active session. Do not poll it or change mode to bypass ownership/quota.
+
+Cost control: project_settings(max_parallel_agents=1..20) is human-only, default one. Atomic startup offers and actual claims share this project capacity; the same actor may resume its current work. Additional workers defer without model inference. Lowering the limit leaves active work intact and prevents new actors until capacity is free. The supervisor holds/renews its slot until process-exit cleanup, even if the worker has released its task. Existing quota/WIP/file ownership rules still apply. Never increase this limit to bypass a hold without human authorization.

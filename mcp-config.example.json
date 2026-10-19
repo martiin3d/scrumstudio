@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "scrum-studio": {
+      "command": "python",
+      "args": ["/absolute/path/to/SCRUM/mcp_server.py"]
+    }
+  }
+}
