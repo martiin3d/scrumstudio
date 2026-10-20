@@ -16,7 +16,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-GIT_DEFAULTS = {'git_merge':'Off', 'git_mode': 'Off', 'git_commit': 'Task', 'git_push': 'Group', 'git_base_branch': '', 'git_branch_prefix': 'scrum/', 'git_remote': 'origin'}
+GIT_DEFAULTS = {'git_cleanup':False, 'git_merge':'Off', 'git_mode': 'Off', 'git_commit': 'Task', 'git_push': 'Group', 'git_base_branch': '', 'git_branch_prefix': 'scrum/', 'git_remote': 'origin'}
 _jobs = threading.local()
 
 @contextmanager
@@ -34,9 +34,9 @@ def transaction_jobs():
 @contextmanager
 def checkout_lock(root):
     # Shared by all processes and folder boards using this same worktree.
-    location=_git(root,'rev-parse','--git-path','scrum-automation.lock')
+    location=_git(root,'rev-parse','--git-common-dir')
     if location.returncode:raise ValueError('Cannot locate Git worktree metadata')
-    path=Path(location.stdout.strip())
+    path=Path(location.stdout.strip())/'scrum-automation.lock'
     if not path.is_absolute():path=Path(root)/path
     try:fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
     except FileExistsError:raise ValueError('Git automation is already running for this checkout; retry later') from None
@@ -47,9 +47,10 @@ def checkout_lock(root):
 
 
 def validate(changed):
+    if 'git_cleanup' in changed and (type(changed['git_cleanup']) not in (bool,int) or changed['git_cleanup'] not in (0,1)):raise ValueError('git_cleanup must be boolean')
     if 'git_merge' in changed and changed['git_merge'] not in ('Off','Group'):raise ValueError('git_merge must be Off or Group')
-    if 'git_mode' in changed and changed['git_mode'] not in ('Off', 'Branches'):
-        raise ValueError('git_mode must be Off or Branches')
+    if 'git_mode' in changed and changed['git_mode'] not in ('Off', 'Branches','Worktrees'):
+        raise ValueError('git_mode must be Off, Branches or Worktrees')
     if 'git_commit' in changed and changed['git_commit'] not in ('Task', 'Group'):
         raise ValueError('git_commit must be Task or Group')
     if 'git_push' in changed and changed['git_push'] not in ('Group', 'Task', 'Never'):
@@ -75,12 +76,13 @@ def slug(text, limit=48):
 
 def branch_for(settings, task):
     """scrum/<group> for a context group, scrum/<CODE>-<title> otherwise."""
+    if task.get('git_branch'):return task['git_branch']
     prefix = settings.get('git_branch_prefix', 'scrum/')
     group = (task.get('context_group') or '').strip()
     return prefix + (slug(group) if group else task['code'].lower() + '-' + slug(task['title'], 40))
 
 def enabled(settings):
-    return settings.get('git_mode', 'Off') == 'Branches'
+    return settings.get('git_mode', 'Off') in ('Branches','Worktrees')
 
 def state(root):
     """(branch, dirty paths outside .scrum) or None when git is unusable."""
@@ -99,7 +101,11 @@ def state(root):
 def on_claim(root, settings, task):
     if not enabled(settings) or not root:return None
     try:
-        with checkout_lock(root):return _on_claim(root,settings,task)
+        with checkout_lock(root):
+            if settings.get('git_mode')=='Worktrees':
+                import git_worktrees
+                return git_worktrees.prepare(root,settings,task)
+            return _on_claim(root,settings,task)
     except (OSError,ValueError,subprocess.SubprocessError) as error:
         return {'branch':branch_for(settings,task),'error':str(error)[:300]}
 
@@ -147,7 +153,8 @@ def _on_claim(root, settings, task):
         return {'branch': target, 'error': str(error)[:300]}
 
 def _commit(root, settings, task, message):
-    files = task.get('files') or []
+    import git_worktrees
+    files = git_worktrees.files(root,task.get('files') or [])
     if not files:return {'committed':False,'reason':'no explicit planned files; automatic commit skipped'}
     root=Path(root).resolve();pathspec=[]
     for name in files:
@@ -207,7 +214,16 @@ def merge_completed(root,settings,source):
     if current.returncode or incoming.returncode:return {'merged':False,'error':'Source or target branch is missing'}
     before=current.stdout.strip();tip=incoming.stdout.strip()
     trees=_git(root,'worktree','list','--porcelain')
-    if trees.returncode or 'branch '+target in trees.stdout.splitlines():return {'merged':False,'error':'Target branch is checked out in a worktree; agent review required'}
+    if trees.returncode:return {'merged':False,'error':'Cannot inspect target worktrees'}
+    target_checkout=None
+    for record in trees.stdout.split('\n\n'):
+        if 'branch '+target in record.splitlines():
+            target_checkout=next((line[9:] for line in record.splitlines() if line.startswith('worktree ')),None)
+    if target_checkout:
+        canonical=settings.get('workspace_root','')
+        current_state=state(target_checkout)
+        if settings.get('git_mode')!='Worktrees' or not canonical or Path(target_checkout).resolve()!=Path(canonical).resolve() or not current_state or current_state[1]:
+            return {'merged':False,'error':'Target branch is checked out or dirty in a protected worktree; agent review required'}
     if _git(root,'merge-base','--is-ancestor',tip,before).returncode==0:
         merged=before
     elif _git(root,'merge-base','--is-ancestor',before,tip).returncode==0:
@@ -218,9 +234,12 @@ def merge_completed(root,settings,source):
         made=_git(root,'commit-tree',tree.stdout.splitlines()[0],'-p',before,'-p',tip,'-m','Merge '+source+' into '+base,timeout=10)
         if made.returncode:return {'merged':False,'error':'Could not create merge commit: '+made.stderr[-300:]}
         merged=made.stdout.strip()
-    update=_git(root,'update-ref',target,merged,before)
+    if target_checkout:
+        if _git(root,'rev-parse',target).stdout.strip()!=before:return {'merged':False,'error':'Target changed concurrently; agent must re-evaluate'}
+        update=_git(target_checkout,'merge','--ff-only','--no-edit',merged,timeout=10)
+    else:update=_git(root,'update-ref',target,merged,before)
     if update.returncode:return {'merged':False,'error':'Target changed concurrently; agent must re-evaluate'}
-    report={'merged':True,'target':base,'sha':merged,'source':source}
+    report={'merged':True,'target':base,'sha':merged,'source':source,'source_sha':tip}
     if settings.get('git_push')!='Never':
         try:
             pushed=_git(root,'push','--quiet',settings.get('git_remote','origin'),merged+':'+target,timeout=10)
@@ -264,6 +283,10 @@ def _finish(item):
             elif commit.get('committed') or commit.get('reason')=='nothing to commit':
                 try:report['merge']=merge_completed(root,settings,report['branch'])
                 except (OSError,ValueError,subprocess.SubprocessError) as error:report['merge']={'merged':False,'error':str(error)[:300]}
+    if settings.get('git_cleanup') and report.get('merge',{}).get('merged') and not report['merge'].get('error'):
+        import git_worktrees
+        try:report['cleanup']=git_worktrees.queue_cleanup(settings.get('workspace_root') or root,report['merge'],item['actor'])
+        except (OSError,ValueError,subprocess.SubprocessError) as error:report['cleanup']={'reason':'retained: '+str(error)[:300]}
     return report
 
 
@@ -287,6 +310,7 @@ def describe(report):
         parts.append('push: ' + push['reason'])
     if report.get('merge'):
         merge=report['merge'];parts.append('merged into '+merge['target'] if merge.get('merged') and not merge.get('error') else 'MERGE FAILED: '+merge.get('error','unknown'))
+    if report.get('cleanup'):parts.append('cleanup: '+report['cleanup'].get('reason','pending worker exit'))
     if report.get('note'):
         parts.append(report['note'])
     return '; '.join(parts) + '.'

@@ -291,9 +291,10 @@ class ManagedBridgeTest(unittest.TestCase):
     def test_immediate_profile_start_uses_role_and_stable_actor(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
             folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
+            workspace=folder/'isolated';workspace.mkdir()
             rpc=Mock()
             def call(name,args):
-                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture','git':{'worktree':str(workspace)}},'task':{'id':1,'code':'FIX-1'}}
                 if name=='worker_launch':return {'eligible':True,'id':1,'code':'FIX-1'} if args.get('action')=='reserve' else {'released':True}
                 if name=='projects':return [{'id':1,'uuid':'project','checkout':'checkout','path':str(folder),'available':True}]
                 if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'You review performance.','generation':1,'model':'fixture-model'}
@@ -310,6 +311,9 @@ class ManagedBridgeTest(unittest.TestCase):
             with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--profile','a'*32,'--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge,'command',return_value=['fake']) as command,patch.object(agent_bridge.subprocess,'Popen',side_effect=spawned) as spawn,patch.object(agent_bridge,'stop_child'),patch.object(agent_bridge.time,'sleep',side_effect=[None,KeyboardInterrupt]):
                 agent_bridge.main()
             spawn.assert_called_once()
+            self.assertEqual(spawn.call_args.kwargs['cwd'],workspace)
+            self.assertEqual(command.call_args.args[1],workspace)
+            self.assertEqual(command.call_args.kwargs['policy_folder'],folder)
             prompt=command.call_args.args[2]
             self.assertEqual(command.call_args.args[3],'fixture-model')
             self.assertIn('relative to each skill directory, never the target checkout',prompt)

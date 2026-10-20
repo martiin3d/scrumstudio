@@ -395,7 +395,7 @@ def open_project(args, connect):
 def portable_file(path, folder):
     if PureWindowsPath(path).is_absolute() or Path(path).is_absolute():
         try:
-            return Path(path).resolve().relative_to(folder).as_posix()
+            return __import__('git_worktrees').logical(folder,Path(path)).relative_to(folder).as_posix()
         except ValueError:
             raise ValueError('Task file plan outside project folder cannot be exported') from None
     parts = PurePosixPath(path.replace('\\','/'))

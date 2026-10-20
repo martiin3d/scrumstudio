@@ -1,4 +1,5 @@
 import json
+import git_worktrees
 import os
 import sqlite3
 import unicodedata
@@ -113,9 +114,20 @@ def git_claim(db, project, row, prefix, actor):
     import git_sync
     project_row=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
     if not git_sync.enabled(coord.settings(project_row)):return None
-    task={'code':f"{prefix}-{row['number']}",'title':row['title'],'context_group':row['context_group'] if 'context_group' in row.keys() else ''}
+    if coord.settings(project_row).get('git_mode')=='Worktrees':
+        import storage
+        storage.ensure_uids(db)
+        row=db.execute('SELECT * FROM tasks WHERE id=?',(row['id'],)).fetchone()
+    task={'id':row['id'],'uid':row['uid'] if 'uid' in row.keys() else None,'code':f"{prefix}-{row['number']}",'title':row['title'],'context_group':row['context_group'] if 'context_group' in row.keys() else ''}
     settings=coord.settings(project_row)
-    active=db.execute("SELECT id,number,title,context_group FROM tasks WHERE project=? AND id!=? AND status='In Progress' AND lock_until>?",(project,row['id'],time.time())).fetchall()
+    active=db.execute("SELECT * FROM tasks WHERE project=? AND id!=? AND status='In Progress' AND lock_until>?",(project,row['id'],time.time())).fetchall()
+    if settings.get('git_mode')=='Worktrees':
+        if row['category']=='Git recovery' and active:
+            return {'busy':{'current_branch':'canonical','wanted':'Git recovery','reason':'Finish active work before Git recovery','dirty':[],'dirty_total':0}}
+        desired=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(row)) or git_sync.branch_for(settings,task)
+        if any((git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(r)) or git_sync.branch_for(settings,{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']}))==desired for r in active):
+            return {'busy':{'current_branch':desired,'wanted':desired,'reason':'Another active task owns this context-group workspace','dirty':[],'dirty_total':0}}
+        active=[]
     # Even a clean working tree belongs to active workers; never switch it.
     if any(git_sync.branch_for(settings,{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']})!=git_sync.branch_for(settings,task) for r in active):
         current=git_sync.state(project_row['workspace_root'])
@@ -147,7 +159,9 @@ def git_done(db, project, t, prefix, actor):
         members=[{'id':r['id'],'code':f"{prefix}-{r['number']}",'status':r['status'],'files':json.loads(r['files'])} for r in db.execute('SELECT id,number,status,files FROM tasks WHERE project=? AND context_group=? ORDER BY id',(project,group))]
         group_done=all(m['status'] in ('Done','Cancelled') for m in members)
     task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
-    report=git_sync.on_done(db,project_row['workspace_root'],settings,task,project,actor,group_done,members)
+    root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(t))
+    task['git_branch']=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(t))
+    report=git_sync.on_done(db,root,settings,task,project,actor,group_done,members)
     # The Git job runs after this database transaction commits.
     if report and not report.get('queued'):activity(db,t['id'],actor,'comment',git_sync.describe(report))
     return report
@@ -304,6 +318,13 @@ def run(action, a):
     if jobs and isinstance(result,dict):
         pushes=git_sync.flush(run,jobs,result,a.get('project'))
         if pushes:result['git_push']=pushes
+    if action=='agent_checkpoint' and a.get('action')=='offline' and 'run_exit_code' in a and isinstance(result,dict):
+        policy=_run('project_settings',{'project':a['project']})
+        if policy.get('git_cleanup') and policy.get('workspace_root'):
+            try:
+                cleaned=git_worktrees.cleanup(policy['workspace_root'],a['actor'],lambda source:_run('git_cleanup_pending',{'project':a['project'],'branch':source}))
+                if cleaned:result['git_cleanup']=cleaned
+            except (OSError,ValueError) as error:result['git_cleanup_error']=str(error)[:300]
     return result
 
 def _run(action, a):
@@ -441,13 +462,17 @@ def legacy_run(action, a, path=None, locks=None):
         if action=='git_note':  # internal: record a post-transaction git outcome
             activity(db,a['id'],a.get('actor'),'comment',a['text'])
             return {'saved':True}
+        if action=='git_cleanup_pending':  # native-only, no model context
+            rows=[dict(r) for r in db.execute('SELECT id,uid,number,title,context_group,dependencies,status FROM tasks WHERE project=?',(project,))]
+            return git_worktrees.related_pending(project_row['workspace_root'],a['branch'],rows,coord.settings(project_row),prefix)
         if action=='task_changes':
-            row=db.execute('SELECT files FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone()
+            row=db.execute('SELECT * FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone()
             if not row:
                 raise ValueError('Task not found')
             root=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]
             if not root:
                 raise ValueError('Project has no workspace folder; open the project folder first')
+            root=git_worktrees.workspace(root,git_worktrees.identity(row))
             subset=a.get('files')
             if subset is not None:
                 subset=coord.file_plan(subset)
@@ -583,7 +608,7 @@ def legacy_run(action, a, path=None, locks=None):
                 # Fresh claim: tell the worker which planned files were already edited on
                 # disk (not its work) so it reviews them before building on them.
                 import git_changes
-                baseline=git_changes.dirty(root,plan)
+                baseline=git_changes.dirty(git_worktrees.workspace(root,git_worktrees.identity(db.execute('SELECT * FROM tasks WHERE id=?',(row['id'],)).fetchone())),plan)
                 if baseline:claimed['dirty_planned']=baseline[:20]
                 if git:claimed['git']=git
             return claimed

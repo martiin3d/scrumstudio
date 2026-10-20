@@ -1,5 +1,6 @@
 """Local cooperative agent control. Never exported, never fabricates usage."""
 import math
+import git_worktrees
 import time
 import json
 import telemetry
@@ -176,7 +177,7 @@ def handoff(db, project, actor, why, text, now, activity):
             if prior and not any(prior in part for part in parts):parts.append(prior[:800])
         import git_changes
         # Factual edit list from local code: the next session knows what to inspect.
-        edits=git_changes.summary(root,json.loads(task['files'] or '[]'))
+        edits=git_changes.summary(git_worktrees.inspection_root(root,git_worktrees.identity(task)),json.loads(task['files'] or '[]'))
         if edits:parts.append(edits)
         if len(parts)==1:parts.append('No progress recorded; inspect partial edits.')
         parts.append('Next: reclaim task/files, inspect partial edits, resume unchecked work; retain recorded verification unless changes invalidate it.')

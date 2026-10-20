@@ -14,7 +14,8 @@ def _git(root, *args):
                           encoding='utf-8', errors='replace', timeout=3, creationflags=flags)
 
 def _relative(root, path):
-    value = Path(path)
+    import git_worktrees
+    value = Path(git_worktrees.files(root,[path])[0])
     if value.is_absolute():
         try:
             value = value.resolve().relative_to(Path(root).resolve())

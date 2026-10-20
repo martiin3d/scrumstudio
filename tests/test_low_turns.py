@@ -46,7 +46,7 @@ class PreclaimTest(unittest.TestCase):
     setUp=test_app.WorkflowTest.setUp
     tearDown=test_app.WorkflowTest.tearDown
 
-    def test_supervisor_claims_before_inference_and_falls_back(self):
+    def test_supervisor_claims_before_inference_and_holds_on_failure(self):
         import agent_bridge
         task=run('task_create',dict(project=self.p,title='Offered',**SPEC))['id']
         rpc=Mock();rpc.call.side_effect=lambda name,args:run(name,args)
@@ -57,7 +57,7 @@ class PreclaimTest(unittest.TestCase):
         self.assertIn('Do NOT call work_start',text);self.assertIn(started['token'],text)
         self.assertIn('Checked.',text)
         failing=Mock();failing.call.side_effect=RuntimeError('down')
-        self.assertEqual(agent_bridge.preclaim(failing,self.p,self.actor,'claude',task,observed),{})
+        self.assertTrue(agent_bridge.preclaim(failing,self.p,self.actor,'claude',task,observed)['should_stop'])
         stopped=agent_bridge.preclaim(rpc,self.p,self.actor,'claude',task,{'session_used_percent':99,'weekly_used_percent':1,'observed_at':time.time()})
         self.assertTrue(stopped['should_stop'])
 

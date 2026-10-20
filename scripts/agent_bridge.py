@@ -48,7 +48,7 @@ def skill_options():
         return ['-c','skills.config='+value] if entries else []
     except (OSError,ValueError,KeyError,TypeError):return []
 
-def command(client,folder,prompt,model=''):
+def command(client,folder,prompt,model='',policy_folder=None):
     model=model_name(model)
     model_args=['--model',model] if model else []
     executable=codex_executable() if client=='codex' else shutil.which(client)
@@ -58,7 +58,7 @@ def command(client,folder,prompt,model=''):
         options=['-c','approval_policy="on-request"','-c','approvals_reviewer="auto_review"']
         options+=skill_options()
         import mcp_selection
-        options+=mcp_selection.codex_options(folder)
+        options+=mcp_selection.codex_options(policy_folder or folder)
         options+=['-c','default_permissions="scrum-worker"','-c','permissions.scrum-worker.extends=":workspace"']
         codex_home=Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))
         read_paths=(codex_home/'skills',Path.home()/'.agents/skills',Path(sys.executable).resolve().parent)
@@ -70,7 +70,7 @@ def command(client,folder,prompt,model=''):
     # (for example Unity or codebase-memory) instead of hiding required tools. Headless -p cannot
     # answer permission prompts, so the Scrum tools and workspace edits are
     # pre-approved explicitly; nothing bypasses permissions.
-    config,strict=claude_mcp_config(folder,with_mode=True)
+    config,strict=claude_mcp_config(policy_folder or folder,with_mode=True)
     return [executable,'-p','Follow the Scrum task instructions supplied on stdin.','--output-format','stream-json','--verbose',*model_args,
             '--mcp-config='+str(config),*(['--strict-mcp-config'] if strict else []),'--permission-mode=acceptEdits',
             '--allowedTools='+','.join(CLAUDE_WORK_TOOLS+tuple('mcp__scrum-studio__'+name for name in SCRUM_WORK_TOOLS))]
@@ -387,6 +387,10 @@ def main():
                         continue
                     if started.get('task'):
                         prompt=prompt[:prompt.index('\nValidated provider quota: ')].replace('Claim an eligible task/files (claimed=true) ONLY for ','Work ONLY on ')+preclaimed_prompt(started)
+                    run_folder=Path(started.get('git',{}).get('worktree') or folder)
+                    if run_folder!=folder:
+                        prompt=prompt.replace(' in '+str(folder)+'.',' in '+str(run_folder)+'.')
+                        prompt+='\nWorking directory: '+str(run_folder)+'. The board stays at '+str(folder)+'; keep its project ID. Edit only this worktree. Use relative file plans so central reservations match across workers. Do not open/register this worktree as a new Scrum project. Verify graph results against source in this worktree.'
                     log_path=folder/'.scrum'/'local'/('worker-'+args.client+'-'+args.worker+'.log')
                     output=open(log_path,'a',encoding='utf-8');log_offset=output.tell()
                     options={'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {'start_new_session':True}
@@ -396,7 +400,7 @@ def main():
                         seen_model=''
                         with tempfile.TemporaryFile(mode='w+b') as prompt_input:
                             prompt_input.write(prompt.encode('utf-8'));prompt_input.seek(0)
-                            child=subprocess.Popen(command(args.client,folder,prompt,selected_model),cwd=folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**os.environ,'SCRUM_BRIDGE_WORKER':'1'},**options)
+                            child=subprocess.Popen(command(args.client,run_folder,prompt,selected_model,policy_folder=folder),cwd=run_folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**os.environ,'SCRUM_BRIDGE_WORKER':'1'},**options)
                     except (OSError,RuntimeError,ValueError) as error:
                         run_id=''
                         release_launch(rpc,args.project,actor)

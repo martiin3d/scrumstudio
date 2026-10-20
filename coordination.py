@@ -1,5 +1,6 @@
 """Project policy and advisory file reservations shared by the web and MCP."""
 import hashlib
+import git_worktrees
 import os
 import secrets
 import time
@@ -63,7 +64,7 @@ def migrate(db, separate=False):
 
 
 def settings(row):
-    return {k: bool(row[k]) if k in ['require_evidence','usage_guard','auto_resume_session_quota'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+    return {k: bool(row[k]) if k in ['require_evidence','usage_guard','auto_resume_session_quota','git_cleanup'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
 
 
 def active_count(db, project, actor, exclude=-1):
@@ -103,6 +104,7 @@ def canonical_paths(root, paths):
     for value in paths:
         path=Path(value)
         path=(path if path.is_absolute() else base/path).resolve()
+        path=git_worktrees.logical(base,path)
         try:
             path.relative_to(base)
         except ValueError:
@@ -152,7 +154,7 @@ def resumable(db, project_row, actor, limit=5):
     """Own unfinished work left by an earlier session: resume it, never redo it."""
     from store import project_prefix
     prefix=project_prefix(project_row['name'])
-    rows=db.execute("SELECT id,number,title,status,continuity,lock_until,files FROM tasks WHERE project=? AND owner_id=? AND status IN ('In Progress','TODO','Blocked','In Review') AND (status='In Progress' OR continuity!='') ORDER BY updated DESC,id DESC LIMIT ?",(project_row['id'],actor,limit)).fetchall()
+    rows=db.execute("SELECT * FROM tasks WHERE project=? AND owner_id=? AND status IN ('In Progress','TODO','Blocked','In Review') AND (status='In Progress' OR continuity!='') ORDER BY updated DESC,id DESC LIMIT ?",(project_row['id'],actor,limit)).fetchall()
     result=[]
     for r in rows:
         item={'id':r['id'],'code':f"{prefix}-{r['number']}",'title':r['title'],'status':r['status'],'continuity':(r['continuity'] or '')[:400]}
@@ -160,7 +162,7 @@ def resumable(db, project_row, actor, limit=5):
             # Crash or expired claim without a handoff: report the edits on disk.
             import git_changes,json
             item['interrupted']=True
-            item['edits']=git_changes.summary(project_row['workspace_root'],json.loads(r['files'] or '[]'))
+            item['edits']=git_changes.summary(git_worktrees.inspection_root(project_row['workspace_root'],git_worktrees.identity(r)),json.loads(r['files'] or '[]'))
         result.append(item)
     return result
 
@@ -200,6 +202,12 @@ def operation(db, action, a, project_row, actor_user, activity, now):
                 raise ValueError('Release excess active tasks before lowering the limit')
         if 'require_evidence' in changed and type(changed['require_evidence']) is not bool:
             raise ValueError('require_evidence must be boolean')
+        if 'git_mode' in changed and changed['git_mode']!=current['git_mode'] and db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchone():
+            raise ValueError('Finish or safely pause active tasks before changing Git workspace mode')
+        if 'git_mode' in changed and current['git_mode']=='Worktrees' and changed['git_mode']!='Worktrees':
+            saved=git_worktrees.entries(current['workspace_root'])
+            if any(git_worktrees.identity(r) in saved for r in db.execute("SELECT * FROM tasks WHERE project=? AND status NOT IN ('Done','Cancelled')",(project,))):
+                raise ValueError('Complete or cancel tasks with saved workspaces before leaving Worktrees mode')
         if 'workspace_root' in changed:
             root=changed['workspace_root']
             if not isinstance(root,str) or len(root)>1024 or '\x00' in root or (root and not Path(root).is_absolute()):
