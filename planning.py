@@ -31,7 +31,7 @@ def apply(db,a,project):
             if old['status'] in ('Done','Cancelled') or old['lock_until']>time.time():
                 raise ValueError('Plan only unfinished tasks without an active claim; preserve current work')
         title=required(item.get('title'),'title',240)
-        same=None if old else duplicate_task(db,project,title,a)
+        same=None if old else duplicate_task(db,project,title,{**a,**item})
         if same:
             # Reused outcomes still reject invalid planning input.
             from store import validate_verification

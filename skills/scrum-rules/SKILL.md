@@ -3,7 +3,7 @@ name: scrum-rules
 description: Apply Scrum Studio task sizing and planning rules - decide when to group or split work so one agent saves tokens and other agents can take tasks in parallel, with no duplicates or speculative backlog.
 ---
 
-Before the first claim, map the whole known authorized scope to existing or new TODO tasks in one `task_plan(project, actor, items)` call (1..10 items: key, title, description, acceptance_criteria; optional id to refine an unlocked unfinished task, files, dependencies by id or key, model_tier). It is atomic and never claims. Search first (`task_search`); same-title items come back `existing=true` and are reused.
+Before the first claim, map the whole known authorized scope to existing or new TODO tasks in one `task_plan(project, actor, items)` call (1..10 items: key, title, description, acceptance_criteria; optional id to refine an unlocked unfinished task, files, dependencies by id or key, model_tier). It is atomic and never claims. Search first (`task_search`); identical scope/criteria can return `existing=true`; matching titles alone do not suppress new requirements.
 
 ## Group or split
 

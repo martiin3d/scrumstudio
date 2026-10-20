@@ -21,7 +21,7 @@ The website is the human-facing dashboard. The MCP server exposes the same proje
 2. Prefer small, independently verifiable outcomes. Explain cohesive grouping; avoid speculative backlog and one-task-per-file fragmentation.
 3. Resume with the latest relevant retrospective, cached policy and a review of obsolete own file reservations.
 4. Claim a task and planned files, do useful work between calls, and record meaningful progress or blockers.
-5. Review the task's own uncommitted diff once (`task_changes`, computed from git without a model call) and record a short before/after assessment with the finish call. Complete only with actual verification evidence. On interruption, save recorded progress and remaining checks, return unfinished work to TODO and release owned reservations.
+5. Review changes proportionally, reusing an already inspected diff. Request `task_changes` on demand; reading its output consumes model context. Complete only with actual verification evidence. On interruption, save recorded progress and remaining checks, return unfinished work to TODO and release owned reservations.
 
 Task creation alone does not authorize execution. The skills provide procedural guidance; the server enforces supported state, ownership and policy checks.
 

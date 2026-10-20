@@ -57,50 +57,65 @@ def command(client,folder,prompt,model=''):
     if client=='codex':
         options=['-c','approval_policy="on-request"','-c','approvals_reviewer="auto_review"']
         options+=skill_options()
+        import mcp_selection
+        options+=mcp_selection.codex_options(folder)
         options+=['-c','default_permissions="scrum-worker"','-c','permissions.scrum-worker.extends=":workspace"']
         codex_home=Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))
         read_paths=(codex_home/'skills',Path.home()/'.agents/skills',Path(sys.executable).resolve().parent)
         options+=['-c','permissions.scrum-worker.filesystem={'+','.join(json.dumps(path.as_posix())+'="read"' for path in read_paths)+'}']
-        options+=['-c','mcp_servers.scrum-studio.command='+json.dumps(sys.executable),'-c','mcp_servers.scrum-studio.args='+json.dumps([str(ROOT/'mcp_server.py'),'--worker-schema']),'-c','mcp_servers.scrum-studio.enabled_tools='+json.dumps(SCRUM_WORK_TOOLS),'-c','mcp_servers.scrum-studio.default_tools_approval_mode="approve"']
+        options+=['-c','mcp_servers.scrum-studio.enabled=true','-c','mcp_servers.scrum-studio.command='+json.dumps(sys.executable),'-c','mcp_servers.scrum-studio.args='+json.dumps([str(ROOT/'mcp_server.py'),'--worker-schema']),'-c','mcp_servers.scrum-studio.enabled_tools='+json.dumps(SCRUM_WORK_TOOLS),'-c','mcp_servers.scrum-studio.default_tools_approval_mode="approve"']
         return [executable,*options,'exec','--json','--skip-git-repo-check','--cd',str(folder),*model_args,'-']
     # Claude CLI: same worker catalog as Codex. A config file (not inline JSON)
-    # survives Windows .cmd quoting; --strict-mcp-config keeps the user's other
-    # MCP servers (and their tool tokens) out of worker runs. Headless -p cannot
+    # survives Windows .cmd quoting. Preserve configured project MCP servers
+    # (for example Unity or codebase-memory) instead of hiding required tools. Headless -p cannot
     # answer permission prompts, so the Scrum tools and workspace edits are
     # pre-approved explicitly; nothing bypasses permissions.
+    config,strict=claude_mcp_config(folder,with_mode=True)
     return [executable,'-p','Follow the Scrum task instructions supplied on stdin.','--output-format','stream-json','--verbose',*model_args,
-            '--mcp-config='+str(claude_mcp_config()),'--strict-mcp-config','--permission-mode=acceptEdits',
+            '--mcp-config='+str(config),*(['--strict-mcp-config'] if strict else []),'--permission-mode=acceptEdits',
             '--allowedTools='+','.join(CLAUDE_WORK_TOOLS+tuple('mcp__scrum-studio__'+name for name in SCRUM_WORK_TOOLS))]
 
 CLAUDE_WORK_TOOLS=('Read','Edit','Write','Glob','Grep','Bash(python:*)','Bash(python3:*)','Bash(py:*)','Bash(git status:*)','Bash(git diff:*)')
 
-def claude_mcp_config():
-    path=ROOT/'data'/'claude-worker-mcp.json'
-    text=json.dumps({'mcpServers':{'scrum-studio':{'type':'stdio','command':sys.executable,'args':[str(ROOT/'mcp_server.py'),'--worker-schema']}}},indent=2)
-    try:
-        if path.read_text(encoding='utf-8')==text:return path
-    except OSError:pass
+def claude_mcp_config(folder=None,with_mode=False):
+    import mcp_selection
+    folder=Path(folder) if folder is not None else ROOT
+    servers,strict=mcp_selection.claude_config(folder,{'type':'stdio','command':sys.executable,'args':[str(ROOT/'mcp_server.py'),'--worker-schema']})
+    path=folder/'.scrum/local/claude-worker-mcp.json'
+    text=json.dumps({'mcpServers':servers},indent=2)
     path.parent.mkdir(parents=True,exist_ok=True)
-    temporary=path.with_suffix('.tmp');temporary.write_text(text,encoding='utf-8');os.replace(temporary,path)
-    return path
+    try:
+        if path.read_text(encoding='utf-8')==text:return (path,strict) if with_mode else path
+    except FileNotFoundError:pass
+    fd,tmp=tempfile.mkstemp(prefix='claude-worker-',suffix='.tmp',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as stream:stream.write(text)
+        os.replace(tmp,path)
+    finally:Path(tmp).unlink(missing_ok=True)
+    return (path,strict) if with_mode else path
+
 
 def preclaim(rpc,project,actor,client,task,observed):
-    """Claim the offered task before inference; any failure falls back to the worker claiming."""
+    """Claim the offered task before inference; never launch an unclaimed worker."""
     try:
         result=rpc.call('work_start',{'project':project,'actor':actor,'client':client,'id':task,'claim':True,**observed})
-    except RuntimeError:
-        return {}
+    except RuntimeError as error:
+        return {'should_stop':True,'reason':'Task reservation failed: '+str(error)[:500]}
     if result.get('checkpoint',{}).get('should_stop'):
         return {'should_stop':True,'reason':result['checkpoint'].get('reason','Stop/quota policy')}
     claim=result.get('claim') or {}
     if not claim.get('claimed') or not result.get('task'):
-        return {}
-    return {'task':result['task'],'token':claim['token']}
+        busy=claim.get('branch_busy') or {}
+        branch_reason=('Checkout branch '+str(busy.get('current_branch','unknown'))+' cannot switch to '+str(busy.get('wanted','task branch'))+': '+str(busy.get('reason') or 'uncommitted work must be preserved')) if busy else ''
+        reason=result.get('claim_deferred') or claim.get('reason') or branch_reason or 'Task ownership was not granted; inspect dependencies, file reservations and workflow policy'
+        return {'should_stop':True,'reason':str(reason)[:500]}
+    return {'task':result['task'],'token':claim['token'],**{k:claim[k] for k in ('dirty_planned','git') if k in claim}}
 
 def preclaimed_prompt(started):
     task=started['task']
-    return ('\nThe supervisor already ran work_start and claimed '+str(task.get('code'))+' for you (In Progress). Do NOT call work_start, task_claim or task_get for it.'
+    return ('\nThe supervisor already ran work_start and claimed '+str(task.get('code'))+' for you (In Progress). Do NOT call work_start or task_claim again, or repeat task_get for the same scope. Pending task reminders may still be fetched on demand.'
             ' Its token is '+json.dumps(started['token'])+'; pass it to task_update/work_finish and never print or log it.'
+            ' Claim diagnostics: '+json.dumps({k:started[k] for k in ('dirty_planned','git') if k in started},separators=(',',':'))+
             ' Full task (acceptance criteria, checklist, files, evidence, continuity): '+json.dumps(task,ensure_ascii=False,separators=(',',':'))+
             '\nIf continuity is present, resume from it and never redo recorded work. Edit, verify, then finish in one call: work_finish with evidence and continuity if anything remains.'
             ' Quota is supervised outside the model; call agent_checkpoint only to pause or when a long step ends.')
@@ -126,7 +141,12 @@ def run_failure(path,offset):
     message=''
     for line in lines:
         try:event=json.loads(line)
-        except ValueError:continue
+        except ValueError:
+            if line.startswith('Error loading config.toml:'):
+                message='Codex could not load config.toml: '+line.partition(':')[2].strip()[:300]
+            elif message.startswith('Codex could not load config.toml:') and line.startswith('in `mcp_servers.'):
+                message+=' '+line[:180]
+            continue
         if not isinstance(event,dict):continue
         if event.get('type')=='error':value=event.get('message')
         elif event.get('type')=='turn.failed':value=event.get('error',{}).get('message') if isinstance(event.get('error'),dict) else None
@@ -242,6 +262,7 @@ def main():
         attempted=generation # Ordinary bridge startup never consumes old Wakeup.
         pending_start=args.start_now
         pending_auto=False
+        recovery_attempts=set()
         profile_generation=managed['generation'] if managed else 0
         last_usage=float('-inf');last_policy=0;policy={};observed={}
         last_checkpoint=None;previous_running=False;control_stamp=idle_signals.stamp(folder)
@@ -314,7 +335,9 @@ def main():
                 pending_auto=False
             current=report['control']['generation']
             profile_request=report.get('profile_generation',profile_generation)>profile_generation
-            immediate=(pending_start or profile_request or pending_auto) and usage_future is None
+            recovery_id=report.get('git_recovery_id')
+            recovery_pending=recovery_id is not None and recovery_id not in recovery_attempts and not report['should_stop']
+            immediate=(pending_start or profile_request or pending_auto or recovery_pending) and usage_future is None
             if not child and usage_future is None and (current>attempted or immediate) and not report['control']['paused']:
                 attempted=current
                 pending_start=False
@@ -325,7 +348,9 @@ def main():
                     print('Wakeup held: '+report['reason'],flush=True)
                     chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: Wakeup held: '+report['reason'])
                 else:
-                    try:offer=rpc.call('worker_launch',{'project':args.project,'actor':actor,'action':'reserve','client':args.client})
+                    try:
+                        offer=rpc.call('worker_launch',dict(project=args.project,actor=actor,action='reserve',client=args.client,**({'id':recovery_id} if recovery_id else {})))
+                        if recovery_id:recovery_attempts.add(recovery_id)
                     except RuntimeError as error:
                         print('Wakeup preflight unavailable; no model started.',flush=True)
                         chat_event(rpc,args.project,actor,'Wakeup preflight failed; no model started: '+str(error)[:500])
@@ -342,6 +367,8 @@ def main():
                         prompt+='\nSequential batch headers (max3; load each scope only as needed): '+json.dumps(offer['batch'],separators=(',',':'))+'. Reuse this context. Work only on the current task; others stay unclaimed/TODO. Complete each using work_finish(use_batch=true,client=\"'+args.client+'\") without close_session. Continue ONLY with the returned next task after a fresh claim; when batch_done/session offline, exit. The server rechecks model/dependencies/locks. Never mark the whole batch In Progress.'
                         prompt=prompt.replace('Verify, work_finish(close_session=true), exit;','Verify each task individually, then exit when the batch is finished;').replace('ONLY for '+str(offer.get('code')),'starting with '+str(offer.get('code')))
                     prompt+='\nFollow the installed scrum-work skill; read its references/core-guidance.md only for batches or MCP recovery; resolve installed skill references relative to each skill directory, never the target checkout. Preflight, next_work, task_search and batch headers are navigation only: load current full scope with task_get or work_start(id) before editing, and preserve its acceptance criteria, blockers, checklist, evidence and continuity. If the task has continuity, resume from it and never redo recorded work or re-create tasks. Claim only the current task/files. Use codebase-memory when installed, otherwise direct source reads. Specialist skills/tools are loaded only on demand.'
+                    if recovery_id:
+                        prompt=prompt.replace('This human Wakeup authorizes the existing backlog.','Human-enabled Git automation authorizes this scoped integration recovery only. Preserve existing work; do not repeat implementation. If blocked, record the blocker and exit without retry loops.')
                     if automatic:
                         prompt=prompt.replace('This human Wakeup authorizes the existing backlog.','Human-enabled session-quota autoresume continues the previously authorized backlog after a verified reset.')
                     if role:
@@ -353,6 +380,7 @@ def main():
                     started=preclaim(rpc,args.project,actor,args.client,offer['id'],observed)
                     if started.get('should_stop'):
                         release_launch(rpc,args.project,actor)
+                        rpc.call('agent_checkpoint',{'project':args.project,'actor':actor,'client':args.client,'action':'offline','reason':'Launch held: '+started['reason'],'summary':'No model launched; task reservation or policy preflight did not permit execution.'})
                         print('Wakeup held: '+started['reason'],flush=True)
                         chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: Wakeup held: '+started['reason'])
                         time.sleep(2)

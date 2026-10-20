@@ -42,6 +42,43 @@ class BridgeTest(unittest.TestCase):
                 if signal_at:self.assertEqual(offers,[6])
                 else:self.assertEqual(offers,[])
 
+    def test_git_recovery_targets_one_offer_without_idle_model_retry(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
+            folder=Path(temporary);clock=[0];offers=[];rpc=Mock()
+            def call(name,args):
+                if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                if name=='user_register':return {'id':9}
+                if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                if name=='project_settings':return {'usage_check_seconds':300}
+                if name=='agent_checkpoint':return {'should_stop':False,'reason':'','git_recovery_id':42,'control':{'generation':0,'paused':False}}
+                if name=='worker_launch' and args.get('action')=='reserve':
+                    offers.append(args);return {'eligible':False,'reason':'Recovery unavailable'}
+                return {}
+            def sleep(seconds):
+                clock[0]+=seconds
+                if clock[0]>=180:raise KeyboardInterrupt
+            rpc.call.side_effect=call
+            pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':1};pool.submit.return_value=future
+            with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge.time,'monotonic',side_effect=lambda:clock[0]),patch.object(agent_bridge.time,'sleep',side_effect=sleep),patch.object(agent_bridge.subprocess,'Popen') as spawn:
+                agent_bridge.main()
+            spawn.assert_not_called();self.assertEqual(len(offers),1);self.assertEqual(offers[0]['id'],42)
+
+    def test_preclaim_failure_is_reported_instead_of_delegated_to_model(self):
+        rpc=Mock();rpc.call.side_effect=RuntimeError('Reservation denied')
+        result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
+        self.assertTrue(result['should_stop']);self.assertIn('Reservation denied',result['reason'])
+        rpc.call.side_effect=None;rpc.call.return_value={'claim_deferred':'File reservation conflict'}
+        result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
+        self.assertTrue(result['should_stop']);self.assertIn('File reservation conflict',result['reason'])
+
+    def test_plain_config_startup_failure_is_reported_without_other_log_content(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as folder:
+            path=Path(folder)/'worker.log'
+            path.write_text('unrelated secret text\nError loading config.toml: invalid transport\nin `mcp_servers.blockbench`\n',encoding='utf-8')
+            message=agent_bridge.run_failure(path,0)
+            self.assertIn('invalid transport',message);self.assertIn('blockbench',message)
+            self.assertNotIn('secret',message)
+
     def test_empty_or_failed_preflight_never_starts_model(self):
         for failure in (False,True):
             with self.subTest(failure=failure),tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
@@ -86,6 +123,7 @@ class BridgeTest(unittest.TestCase):
             rpc=Mock();observations=0
             def call(name,args):
                 nonlocal observations
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
                 if name=='worker_launch':return {'eligible':True,'id':1,'code':'FIX-1'} if args.get('action')=='reserve' else {'released':True}
                 if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
                 if name=='user_register':return {'id':9}
@@ -142,7 +180,7 @@ class BridgeTest(unittest.TestCase):
     def test_claude_worker_uses_compact_preapproved_scrum_catalog(self):
         with patch.object(agent_bridge.shutil,'which',return_value='claude'):
             claude=agent_bridge.command('claude',Path.cwd(),'Task')
-        self.assertIn('--strict-mcp-config',claude)
+        self.assertNotIn('--strict-mcp-config',claude)
         config=Path(next(arg.split('=',1)[1] for arg in claude if arg.startswith('--mcp-config=')))
         server=json.loads(config.read_text(encoding='utf-8'))['mcpServers']['scrum-studio']
         self.assertIn('--worker-schema',server['args'])
@@ -163,6 +201,7 @@ class BridgeTest(unittest.TestCase):
             rpc=Mock();events=[];observations=0
             def call(name,args):
                 nonlocal observations
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
                 if name=='worker_launch':return {'eligible':True,'id':1,'code':'FIX-1'} if args.get('action')=='reserve' else {'released':True}
                 if name=='projects':return [{'id':1,'uuid':'project','checkout':'checkout','path':str(folder),'available':True}]
                 if name=='user_register':return {'id':9}
@@ -233,6 +272,7 @@ class ManagedBridgeTest(unittest.TestCase):
                 if name=='agent_status':return {'agents':[],'control':{'generation':0}}
                 if name=='project_settings':return {'usage_check_seconds':60}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','profile_enabled':True,'control':{'generation':0,'paused':False}}
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':args['id'],'code':'FIX-'+str(args['id'])}}
                 if name=='task_get':return {'status':'Done'}
                 if name=='worker_launch' and args.get('action')=='reserve':
                     if len(offers)==2:return {'eligible':False,'reason':'No work'}
@@ -246,13 +286,14 @@ class ManagedBridgeTest(unittest.TestCase):
                 agent_bridge.main()
             self.assertEqual(spawn.call_count,2)
             self.assertEqual([entry.args[3] for entry in command.call_args_list],['task-1','task-2'])
-            self.assertTrue(all('ONLY for FIX-' in entry.args[2] for entry in command.call_args_list))
+            self.assertTrue(all('Work ONLY on FIX-' in entry.args[2] for entry in command.call_args_list))
 
     def test_immediate_profile_start_uses_role_and_stable_actor(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
             folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
             rpc=Mock()
             def call(name,args):
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
                 if name=='worker_launch':return {'eligible':True,'id':1,'code':'FIX-1'} if args.get('action')=='reserve' else {'released':True}
                 if name=='projects':return [{'id':1,'uuid':'project','checkout':'checkout','path':str(folder),'available':True}]
                 if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'You review performance.','generation':1,'model':'fixture-model'}
@@ -277,16 +318,16 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertEqual(captured,[prompt])
             self.assertIn('You review performance.',prompt)
             self.assertIn('persistent agent actor is 9',prompt)
-            self.assertIn('Claim an eligible task',prompt)
-            self.assertIn('claim=true',prompt)
-            self.assertIn('Start AND claim in one call: work_start',prompt)
+            self.assertIn('supervisor already ran work_start and claimed',prompt)
+            self.assertIn('Do NOT call work_start or task_claim again',prompt)
+            self.assertIn('In Progress',prompt)
             self.assertIn('continue with the next eligible task',prompt)
             self.assertIn(json.dumps(sys.executable),prompt)
             self.assertIn('--usage-once',prompt)
             self.assertIn('--timeout 15',prompt)
-            self.assertIn('original observed_at',prompt)
-            self.assertIn('strictly sequentially',prompt)
-            self.assertIn('request the minimum required access',prompt)
+            self.assertIn('Quota is supervised outside the model',prompt)
+            self.assertIn('Full task',prompt)
+            self.assertIn('acceptance criteria',prompt)
             self.assertIn('do not weaken them',prompt)
             self.assertFalse(any(c.args[0]=='user_register' for c in rpc.call.call_args_list))
             self.assertTrue(any(c.args[0]=='agent_checkpoint' and c.args[1].get('profile_id')=='a'*32 for c in rpc.call.call_args_list))

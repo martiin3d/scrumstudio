@@ -33,6 +33,24 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(run('task_get',dict(project=self.p,id=ui['id']))['dependencies'],[done])
         self.assertEqual(len(run('snapshot',dict(project=self.p))['tasks']),2)
 
+    def test_same_title_with_changed_scope_is_new_work(self):
+        original=run('task_create',dict(project=self.p,actor=self.actor,title='Login',**SPEC))['id']
+        token=run('task_claim',dict(project=self.p,id=original,actor=self.actor))['token']
+        run('work_finish',dict(project=self.p,id=original,actor=self.actor,token=token,evidence='Checked.'))
+        changed=dict(description='OAuth login',acceptance_criteria=['OAuth works'])
+        other=run('task_create',dict(project=self.p,actor=self.actor,title='Login',**changed))
+        self.assertNotEqual(other['id'],original)
+        self.assertEqual(other['status'],'TODO')
+        plan=run('task_plan',dict(project=self.p,actor=self.actor,items=[dict(key='new',title='Login',description='Passkey login',acceptance_criteria=['Passkeys work'])]))
+        self.assertNotEqual(plan['items'][0]['id'],original)
+        self.assertEqual(run('task_get',dict(project=self.p,id=original))['acceptance_criteria'],SPEC['acceptance_criteria'])
+
+    def test_worker_keeps_planning_and_routing_fields(self):
+        with patch.object(sys,'argv',['mcp_server.py','--profile','worker']):tools=mcp_server.catalog()
+        for name in ('task_create','task_update'):
+            properties=next(t for t in tools if t['name']==name)['inputSchema']['properties']
+            self.assertTrue({'context_group','model_tier','model_reason','verification_level','verification_reason'}<=properties.keys())
+
     def test_paused_work_is_returned_first_and_listed_for_resume(self):
         other=run('task_create',dict(project=self.p,title='Other work',priority=1,**SPEC))['id']
         mine=run('task_create',dict(project=self.p,title='Half done',priority=3,**SPEC))['id']

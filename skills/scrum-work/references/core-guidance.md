@@ -3,7 +3,7 @@
 The normal lifecycle lives in [scrum-work](../SKILL.md). Load this file only for the topics below.
 
 ## Managed batches
-Preflight may offer up to three compatible task headers. Work only on the current claimed task; the others stay TODO with unreserved files. Complete each with `work_finish(use_batch=true, client)`; continue only with the returned next task after a fresh claim; exit on `batch_done` or session offline. Never combine evidence or mark the whole batch In Progress.
+Preflight may offer up to three compatible task headers. Work only on the current claimed task; the others stay TODO with unreserved files. Complete each with `work_finish(use_batch=true, client)`; continue only with the returned next task; reuse next.claim when claimed=true, otherwise claim it freshly; exit on `batch_done` or session offline. Never combine evidence or mark the whole batch In Progress.
 
 ## Model routing
 Set `model_tier` (economy/standard/advanced) with a short reason during planning when useful; a human-fixed model wins. If routing changes mid-task, save continuity and close safely; at most two relaunches. Never probe accounts or run a model for discovery.
