@@ -16,9 +16,13 @@ class RoutingTest(unittest.TestCase):
 
     def test_auto_precedence_and_cross_provider(self):
         available={'gpt-6-luna','gpt-6.1-sol','gpt-6-astra'}
-        self.assertEqual(model_routing.select({'scope_size':'Small'},'codex',available=available)['model'],'gpt-6-luna')
+        self.assertEqual(model_routing.select({'scope_size':'Small'},'codex',available=available)['model'],'gpt-6.1-sol')
         self.assertEqual(model_routing.select({},'codex',available=available)['model'],'gpt-6.1-sol')
-        self.assertEqual(model_routing.select({'scope_size':'Large'},'codex',available=available)['model'],'gpt-6-astra')
+        self.assertEqual(model_routing.select({'scope_size':'Large'},'codex',available=available)['model'],'gpt-6.1-sol')
+        self.assertEqual(model_routing.select({'scope_size':'Small','model_tier':'advanced','model_reason':'Subtle recovery invariants'},'codex',available=available)['model'],'gpt-6-astra')
+        self.assertEqual(model_routing.select({'scope_size':'Large','model_tier':'economy','model_reason':'Mechanical repeated edits'},'codex',available=available)['model'],'gpt-6-luna')
+        for scope in ['Small','Large','Unknown']:
+            self.assertEqual(model_routing.select({'scope_size':scope},'claude')['model'],'sonnet')
         self.assertEqual(model_routing.select({'model':'fixed-task'},'codex','fixed-profile',available)['model'],'fixed-task')
         self.assertEqual(model_routing.select({},'codex','fixed-profile',available)['source'],'profile')
         self.assertEqual(model_routing.select({'model_tier':'economy','model_reason':'Mechanical change'},'claude')['model'],'haiku')

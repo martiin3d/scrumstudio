@@ -18,9 +18,7 @@ def request(task):
 
 def automatic_tier(task):
     if task.get('model_tier','auto')!='auto':return task['model_tier'],'Agent/planner choice: '+task['model_reason']
-    if task.get('scope_size')=='Large':return 'advanced','Large scope estimate'
-    if task.get('scope_size')=='Small':return 'economy','Explicit bounded Small scope'
-    return 'standard','Unknown complexity; conservative standard route'
+    return 'standard','Default standard route; task size does not determine technical difficulty'
 
 def catalog():
     try:

@@ -18,7 +18,7 @@ The unit is **one result with its own acceptance check**, sized so a session fin
 **Split** when any applies:
 - The results ship or can be reverted independently.
 - They touch disjoint files or areas: another agent can take one in parallel.
-- They need different model tiers (mechanical edit = economy, design or tricky bug = advanced).
+- They need different model tiers (mechanical low-risk edit = economy; implementation/debugging = standard; demonstrated difficult reasoning = advanced). Size alone does not select a model; auto defaults to standard.
 - Together they would likely exceed one session (a split task survives a Stop/resume with cleaner continuity).
 - Different risk: keep a risky change separate from safe cleanup.
 

@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -9,6 +10,15 @@ from store import run
 from diagnostics import failure
 
 PUBLIC = Path(__file__).resolve().parent / 'public'
+
+class LocalHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # Windows SO_REUSEADDR can let a second website steal the same port
+        # and replace the first instance's shutdown token.
+        if os.name=='nt':
+            self.allow_reuse_address=False
+            self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
+        super().server_bind()
 
 class Handler(BaseHTTPRequestHandler):
     # Browser preconnect sockets must not keep non-daemon request threads alive
@@ -73,7 +83,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     port = int(os.environ.get('SCRUM_PORT', '8765'))
     from web_lifecycle import publish,clear
-    with ThreadingHTTPServer(('127.0.0.1', port), Handler) as server:
+    with LocalHTTPServer(('127.0.0.1', port), Handler) as server:
         server.daemon_threads=False
         server.shutdown_token=publish(port)
         print(f'Scrum Studio: http://127.0.0.1:{port}', flush=True)

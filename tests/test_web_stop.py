@@ -59,6 +59,27 @@ class WebStopTest(unittest.TestCase):
         lifecycle.control_path(port).write_text(json.dumps(record),encoding='utf-8')
         with self.assertRaisesRegex(ValueError,'Invalid website control'):lifecycle.stop(port)
 
+    def test_duplicate_server_cannot_replace_live_shutdown_record(self):
+        first,port=self.start();record=lifecycle.read_control(port)
+        second=subprocess.Popen([sys.executable,str(ROOT/'server.py')],cwd=ROOT,env=dict(os.environ,SCRUM_PORT=str(port)),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        self.instances.append((second,port))
+        self.assertNotEqual(second.wait(timeout=5),0)
+        self.assertEqual(lifecycle.read_control(port),record)
+        self.assertEqual(lifecycle.stop(port),0)
+        self.assertEqual(first.wait(timeout=5),0)
+
+    def test_same_port_can_restart_after_graceful_shutdown(self):
+        first,port=self.start()
+        lifecycle.stop(port);self.assertEqual(first.wait(timeout=5),0)
+        second=subprocess.Popen([sys.executable,str(ROOT/'server.py')],cwd=ROOT,env=dict(os.environ,SCRUM_PORT=str(port)),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        self.instances.append((second,port))
+        for _ in range(50):
+            if second.poll() is not None:self.fail('Website could not restart on its released port')
+            if lifecycle.control_path(port).exists():break
+            time.sleep(.05)
+        else:self.fail('Restarted website did not become ready')
+        lifecycle.stop(port);self.assertEqual(second.wait(timeout=5),0)
+
     def test_idle_browser_preconnect_does_not_block_graceful_shutdown(self):
         process,port=self.start()
         idle=socket.create_connection(('127.0.0.1',port),timeout=2)
