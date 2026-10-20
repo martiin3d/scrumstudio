@@ -1,6 +1,7 @@
 """Install bundled skills and register the local MCP using local paths."""
 import argparse
 import hashlib
+import json
 from datetime import datetime
 import os
 import re
@@ -47,6 +48,8 @@ def repair_skill(name,profile,config_root,backup):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skills-only', action='store_true')
+    parser.add_argument('--claude-hooks',action='store_true',help='Add optional Claude Code hooks (board context at start, quota checkpoints, offline at end) to ~/.claude/settings.json')
+    parser.add_argument('--full-tools',action='store_true',help='Expose all MCP tools (administration included) instead of the compact worker catalog')
     parser.add_argument('--client',choices=['codex','claude','both'],default='codex')
     parser.add_argument('--repair-skill',action='append',default=[],metavar='NAME',help='Explicitly migrate a legacy Codex skill to .agents/skills with a verified backup; repeat for multiple skills')
     args = parser.parse_args()
@@ -83,12 +86,36 @@ def main():
                     raise RuntimeError(f'Skill verification failed: {source.name}')
     if not args.skills_only:
         for client in clients:
+            # Re-running setup upgrades an existing registration (for example to
+            # the compact worker profile); a missing entry is not an error.
+            subprocess.run([executables[client],'mcp','remove','scrum-studio']+(['--scope','user'] if client=='claude' else []),check=False,capture_output=True)
             command=[executables[client],'mcp','add','scrum-studio']
             if client=='claude':
                 command += ['--transport','stdio','--scope','user']
-            subprocess.run(command+['--',sys.executable,str(ROOT/'mcp_server.py')],check=True)
+            subprocess.run(command+['--',sys.executable,str(ROOT/'mcp_server.py')]+([] if args.full_tools else ['--profile','worker']),check=True)
         subprocess.run([sys.executable, str(ROOT / 'scripts' / 'check_mcp.py'), '--command', sys.executable, '--server', str(ROOT / 'mcp_server.py')], check=True)
+    if args.claude_hooks and 'claude' in clients:
+        install_claude_hooks(profile/'.claude'/'settings.json',backup)
+        print('Claude hooks installed in ~/.claude/settings.json')
     print(f'Installed {len(folders)} skills. Backup: {backup}')
     print('Reopen the selected client chat to load updated tools and skills.')
+HOOK_EVENTS={'SessionStart':'session-start','UserPromptSubmit':'prompt','Stop':'stop','SessionEnd':'session-end'}
+
+def install_claude_hooks(settings_path,backup):
+    """Merge Scrum Studio hooks, replacing only previous Scrum Studio entries."""
+    settings={}
+    if settings_path.exists():
+        shutil.copy2(settings_path,backup/'claude-settings.json')
+        settings=json.loads(settings_path.read_text(encoding='utf-8') or '{}')
+    hooks=settings.setdefault('hooks',{})
+    script=ROOT/'scripts'/'claude_hooks.py'
+    for event,action in HOOK_EVENTS.items():
+        groups=[g for g in hooks.get(event,[]) if not any('claude_hooks.py' in h.get('command','') for h in g.get('hooks',[]))]
+        groups.append({'hooks':[{'type':'command','command':f'"{sys.executable}" "{script}" {action}','timeout':15}]})
+        hooks[event]=groups
+    settings_path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=settings_path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(settings,indent=2),encoding='utf-8');os.replace(temporary,settings_path)
+
 if __name__ == '__main__':
     main()

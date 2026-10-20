@@ -1,13 +1,16 @@
 """Project policy and advisory file reservations shared by the web and MCP."""
 import hashlib
+import git_worktrees
 import os
 import secrets
 import time
 from pathlib import Path
 
-POLICY_DEFAULTS = {'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1}
+from git_sync import GIT_DEFAULTS, validate as validate_git
+POLICY_DEFAULTS = {'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS}
 
 def validate_policy(changed):
+    validate_git(changed)
     if 'max_parallel_agents' in changed and (type(changed['max_parallel_agents']) is not int or not 1<=changed['max_parallel_agents']<=20):
         raise ValueError('max_parallel_agents must be 1..20')
     if 'workflow_mode' in changed and changed['workflow_mode'] not in ['Auto','Light','Standard']:
@@ -61,7 +64,7 @@ def migrate(db, separate=False):
 
 
 def settings(row):
-    return {k: bool(row[k]) if k in ['require_evidence','usage_guard','auto_resume_session_quota'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+    return {k: bool(row[k]) if k in ['require_evidence','usage_guard','auto_resume_session_quota','git_cleanup'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
 
 
 def active_count(db, project, actor, exclude=-1):
@@ -101,6 +104,7 @@ def canonical_paths(root, paths):
     for value in paths:
         path=Path(value)
         path=(path if path.is_absolute() else base/path).resolve()
+        path=git_worktrees.logical(base,path)
         try:
             path.relative_to(base)
         except ValueError:
@@ -146,6 +150,22 @@ def own_task(db, a):
     return row
 
 
+def resumable(db, project_row, actor, limit=5):
+    """Own unfinished work left by an earlier session: resume it, never redo it."""
+    from store import project_prefix
+    prefix=project_prefix(project_row['name'])
+    rows=db.execute("SELECT * FROM tasks WHERE project=? AND owner_id=? AND status IN ('In Progress','TODO','Blocked','In Review') AND (status='In Progress' OR continuity!='') ORDER BY updated DESC,id DESC LIMIT ?",(project_row['id'],actor,limit)).fetchall()
+    result=[]
+    for r in rows:
+        item={'id':r['id'],'code':f"{prefix}-{r['number']}",'title':r['title'],'status':r['status'],'continuity':(r['continuity'] or '')[:400]}
+        if r['status']=='In Progress' and r['lock_until']<=time.time():
+            # Crash or expired claim without a handoff: report the edits on disk.
+            import git_changes,json
+            item['interrupted']=True
+            item['edits']=git_changes.summary(git_worktrees.inspection_root(project_row['workspace_root'],git_worktrees.identity(r)),json.loads(r['files'] or '[]'))
+        result.append(item)
+    return result
+
 def page_locks(db, project=None, actor=None, after=0, limit=20):
     if type(limit) is not int or not 1<=limit<=100 or type(after) is not int or after<0:
         raise ValueError('Use a nonnegative after cursor and limit 1..100')
@@ -173,6 +193,11 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         db.execute('BEGIN IMMEDIATE')
         current=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
         validate_policy(changed)
+        if changed.get('git_merge')=='Group':
+            import git_sync
+            version=git_sync.git_version(current['workspace_root'] or '.')
+            if version and version<git_sync.MERGE_TREE_MIN:
+                raise ValueError(f'git_merge=Group needs git {git_sync.MERGE_TREE_MIN[0]}.{git_sync.MERGE_TREE_MIN[1]}+ on this machine (found {version[0]}.{version[1]})')
         if 'max_active_per_agent' in changed:
             limit=changed['max_active_per_agent']
             if type(limit) is not int or not 1<=limit<=20:
@@ -182,6 +207,12 @@ def operation(db, action, a, project_row, actor_user, activity, now):
                 raise ValueError('Release excess active tasks before lowering the limit')
         if 'require_evidence' in changed and type(changed['require_evidence']) is not bool:
             raise ValueError('require_evidence must be boolean')
+        if 'git_mode' in changed and changed['git_mode']!=current['git_mode'] and db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchone():
+            raise ValueError('Finish or safely pause active tasks before changing Git workspace mode')
+        if 'git_mode' in changed and current['git_mode']=='Worktrees' and changed['git_mode']!='Worktrees':
+            saved=git_worktrees.entries(current['workspace_root'])
+            if any(git_worktrees.identity(r) in saved for r in db.execute("SELECT * FROM tasks WHERE project=? AND status NOT IN ('Done','Cancelled')",(project,))):
+                raise ValueError('Complete or cancel tasks with saved workspaces before leaving Worktrees mode')
         if 'workspace_root' in changed:
             root=changed['workspace_root']
             if not isinstance(root,str) or len(root)>1024 or '\x00' in root or (root and not Path(root).is_absolute()):
@@ -201,7 +232,8 @@ def operation(db, action, a, project_row, actor_user, activity, now):
     if action == 'session_resume':
         actor=actor_user(db,a)
         return {'settings':settings(project_row),'active_tasks':active_count(db,project,actor['id']),
-                'own_file_locks':page_locks(db,project=project,actor=actor['id'],after=a.get('after',0),limit=a.get('limit',20))}
+                'own_file_locks':page_locks(db,project=project,actor=actor['id'],after=a.get('after',0),limit=a.get('limit',20)),
+                'resume':resumable(db,project_row,actor['id'])}
     mode=a.get('action','list')
     if mode=='list':
         if a.get('own'):

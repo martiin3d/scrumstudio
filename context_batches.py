@@ -55,11 +55,13 @@ def ready(db,project,task,allowed=()):
 def plan(db,project,actor,root,tasks,selection,folder,size=3):
     ensure(db)
     members=[root];used={root['id']};total=len(json.dumps(context_tools.agent_task(root)).encode())
+    isolated=db.execute('SELECT git_mode FROM projects WHERE id=?',(project,)).fetchone()[0]=='Worktrees'
     profile=model_routing.profile_model(folder,actor)
     available=model_routing.catalog() if selection['client']=='codex' else None
     if root['scope_size']!='Large' and 0<len(root['files'])<=5:
         for task in tasks:
             if len(members)>=size:break
+            if isolated and (not root.get('context_group') or task.get('context_group')!=root['context_group']):continue
             if task['id'] in used or task['locked'] or task['status'] not in ('TODO','Blocked') or not compatible(root,task) or not ready(db,project,task,used):continue
             held=reservation(db,project,task['id'])
             if held and held['actor']!=actor:continue

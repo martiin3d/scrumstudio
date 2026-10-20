@@ -90,6 +90,9 @@ def cached_usage(a):
         return a
     try:
         file = usage_path(a['project'], a['actor'], a['client'])
+        if a['client'] == 'claude' and not file.exists():
+            # The documented Claude status-line feed is shared by the checkout.
+            file = file.with_name('claude-usage.json')
         if file.stat().st_size > 10000:
             return a
         data = json.loads(file.read_text(encoding='utf-8'))

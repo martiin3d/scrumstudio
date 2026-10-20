@@ -53,9 +53,10 @@ class SetupTest(unittest.TestCase):
             (old / 'SKILL.md').write_text('old skill')
             with patch.object(setup.Path, 'home', return_value=profile), patch.dict(os.environ, {'CODEX_HOME': str(config)}), patch.object(setup.sys, 'argv', ['setup.py']), patch.object(setup.shutil, 'which', return_value='codex'), patch.object(setup.subprocess, 'run') as run:
                 setup.main()
-            command = run.call_args_list[0].args[0]
+            self.assertEqual(run.call_args_list[0].args[0][:3], ['codex','mcp','remove'])
+            command = run.call_args_list[1].args[0]
             self.assertEqual(command[:5], ['codex','mcp','add','scrum-studio','--'])
-            self.assertEqual(command[-1], str(ROOT / 'mcp_server.py'))
+            self.assertEqual(command[-3:], [str(ROOT / 'mcp_server.py'),'--profile','worker'])
             self.assertEqual((old / 'SKILL.md').read_bytes(), (ROOT / 'skills' / 'scrum-chat' / 'SKILL.md').read_bytes())
             self.assertEqual((config / 'config.toml').read_text(), 'preserved')
             backups = list((config / 'backups' / 'scrum-studio').iterdir())
@@ -73,5 +74,5 @@ class SetupTest(unittest.TestCase):
             with patch.object(setup.Path,'home',return_value=profile),patch.dict(os.environ,{'CODEX_HOME':str(profile/'.codex')}),patch.object(setup.sys,'argv',['setup.py','--client','claude']),patch.object(setup.shutil,'which',return_value='claude'),patch.object(setup.subprocess,'run') as run:
                 setup.main()
             self.assertTrue((profile/'.claude/skills/scrum-work/SKILL.md').exists())
-            self.assertIn('--scope',run.call_args_list[0].args[0])
-            self.assertIn('user',run.call_args_list[0].args[0])
+            self.assertIn('--scope',run.call_args_list[1].args[0])
+            self.assertIn('user',run.call_args_list[1].args[0])

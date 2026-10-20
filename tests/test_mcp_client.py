@@ -17,6 +17,26 @@ spec.loader.exec_module(cli)
 
 
 class McpClientTest(unittest.TestCase):
+    def test_default_completion_budget_covers_two_pushes_without_widening_reads(self):
+        client=cli.ScrumClient.__new__(cli.ScrumClient)
+        cases=[('work_finish',{},180),('task_update',{'status':'Done'},180),
+               ('task_update',{'status':'TODO'},20),('projects',{},20)]
+        for name,args,budget in cases:
+            with self.subTest(name=name,args=args),patch.object(client,'rpc',return_value={'content':[{'text':'{}'}]}) as rpc:
+                client.call(name,args)
+                self.assertEqual(rpc.call_args.kwargs['timeout'],budget)
+        with patch.object(client,'rpc',return_value={'content':[{'text':'{}'}]}) as rpc:
+            client.call('work_finish',{},timeout=.5)
+            self.assertEqual(rpc.call_args.kwargs['timeout'],.5)
+
+    def test_cli_selects_completion_budget_and_keeps_initialization_short(self):
+        for name,args,budget in [('work_finish',{},180),('task_update',{'status':'Done'},180),('projects',{},15)]:
+            with self.subTest(name=name),patch.object(cli,'ScrumClient') as factory,patch.object(sys,'stdin',io.StringIO(json.dumps(args))),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                factory.return_value.call.return_value={}
+                self.assertEqual(cli.main(['--tool',name]),0)
+                factory.assert_called_once_with(timeout=15)
+                factory.return_value.call.assert_called_once_with(name,args,timeout=budget)
+
     def invoke(self,arguments='{}',error=None):
         out,err=io.StringIO(),io.StringIO()
         with patch.object(cli,'ScrumClient') as factory,patch.object(sys,'stdin',io.StringIO(arguments)),contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):

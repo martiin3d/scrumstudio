@@ -33,7 +33,7 @@ class TelemetryTest(unittest.TestCase):
         self.temp.cleanup()
 
     def task(self, **kw):
-        return run('task_create',dict(description='Test fixture: verify the named workflow outcome', acceptance_criteria=['The scenario assertions pass'], project=self.p,title='Task',actor=self.actor,**kw))['id']
+        return run('task_create',dict(description='Test fixture: verify the named workflow outcome', acceptance_criteria=['The scenario assertions pass'], project=self.p,title='Task',actor=self.actor,allow_duplicate=True,**kw))['id']
 
     def claim(self,t,**kw):
         return run('task_claim',dict(project=self.p,id=t,actor=self.actor,**kw))['token']

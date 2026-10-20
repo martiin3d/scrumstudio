@@ -7,7 +7,7 @@ import telemetry
 
 
 def apply(db,a,project):
-    from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix
+    from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix,duplicate_task
     actor=actor_user(db,a)
     db.execute('BEGIN IMMEDIATE')
     runtime.gate(db,project,actor['id'])
@@ -31,6 +31,13 @@ def apply(db,a,project):
             if old['status'] in ('Done','Cancelled') or old['lock_until']>time.time():
                 raise ValueError('Plan only unfinished tasks without an active claim; preserve current work')
         title=required(item.get('title'),'title',240)
+        same,differs=(None,[]) if old else duplicate_task(db,project,title,{**a,**item})
+        if same:
+            # Reused outcomes still reject invalid planning input.
+            from store import validate_verification
+            import model_routing
+            validate_verification(item.get('verification_level','auto'),item.get('verification_reason',''))
+            model_routing.validate('',item.get('model_tier','auto'),item.get('model_reason',''))
         description=required(item.get('description'),'description',12000)
         criteria=acceptance_criteria(item.get('acceptance_criteria'))
         size=item.get('scope_size',old['scope_size'] if old else 'Unknown')
@@ -40,12 +47,18 @@ def apply(db,a,project):
         deps=item.get('dependencies',json.loads(old['dependencies']) if old else [])
         if not isinstance(deps,list) or len(deps)>100 or any(type(d) not in (str,int) for d in deps):
             raise ValueError('Dependencies must be task IDs or plan keys')
-        prepared.append(dict(item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps))
+        prepared.append(dict(same=same,differs=differs,item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps))
     prefix=project_prefix(db.execute('SELECT name FROM projects WHERE id=?',(project,)).fetchone()['name'])
     result=[]
     resolved_items=[]
     for value in prepared:
         old=value['old'];item=value['item']
+        if value['same']:
+            # Resumed sessions often re-plan known work: reuse, never repeat it.
+            same=value['same'];keys[value['key']]=same['id']
+            from store import existing_note
+            result.append({'key':value['key'],'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':value['differs'],'note':existing_note(value['differs'])} if value['differs'] else {})})
+            continue
         rank=priority(item.get('priority',old['priority'] if old else 2))
         category=required(item.get('category',old['category'] if old else 'General'),'category',80)
         if old:
@@ -77,6 +90,7 @@ def apply(db,a,project):
         keys[value['key']]=task
         result.append({'key':value['key'],'id':task,'code':f'{prefix}-{number}','status':status})
     for value in prepared:
+        if value['same']:continue
         resolved=[]
         for dep in value['deps']:
             if isinstance(dep,str):

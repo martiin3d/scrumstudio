@@ -45,6 +45,13 @@ class CachedUsageTest(unittest.TestCase):
         self.assertTrue(result['should_stop'])
         self.assertIn('stale', result['reason'])
 
+    def test_claude_reads_documented_status_line_feed(self):
+        project, folder = self.project()
+        target = overhead.usage_path(project, self.agent, 'claude').with_name('claude-usage.json')
+        storage.atomic_json(target, {'session_used_percent':10,'weekly_used_percent':3,'observed_at':time.time()})
+        result = run('agent_checkpoint', {'project':project,'actor':self.agent,'client':'claude'})
+        self.assertFalse(result['should_stop'], result)
+
     def test_measurement_failure_does_not_break_delivery(self):
         with patch('overhead.connection', side_effect=OSError('disk unavailable')):
             overhead.record(1,'task_get',10,10,1,False)

@@ -1,4 +1,5 @@
 import json
+import git_worktrees
 import os
 import sqlite3
 import unicodedata
@@ -108,6 +109,63 @@ def project_exists(db, project):
         raise ValueError('Project not found')
     return row
 
+def git_claim(db, project, row, prefix, actor):
+    """Branch policy at claim time; returns a report or a {'busy':...} refusal."""
+    import git_sync
+    project_row=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
+    if not git_sync.enabled(coord.settings(project_row)):return None
+    if coord.settings(project_row).get('git_mode')=='Worktrees':
+        import storage
+        storage.ensure_uids(db)
+        row=db.execute('SELECT * FROM tasks WHERE id=?',(row['id'],)).fetchone()
+    task={'id':row['id'],'uid':row['uid'] if 'uid' in row.keys() else None,'code':f"{prefix}-{row['number']}",'title':row['title'],'context_group':row['context_group'] if 'context_group' in row.keys() else ''}
+    settings=coord.settings(project_row)
+    active=db.execute("SELECT * FROM tasks WHERE project=? AND id!=? AND status='In Progress' AND lock_until>?",(project,row['id'],time.time())).fetchall()
+    if settings.get('git_mode')=='Worktrees':
+        if row['category']=='Git recovery' and active:
+            return {'busy':{'current_branch':'canonical','wanted':'Git recovery','reason':'Finish active work before Git recovery','dirty':[],'dirty_total':0}}
+        desired=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(row)) or git_sync.branch_for(settings,task)
+        if any((git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(r)) or git_sync.branch_for(settings,{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']}))==desired for r in active):
+            return {'busy':{'current_branch':desired,'wanted':desired,'reason':'Another active task owns this context-group workspace','dirty':[],'dirty_total':0}}
+        active=[]
+    # Even a clean working tree belongs to active workers; never switch it.
+    if any(git_sync.branch_for(settings,{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']})!=git_sync.branch_for(settings,task) for r in active):
+        current=git_sync.state(project_row['workspace_root'])
+        dirty=current[1] if current else []
+        wanted=git_sync.branch_for(settings,task)
+        activity(db,row['id'],actor,'comment','git: claim refused, another active task owns the checkout branch (wanted '+wanted+').')
+        return {'busy':{'current_branch':current[0] if current else 'unknown','wanted':wanted,'reason':'Another active task owns this checkout branch','dirty':dirty[:20],'dirty_total':len(dirty)}}
+    if row['category']=='Git recovery':
+        if active:raise ValueError('Finish active work before Git recovery')
+        current=git_sync.state(project_row['workspace_root'])
+        return {'branch':current[0] if current else 'unknown','recovery':True}
+    task['dependencies']=[{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']} for r in db.execute('SELECT number,title,context_group FROM tasks WHERE project=? AND id IN ('+','.join('?' for _ in json.loads(row['dependencies']))+')',[project,*json.loads(row['dependencies'])])] if json.loads(row['dependencies']) else []
+    report=git_sync.on_claim(project_row['workspace_root'],settings,task)
+    if report and report.get('busy'):
+        activity(db,row['id'],actor,'comment','git: claim refused, checkout has uncommitted work on branch '+report['busy']['current_branch']+' (wanted '+report['busy']['wanted']+').')
+    elif report and (report.get('created') or report.get('switched') or report.get('error')):
+        activity(db,row['id'],actor,'comment','git: '+('created' if report.get('created') else 'switched to' if report.get('switched') else 'ERROR')+' branch '+report['branch']+(' ('+report['error']+')' if report.get('error') else '')+'.')
+    return report
+
+def git_done(db, project, t, prefix, actor):
+    """Commit/push policy when a task first becomes Done."""
+    import git_sync
+    project_row=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
+    settings=coord.settings(project_row)
+    if not git_sync.enabled(settings) or t.get('category')=='Git recovery':return None
+    group=(t.get('context_group') or '').strip()
+    members=[];group_done=True
+    if group:
+        members=[{'id':r['id'],'code':f"{prefix}-{r['number']}",'status':r['status'],'files':json.loads(r['files'])} for r in db.execute('SELECT id,number,status,files FROM tasks WHERE project=? AND context_group=? ORDER BY id',(project,group))]
+        group_done=all(m['status'] in ('Done','Cancelled') for m in members)
+    task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
+    root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(t))
+    task['git_branch']=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(t))
+    report=git_sync.on_done(db,root,settings,task,project,actor,group_done,members)
+    # The Git job runs after this database transaction commits.
+    if report and not report.get('queued'):activity(db,t['id'],actor,'comment',git_sync.describe(report))
+    return report
+
 def project_prefix(name):
     letters = ''.join(c for c in unicodedata.normalize('NFKD', name) if c.isalpha() and not unicodedata.combining(c))
     return (letters[:3] or 'PRJ').upper()
@@ -141,6 +199,41 @@ def task_dict(row, prefix, include_cost=False):
     t['locked'] = t['lock_until'] > time.time()
     import context_tools
     return context_tools.decorate(t)
+
+def title_key(value):
+    return ' '.join(unicodedata.normalize('NFKC',value).casefold().split())
+
+def duplicate_task(db, project, title, a):
+    """Same-title task for an agent re-planning after a resume.
+
+    Returns (row, differs): differs is empty when the registered outcome is
+    identical, otherwise the fields that differ. A reworded re-plan of UNFINISHED
+    work must never create a second task silently: the caller reports the
+    existing one and the agent continues it, refines it (task_plan with id) or
+    passes allow_duplicate. A Done task with a different scope is not a match:
+    new requirements under an old title are new work.
+    """
+    allow=a.get('allow_duplicate',False)
+    if type(allow) is not bool:raise ValueError('allow_duplicate must be boolean')
+    if allow or a.get('actor') is None or actor_user(db,a)['kind']!='agent':return None,[]
+    key=title_key(title)
+    for row in db.execute("SELECT * FROM tasks WHERE project=? AND status!='Cancelled' ORDER BY id DESC",(project,)):
+        if title_key(row['title'])!=key:continue
+        differs=[]
+        if row['description'].strip()!=str(a.get('description','')).strip():differs.append('description')
+        if json.loads(row['acceptance_criteria'])!=a.get('acceptance_criteria'):differs.append('acceptance_criteria')
+        for field in ('files','dependencies','checklist'):
+            if field in a and json.loads(row[field])!=a[field]:differs.append(field)
+        for field in ('category','priority','scope_size','scope_reason','context_group','model','model_tier','model_reason','verification_level','verification_reason'):
+            if field in a and row[field]!=a[field]:differs.append(field)
+        if differs and row['status']=='Done':
+            continue  # delivered work with a new scope is new work; an unfinished one is continued
+        return row,differs
+    return None,[]
+
+def existing_note(differs):
+    if not differs:return 'Identical scope already registered; reuse its recorded state. allow_duplicate=true permits a deliberately separate outcome.'
+    return 'A task with this title already exists with a different '+', '.join(differs)+'. Reuse it, refine it with task_plan(id=...) if its scope must change, or pass allow_duplicate=true for a deliberately separate outcome. Nothing was created.'
 
 def actor_user(db, a):
     row = db.execute('SELECT * FROM users WHERE id=?', (a.get('actor'),)).fetchone()
@@ -207,6 +300,8 @@ def resolve_dependents(db, project, completed, prefix, actor):
     done = {r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status IN ('Done','Cancelled')", (project,))}
     prerequisite=db.execute('SELECT number,status FROM tasks WHERE id=?',(completed,)).fetchone()
     changed = []
+    import git_sync
+    preserve_done=git_sync.enabled(coord.settings(project_exists(db,project)))
     for row in db.execute("SELECT * FROM tasks WHERE project=? AND status NOT IN ('Done','In Review','Cancelled')", (project,)).fetchall():
         deps = json.loads(row['dependencies'])
         if completed not in deps or row['lock_until'] > time.time():
@@ -215,19 +310,36 @@ def resolve_dependents(db, project, completed, prefix, actor):
         status = row['status']
         if status == 'Blocked' and not remaining and not row['blocked_reason'].strip():
             status = 'TODO'
-        db.execute('UPDATE tasks SET dependencies=?,status=?,updated=? WHERE id=?', (json.dumps(remaining), status, now(), row['id']))
+        retained=[i for i in deps if db.execute('SELECT status FROM tasks WHERE id=?',(i,)).fetchone()[0]!='Cancelled'] if preserve_done else remaining
+        db.execute('UPDATE tasks SET dependencies=?,status=?,updated=? WHERE id=?', (json.dumps(retained), status, now(), row['id']))
         telemetry.transition(db,row['id'],status,actor)
         code = f"{prefix}-{row['number']}"
         author = actor_user(db, {'actor': actor})['name'] if actor is not None else 'System'
         resolution='resolved by cancellation' if prerequisite['status']=='Cancelled' else 'resolved by completion'
-        activity(db, row['id'], actor, 'comment', f"Blocker {prefix}-{prerequisite['number']} {resolution} by {author}; dependency removed; remaining task blockers: {len(remaining)}. Status: {status}." + (' Ready to claim.' if status == 'TODO' and not remaining and not row['blocked_reason'].strip() else ''))
+        dependency_note='dependency completion retained for Git integration' if preserve_done and prerequisite['status']=='Done' else 'dependency removed'
+        activity(db, row['id'], actor, 'comment', f"Blocker {prefix}-{prerequisite['number']} {resolution} by {author}; {dependency_note}; remaining task blockers: {len(remaining)}. Status: {status}." + (' Ready to claim.' if status == 'TODO' and not remaining and not row['blocked_reason'].strip() else ''))
         changed.append({'id': row['id'], 'code': code, 'status': status, 'remaining': len(remaining)})
     return changed
 
 def run(action, a):
-    result=_run(action,a)
+    import git_sync
+    with git_sync.transaction_jobs() as jobs:
+        result=_run(action,a)
+    if action=='agent_checkpoint' and a.get('action')=='observe' and isinstance(result,dict):
+        candidate=_run('git_recovery_next',{'project':a['project']})
+        if candidate:result['git_recovery_id']=candidate['id']
     import idle_signals
     idle_signals.notify(action,a)
+    if jobs and isinstance(result,dict):
+        pushes=git_sync.flush(run,jobs,result,a.get('project'))
+        if pushes:result['git_push']=pushes
+    if action=='agent_checkpoint' and a.get('action')=='offline' and 'run_exit_code' in a and isinstance(result,dict):
+        policy=_run('project_settings',{'project':a['project']})
+        if policy.get('git_cleanup') and policy.get('workspace_root'):
+            try:
+                cleaned=git_worktrees.cleanup(policy['workspace_root'],a['actor'],lambda source:_run('git_cleanup_pending',{'project':a['project'],'branch':source}))
+                if cleaned:result['git_cleanup']=cleaned
+            except (OSError,ValueError) as error:result['git_cleanup_error']=str(error)[:300]
     return result
 
 def _run(action, a):
@@ -238,6 +350,16 @@ def _run(action, a):
         import managed_agents
         import storage
         return managed_agents.wakeup(a,run,lambda:storage.dispatch(action,a,legacy_run,connect))
+    if action=='mcp_servers':
+        import storage,mcp_selection
+        _,folder=storage.entry(a['project'])
+        mode=a.get('action','list')
+        if mode=='update':
+            actor=next((u for u in run('users',{}) if u['id']==a.get('actor') and u['active'] and u['kind']=='human'),None)
+            if not actor:raise ValueError('An active human must change MCP server selection')
+            mcp_selection.save(folder,a.get('client'),a.get('mode'),a.get('servers',[]))
+        elif mode!='list':raise ValueError('Use list or update')
+        return mcp_selection.listing(folder)
     if action=='agent_manage':
         import managed_agents
         return managed_agents.operation(a,run)
@@ -349,6 +471,33 @@ def legacy_run(action, a, path=None, locks=None):
             return coord.operation(db,action,a,project_row,actor_user,activity,now)
         if action=='project_metrics':
             return telemetry.metrics(db,project,a.get('days',30),a.get('include_series',False))
+        if action=='git_recovery_next':
+            row=db.execute("SELECT id FROM tasks WHERE project=? AND category='Git recovery' AND status='TODO' AND lock_until<=? AND NOT EXISTS (SELECT 1 FROM tasks active WHERE active.project=tasks.project AND active.status='In Progress' AND active.lock_until>?) ORDER BY id LIMIT 1",(project,time.time(),time.time())).fetchone()
+            return dict(row) if row else None
+        if action=='git_note':  # internal: record a post-transaction git outcome
+            activity(db,a['id'],a.get('actor'),'comment',a['text'])
+            return {'saved':True}
+        if action=='git_cleanup_pending':  # native-only, no model context
+            rows=[dict(r) for r in db.execute('SELECT id,uid,number,title,context_group,dependencies,status FROM tasks WHERE project=?',(project,))]
+            return git_worktrees.related_pending(project_row['workspace_root'],a['branch'],rows,coord.settings(project_row),prefix)
+        if action=='task_changes':
+            row=db.execute('SELECT * FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone()
+            if not row:
+                raise ValueError('Task not found')
+            root=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]
+            if not root:
+                raise ValueError('Project has no workspace folder; open the project folder first')
+            root=git_worktrees.workspace(root,git_worktrees.identity(row))
+            subset=a.get('files')
+            if subset is not None:
+                subset=coord.file_plan(subset)
+            import git_changes
+            planned=json.loads(row['files'] or '[]')
+            view=git_changes.review(root,planned,a.get('max_lines',200),include_diff=a.get('diff',True),scope=subset)
+            if not view:
+                raise ValueError('Could not inspect the checkout (git unavailable or timed out)')
+            view['id']=a['id'];view['planned']=planned
+            return view
         if action=='task_timing':
             if not db.execute('SELECT 1 FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone():
                 raise ValueError('Task not found')
@@ -455,8 +604,11 @@ def legacy_run(action, a, path=None, locks=None):
             if held:
                 return {'claimed':False,'conflicts':held[:20],'conflicts_total':len(held)}
             seconds = a.get('lease_seconds', 3600)
-            if type(seconds) is not int or not 60 <= seconds <= 14400:
-                raise ValueError('lease_seconds must be 60..14400')
+            if type(seconds) is not int or not 60 <= seconds <= 14400:raise ValueError('lease_seconds must be 60..14400')
+            git=git_claim(db,project,row,prefix,actor['id']) if row['lock_until'] <= time.time() else None
+            if git and git.get('error'):raise ValueError('Git branch preparation failed: '+git['error'])
+            if git and git.get('busy'):
+                return {'claimed':False,'branch_busy':git['busy'],'hint':'Checkout holds uncommitted work of another branch; finish or hand off that work, or pick other work with exclude_ids.'}
             token = row['lock_token'] if row['lock_until'] > time.time() else secrets.token_urlsafe(24)
             until = time.time() + seconds
             db.execute("UPDATE tasks SET owner_id=?,lock_token=?,lock_until=?,status='In Progress',updated=? WHERE id=?", (actor['id'], token, until, now(), row['id']))
@@ -466,7 +618,15 @@ def legacy_run(action, a, path=None, locks=None):
             telemetry.transition(db,row['id'],'In Progress',actor['id'])
             if row['lock_until'] <= time.time():
                 activity(db, row['id'], actor['id'], 'claim', 'Claimed task; status In Progress.')
-            return {'claimed':True,'id': row['id'], 'code': f"{prefix}-{row['number']}", 'owner_id': actor['id'], 'token': token, 'lock_until': until, 'status': 'In Progress','files_reserved':len(paths)}
+            claimed={'claimed':True,'id': row['id'], 'code': f"{prefix}-{row['number']}", 'owner_id': actor['id'], 'token': token, 'lock_until': until, 'status': 'In Progress','files_reserved':len(paths)}
+            if row['lock_until'] <= time.time():
+                # Fresh claim: tell the worker which planned files were already edited on
+                # disk (not its work) so it reviews them before building on them.
+                import git_changes
+                baseline=git_changes.dirty(git_worktrees.workspace(root,git_worktrees.identity(db.execute('SELECT * FROM tasks WHERE id=?',(row['id'],)).fetchone())),plan)
+                if baseline:claimed['dirty_planned']=baseline[:20]
+                if git:claimed['git']=git
+            return claimed
         if action == 'snapshot':
             return {'runtime':runtime.summary(db,project),'settings':coord.settings(project_row),'users': [dict(r) for r in db.execute('SELECT * FROM users ORDER BY name,id')], 'tasks': [task_dict(r, prefix) for r in db.execute('SELECT * FROM tasks WHERE project=? ORDER BY priority,id', (project,))], 'notes': [dict(r, items=json.loads(r['items'])) for r in db.execute('SELECT * FROM notes WHERE project=? ORDER BY id DESC', (project,))]}
         if action == 'task_plan':
@@ -478,6 +638,9 @@ def legacy_run(action, a, path=None, locks=None):
             criteria = acceptance_criteria(a.get('acceptance_criteria'))
             coord.validate_scope(a.get('scope_size','Unknown'),a.get('scope_reason',''))
             db.execute('BEGIN IMMEDIATE')
+            same,differs=duplicate_task(db,project,title,a)
+            if same:
+                return {'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':differs} if differs else {}),'note':existing_note(differs)}
             number = db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE project=?', (project,)).fetchone()[0]
             cur = db.execute('INSERT INTO tasks(project,title,description,priority,updated,checklist,number,category,acceptance_criteria) VALUES(?,?,?,?,?,?,?,?,?)', (project, title, scope, priority(a.get('priority', 2)), now(), json.dumps(checklist(a.get('checklist', []))), number, required(a.get('category','General'), 'category', 80),json.dumps(criteria)))
             import task_cost
@@ -623,6 +786,10 @@ def legacy_run(action, a, path=None, locks=None):
                 held=coord.conflicts(db,paths,t['id'],a['actor'])
                 if held:
                     return {'claimed':False,'conflicts':held[:20],'conflicts_total':len(held)}
+                git=git_claim(db,project,old,prefix,a['actor']) if old['lock_until'] <= time.time() else None
+                if git and git.get('error'):raise ValueError('Git branch preparation failed: '+git['error'])
+                if git and git.get('busy'):
+                    return {'claimed':False,'branch_busy':git['busy'],'hint':'Checkout holds uncommitted work of another branch; finish or hand off that work, or pick other work with exclude_ids.'}
             db.execute('UPDATE tasks SET title=?,description=?,status=?,priority=?,blocked_reason=?,dependencies=?,checklist=?,updated=? WHERE id=? AND project=?', (t['title'], t['description'], t['status'], int(t['priority']), t['blocked_reason'], json.dumps(t['dependencies']), json.dumps(t['checklist']), now(), t['id'], project))
             until = old['lock_until']
             token = old['lock_token']
@@ -674,6 +841,10 @@ def legacy_run(action, a, path=None, locks=None):
             result = {'id': t['id'], 'code': t['code'], 'status': t['status'], 'unblocked': unblocked[:20], 'unblocked_total': len(unblocked)}
             if claiming:
                 result.update(claimed=True,token=token, lock_until=until, owner_id=owner,files_reserved=len(paths))
+                if git:result['git']=git
+            if t['status']=='Done' and old['status']!='Done':
+                git=git_done(db,project,dict(t,context_group=a.get('context_group',old['context_group'])),prefix,a.get('actor') if a.get('actor') is not None else owner)
+                if git:result['git']=git
             return result
         if action=='cli_usage_summary':
             import execution_usage
@@ -748,7 +919,10 @@ def legacy_run(action, a, path=None, locks=None):
             # A prose blocker requires an agent decision; never silently clear it.
             candidates = [t for t in tasks if t['status'] == 'In Progress' and ready(t)]
             candidates += [t for t in tasks if t['status'] == 'Blocked' and t['dependencies'] and ready(t) and not t['blocked_reason']]
-            candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t)]
+            # Own paused work (handoff continuity) resumes before fresh TODO work.
+            mine=lambda t: a.get('actor') is not None and t['owner_id']==a.get('actor') and bool(t.get('continuity'))
+            candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and mine(t)]
+            candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and not mine(t)]
             excluded=a.get('exclude_ids',[])
             if not isinstance(excluded,list) or len(excluded)>100 or any(type(i) is not int for i in excluded):
                 raise ValueError('exclude_ids must be a list of at most 100 task IDs')
@@ -786,6 +960,29 @@ def legacy_run(action, a, path=None, locks=None):
                 else:
                     available.append(task)
             candidates=available
+            # Branches mode: one checkout works one branch at a time, so never
+            # suggest work whose claim would be refused with branch_busy. The
+            # checkout belongs to the branch of other active tasks, or to the
+            # current branch while it holds uncommitted edits.
+            branch_skipped=0
+            settings=coord.settings(project_row)
+            if settings.get('git_mode')=='Branches' and project_row['workspace_root'] and candidates:
+                import git_sync
+                task_branch=lambda t:git_sync.branch_for(settings,{'code':t['code'],'title':t['title'],'context_group':t.get('context_group','')})
+                active_rows=db.execute("SELECT * FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchall()
+                branches={task_branch(task_dict(r,prefix)) for r in active_rows}
+                owned=next(iter(branches)) if len(branches)==1 else None
+                if owned is None and not branches:
+                    current=git_sync.state(project_row['workspace_root'])
+                    if current and current[1]:owned=current[0]
+                if owned is not None or branches:
+                    # Recovery deliberately uses the existing checkout (including
+                    # dirty staging), but cannot interrupt another live claim.
+                    keep=[t for t in candidates if (t['locked'] and t['owner_id']==a.get('actor')) or
+                          (not active_rows if t['category']=='Git recovery' else task_branch(t)==owned)]
+                    branch_skipped=len(candidates)-len(keep)
+                    candidates=keep
+            if action=='worker_launch' and a.get('id') is not None:candidates=[t for t in candidates if t['id']==a['id']]
             if action=='worker_launch':
                 if not candidates:return {'eligible':False,'reason':'No eligible unreserved work; no model was started.'}
                 selected=candidates[0]
@@ -809,5 +1006,5 @@ def legacy_run(action, a, path=None, locks=None):
                 import context_tools
                 candidates[0]=context_tools.conditional(candidates[0],a['task_seen'])
             import context_tools
-            return {'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'capacity':{'active':active,'limit':limit},'file_conflicts_skipped':conflicts_skipped,'missing_workspace_skipped':missing_root,'invalid_files_skipped':invalid_files,'task': candidates[0] if candidates else None, 'blocked': blocked[:20], 'blocked_total': len(blocked), 'instruction': 'Resume In Progress, then actionable Blocked, then TODO. Claim task and planned files before edits; on conflict choose other work. No candidate can mean locked work or capacity/configuration limits, not an empty backlog. Never invent busywork.'}
+            return {'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'capacity':{'active':active,'limit':limit},'file_conflicts_skipped':conflicts_skipped,'missing_workspace_skipped':missing_root,'invalid_files_skipped':invalid_files,**({'branch_skipped':branch_skipped} if branch_skipped else {}),'task': candidates[0] if candidates else None, 'blocked': blocked[:20], 'blocked_total': len(blocked), 'instruction': 'Resume In Progress, then actionable Blocked, then TODO. Claim task and planned files before edits; on conflict choose other work. No candidate can mean locked work or capacity/configuration limits, not an empty backlog. Never invent busywork.'}
         raise ValueError('Unknown action')

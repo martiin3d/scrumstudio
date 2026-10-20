@@ -1,22 +1,37 @@
 ---
 name: scrum-rules
-description: Apply Scrum Studio scope sizing and planning rules for independently verifiable tasks.
+description: Apply Scrum Studio task sizing and planning rules - decide when to group or split work so one agent saves tokens and other agents can take tasks in parallel, with no duplicates or speculative backlog.
 ---
 
-Read cached project settings from session_resume/next_work. task_sizing defaults to Small; humans may change it through project_settings(project,actor,task_sizing) or web Settings. Use an existing human identity only for a human-requested change; never weaken policy to finish your own task.
+Before the first claim, map the whole known authorized scope to existing or new TODO tasks in one `task_plan(project, actor, items)` call (1..10 items: key, title, description, acceptance_criteria; optional id to refine an unlocked unfinished task, files, dependencies by id or key, model_tier). It is atomic and never claims. Search first (`task_search`). A same-title unfinished task returns `existing=true` and is never duplicated silently: with no `differs` it is identical, continue it; with `differs=[...]` refine it by `id` if the scope really changed; `allow_duplicate=true` only for a deliberately separate outcome.
 
-Before implementation, map the entire currently known human-authorized scope to existing or new TODO tasks, then finish registering that set before claiming the first task. Preserve actual states/history of reused tasks; only newly created work must start in TODO. Every new task must include description and explicit acceptance criteria in its initial creation. Prefer one independently verifiable outcome per task; a single bounded request needs only one task. Group improvements only when they form one cohesive outcome with shared verification, and state the grouping rationale briefly before execution. Measurement may be acceptance evidence for those tasks or its own bounded task when it produces a separate deliverable. Do not split by file/tool call, add speculative backlog, or duplicate existing work. If creation fails or scope needs required clarification, resolve it before executing dependent work. During execution, register newly discovered justified work in TODO before switching to it; do not reconstruct completed work as if it had been planned beforehand. A backlog-only request never authorizes execution.
+## Group or split
 
-Small: one concrete outcome with independent acceptance evidence. Split independent results or work expected to span sessions. Keep only the near-term justified backlog; do not turn every edit, file or tool call into a task. If a selected task is too broad, record its remaining scope and create a few executable TODO tasks with dependencies rather than a speculative tree. Balanced permits a cohesive multi-step outcome; Unrestricted removes the sizing preference while retaining acceptance criteria and ownership rules. Sizing is a semantic agent instruction, not a reliable server-side word-count heuristic.
+The unit is **one result with its own acceptance check**, sized so a session finishes one to three tasks. Then decide with these criteria:
 
-Batch a small set of related backlog writes when supported, reuse cached settings_version, and keep each task's resume context in concise work logs. Avoid duplicate parent/child completion claims. See scrum-task-create for creation and scrum-work for execution.
+**Keep in one task** when any applies:
+- Same result with shared verification (API + storage + regression test of one fix).
+- The pieces edit the same files and must land together (splitting would only create lock conflicts).
+- A piece is trivial on its own (a rename, a constant, a copy fix of a few minutes): fold it into the task that touches that code.
+- One piece cannot be verified without the other.
 
-Make the decision in the existing planning turn using cached task_sizing. A broad "Improve checkout" with independently shippable address validation and receipt download should become two concrete outcomes, each with its own observable acceptance check. Refine the original task into one outcome (retain its ID/history) and create only the other authorized outcomes. A "Fix duplicate receipt on retry" spanning API, storage and a regression test stays one task because it has one result and shared verification. Never create separate tasks just for reading, editing a file, running tests, or generic "backend/frontend/testing" phases of one result. Balanced can group related steps; Unrestricted does not require decomposition.
+**Split** when any applies:
+- The results ship or can be reverted independently.
+- They touch disjoint files or areas: another agent can take one in parallel.
+- They need different model tiers (mechanical edit = economy, design or tricky bug = advanced).
+- Together they would likely exceed one session (a split task survives a Stop/resume with cleaner continuity).
+- Different risk: keep a risky change separate from safe cleanup.
 
-Use task_plan(project,actor,items) for 1..10 planned outcomes in one atomic call instead of per-item writes. Each item needs key, title, description and acceptance_criteria; optional id refines an unlocked unfinished existing task, optional files is a minimal plan, and dependencies accepts numeric task IDs or another item's key. New tasks stay TODO and unclaimed. Existing status, evidence, authorship and ownership stay intact. An active claim blocks refinement; do not release others to bypass it. All changes roll back together on invalid input/dependencies. Reuse task_create/task_update for a single ordinary write or unsupported fields. Register the whole known set before claiming, leave independent outcomes available through next_work for already-authorized workers, and add only real dependencies. No extra model calls, automatic workers, polling, or mandatory per-subtask logs/settings reads are needed. Local request/response bytes and server time are not provider tokens; never promise zero quota cost without actual provider measurements.
+**Never split** by file, tool call, reading/testing phase or backend/frontend layer of one result. No speculative backlog; register justified discoveries in TODO before switching to them.
 
-Follow shared compact-context, source-reading, verification and model-routing policy in [core guidance](../scrum-work/references/core-guidance.md). Scope sizing and planning rules above remain specific to this skill.
+## Make split tasks cheap and parallel-safe
 
-Optional verification_level and verification_reason can be selected during normal planning. They record intent, not evidence or permission to skip required checks. Record actual evidence and explain any skipped automated checks.
+- Always give each task an accurate minimal `files` plan. The server uses it to avoid conflicts between agents and to batch tasks that share files into one agent run (up to three, same priority and model), so related small tasks reuse context automatically while disjoint tasks go to other agents.
+- Add `dependencies` only for real order constraints; a needless dependency serializes work and blocks other agents.
+- Same `context_group` for tasks that share reading context; it groups them on the board without claiming anything.
+- Check cached `max_parallel_agents`: with 1, lean toward fewer, cohesive tasks; with more, prefer splitting by disjoint files so agents do not wait on each other.
+- State the grouping decision in one line. Sizing policy is changed only by a human (`project_settings` or the web).
 
-Use optional `context_group` (single-line name, max80 characters; blank clears) in task_create/task_update or task_plan items for planned shared-context membership. Use the same name on related tasks; do not duplicate grouping instructions in descriptions. Task list > Group by > Context group displays this metadata. It grants no claims, reservations, dependency changes or execution authorization. Agent batch separately displays actual execution batches; compatibility, dependencies and fresh ownership still apply.
+Examples and Balanced/Unrestricted details: [details](references/details.md).
+
+Git recovery tasks use the existing checkout and may preserve dirty files/staging; they remain eligible when no other live claim needs the checkout. Never bypass active claims. For direct MCP CLI fallback omit --timeout to use operation-specific bounds (15 seconds ordinary calls, 180 completion writes); never retry an uncertain write without reconciling recorded state.

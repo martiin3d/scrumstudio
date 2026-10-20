@@ -8,6 +8,12 @@ import threading
 
 ROOT=Path(__file__).resolve().parents[1]
 
+def tool_timeout(name,args,default=20):
+    # Completion may publish source and target (60 seconds each) after Done.
+    # Leave room for commit/merge and bookkeeping without slowing ordinary calls.
+    completion=name=='work_finish' or (name=='task_update' and args.get('status')=='Done')
+    return 180 if completion else default
+
 class ToolError(RuntimeError):
     def __init__(self,result):
         structured=result.get('structuredContent')
@@ -89,7 +95,8 @@ class ScrumClient(JsonClient):
         except Exception:
             self.close();raise
 
-    def call(self,name,args,timeout=20):
+    def call(self,name,args,timeout=None):
+        if timeout is None:timeout=tool_timeout(name,args)
         result=self.rpc('tools/call',{'name':name,'arguments':args},timeout=timeout)
         if not isinstance(result,dict):raise RuntimeError('Malformed MCP tool response')
         if result.get('isError'):
@@ -108,10 +115,10 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tool',required=True)
     parser.add_argument('--args-file',type=Path,help='UTF-8 JSON arguments; otherwise read JSON from stdin')
-    parser.add_argument('--timeout',type=float,default=15,help='Seconds per RPC, including initialization (default 15, maximum 60)')
+    parser.add_argument('--timeout',type=float,help='Explicit seconds per RPC (maximum 300); default: initialization/ordinary calls 15, completion writes 180')
     options=parser.parse_args(argv)
-    if not math.isfinite(options.timeout) or not 0<options.timeout<=60:
-        parser.error('--timeout must be greater than zero and at most 60 seconds')
+    if options.timeout is not None and (not math.isfinite(options.timeout) or not 0<options.timeout<=300):
+        parser.error('--timeout must be greater than zero and at most 300 seconds')
     try:
         raw=options.args_file.read_text(encoding='utf-8-sig') if options.args_file else (sys.stdin.read() if not sys.stdin.isatty() else '{}')
         arguments=json.loads(raw.strip().lstrip('\ufeff') or '{}')
@@ -124,8 +131,8 @@ def main(argv=None):
     started=time.perf_counter()
     client=None
     try:
-        client=ScrumClient(timeout=options.timeout)
-        result=client.call(options.tool,arguments,timeout=options.timeout)
+        client=ScrumClient(timeout=options.timeout if options.timeout is not None else 15)
+        result=client.call(options.tool,arguments,timeout=options.timeout if options.timeout is not None else tool_timeout(options.tool,arguments,15))
         print(json.dumps(result,ensure_ascii=True))
         return 0
     except (RuntimeError,OSError,ValueError) as error:
