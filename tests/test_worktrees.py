@@ -8,6 +8,9 @@ SPEC=test_low_turns.SPEC
 from store import run
 
 
+import git_sync as _git_sync
+NEEDS_MERGE_TREE=unittest.skipIf((_git_sync.git_version() or (0,0))<_git_sync.MERGE_TREE_MIN,"git_merge needs git 2.38+ (merge-tree --write-tree)")
+
 class WorktreeTest(unittest.TestCase):
     setUp=test_storage.StorageTest.setUp
     tearDown=test_storage.StorageTest.tearDown
@@ -78,6 +81,7 @@ class WorktreeTest(unittest.TestCase):
         self.assertEqual(resumed['git']['worktree'],str(work))
         self.assertEqual((work/'a.py').read_text(),'partial outcome')
 
+    @NEEDS_MERGE_TREE
     def test_parallel_completed_work_merges_into_clean_canonical_parent(self):
         project,folder,git=self.setup_repo(git_merge='Group')
         first=self.task(project,'One','a.py');second=self.task(project,'Two','b.py');other=self.other(project)
@@ -92,6 +96,7 @@ class WorktreeTest(unittest.TestCase):
         self.assertEqual((folder/'a.py').read_text(),'one');self.assertEqual((folder/'b.py').read_text(),'two')
         self.assertEqual(git('status','--porcelain'),'')
 
+    @NEEDS_MERGE_TREE
     def test_cleanup_waits_for_cli_exit_and_reopened_task_gets_parent(self):
         project,folder,git=self.setup_repo(git_merge='Group',git_cleanup=True)
         task=self.task(project,'Cleanup','a.py')
@@ -109,6 +114,7 @@ class WorktreeTest(unittest.TestCase):
         resumed=run('task_claim',dict(project=project,id=task,actor=self.agent))
         self.assertEqual(resumed['git']['parent'],'main');self.assertEqual((work/'a.py').read_text(),'completed')
 
+    @NEEDS_MERGE_TREE
     def test_cleanup_preserves_untracked_and_ignored_files(self):
         project,folder,git=self.setup_repo(git_merge='Group',git_cleanup=True)
         task=self.task(project,'Keep files','a.py')
@@ -118,6 +124,7 @@ class WorktreeTest(unittest.TestCase):
         result=run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='offline',run_exit_code=0))
         self.assertFalse(result['git_cleanup'][0]['removed']);self.assertEqual((work/'.scrum/private').read_text(),'keep')
 
+    @NEEDS_MERGE_TREE
     def test_cleanup_keeps_parent_needed_by_another_branch(self):
         project,folder,git=self.setup_repo(git_merge='Group',git_cleanup=True)
         task=self.task(project,'Parent','a.py');claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
@@ -127,6 +134,7 @@ class WorktreeTest(unittest.TestCase):
         result=run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='offline',run_exit_code=0))
         self.assertIn('origin',result['git_cleanup'][0]['reason']);self.assertTrue(work.exists())
 
+    @NEEDS_MERGE_TREE
     def test_cleanup_defers_for_new_related_work_and_rechecks_after_later_exit(self):
         project,folder,git=self.setup_repo(git_merge='Group',git_cleanup=True)
         task=self.task(project,'First related','a.py')

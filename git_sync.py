@@ -18,6 +18,16 @@ from pathlib import Path
 
 GIT_DEFAULTS = {'git_cleanup':False, 'git_merge':'Off', 'git_mode': 'Off', 'git_commit': 'Task', 'git_push': 'Group', 'git_base_branch': '', 'git_branch_prefix': 'scrum/', 'git_remote': 'origin'}
 _jobs = threading.local()
+PUSH_TIMEOUT = 60   # network; a first push of a large branch is slow, and GIT_TERMINAL_PROMPT=0 keeps it from hanging
+MERGE_TREE_MIN = (2, 38)  # `git merge-tree --write-tree`
+
+def git_version(root='.'):
+    try:
+        out = _git(root, '--version').stdout.strip()  # 'git version 2.44.0.windows.1'
+        parts = out.split()[2].split('.')
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError, OSError, subprocess.SubprocessError):
+        return None
 
 @contextmanager
 def transaction_jobs():
@@ -229,6 +239,9 @@ def merge_completed(root,settings,source):
     elif _git(root,'merge-base','--is-ancestor',before,tip).returncode==0:
         merged=tip
     else:
+        version=git_version(root)
+        if version and version<MERGE_TREE_MIN:
+            return {'merged':False,'error':f'Automatic merge needs git {MERGE_TREE_MIN[0]}.{MERGE_TREE_MIN[1]}+ (merge-tree --write-tree); found {version[0]}.{version[1]}. Upgrade git or set git_merge=Off'}
         tree=_git(root,'merge-tree','--write-tree',before,tip,timeout=10)
         if tree.returncode:return {'merged':False,'error':'Merge conflict or merge-tree failure; agent resolution required','details':tree.stdout[-1500:]}
         made=_git(root,'commit-tree',tree.stdout.splitlines()[0],'-p',before,'-p',tip,'-m','Merge '+source+' into '+base,timeout=10)
@@ -242,7 +255,7 @@ def merge_completed(root,settings,source):
     report={'merged':True,'target':base,'sha':merged,'source':source,'source_sha':tip}
     if settings.get('git_push')!='Never':
         try:
-            pushed=_git(root,'push','--quiet',settings.get('git_remote','origin'),merged+':'+target,timeout=10)
+            pushed=_git(root,'push','--quiet',settings.get('git_remote','origin'),merged+':'+target,timeout=PUSH_TIMEOUT)
             if pushed.returncode:report.update(error='Merge exists locally, but target push failed: '+pushed.stderr[-300:],pushed=False)
             else:report['pushed']=True
         except (OSError,subprocess.SubprocessError) as error:report.update(error=str(error)[:300],pushed=False)
@@ -272,7 +285,7 @@ def _finish(item):
         elif policy=='Task' or unit_done:
             remote=settings.get('git_remote','origin')
             try:
-                result=_git(root,'push','--quiet','-u',remote,report['branch'],timeout=10)
+                result=_git(root,'push','--quiet','-u',remote,report['branch'],timeout=PUSH_TIMEOUT)
                 report['push']={'pushed':True,'remote':remote,'branch':report['branch']} if not result.returncode else {'pushed':False,'error':(result.stderr or result.stdout).strip()[-300:] or 'push failed'}
             except (OSError,subprocess.SubprocessError) as error:
                 report['push']={'pushed':False,'error':str(error)[:300]}

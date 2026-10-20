@@ -31,7 +31,7 @@ def apply(db,a,project):
             if old['status'] in ('Done','Cancelled') or old['lock_until']>time.time():
                 raise ValueError('Plan only unfinished tasks without an active claim; preserve current work')
         title=required(item.get('title'),'title',240)
-        same=None if old else duplicate_task(db,project,title,{**a,**item})
+        same,differs=(None,[]) if old else duplicate_task(db,project,title,{**a,**item})
         if same:
             # Reused outcomes still reject invalid planning input.
             from store import validate_verification
@@ -47,7 +47,7 @@ def apply(db,a,project):
         deps=item.get('dependencies',json.loads(old['dependencies']) if old else [])
         if not isinstance(deps,list) or len(deps)>100 or any(type(d) not in (str,int) for d in deps):
             raise ValueError('Dependencies must be task IDs or plan keys')
-        prepared.append(dict(same=same,item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps))
+        prepared.append(dict(same=same,differs=differs,item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps))
     prefix=project_prefix(db.execute('SELECT name FROM projects WHERE id=?',(project,)).fetchone()['name'])
     result=[]
     resolved_items=[]
@@ -56,7 +56,8 @@ def apply(db,a,project):
         if value['same']:
             # Resumed sessions often re-plan known work: reuse, never repeat it.
             same=value['same'];keys[value['key']]=same['id']
-            result.append({'key':value['key'],'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True})
+            from store import existing_note
+            result.append({'key':value['key'],'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':value['differs'],'note':existing_note(value['differs'])} if value['differs'] else {})})
             continue
         rank=priority(item.get('priority',old['priority'] if old else 2))
         category=required(item.get('category',old['category'] if old else 'General'),'category',80)

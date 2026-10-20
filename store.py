@@ -204,21 +204,36 @@ def title_key(value):
     return ' '.join(unicodedata.normalize('NFKC',value).casefold().split())
 
 def duplicate_task(db, project, title, a):
-    """Identical outcome for an agent retry; title alone is never identity."""
+    """Same-title task for an agent re-planning after a resume.
+
+    Returns (row, differs): differs is empty when the registered outcome is
+    identical, otherwise the fields that differ. A reworded re-plan of UNFINISHED
+    work must never create a second task silently: the caller reports the
+    existing one and the agent continues it, refines it (task_plan with id) or
+    passes allow_duplicate. A Done task with a different scope is not a match:
+    new requirements under an old title are new work.
+    """
     allow=a.get('allow_duplicate',False)
     if type(allow) is not bool:raise ValueError('allow_duplicate must be boolean')
-    if allow or a.get('actor') is None or actor_user(db,a)['kind']!='agent':return None
+    if allow or a.get('actor') is None or actor_user(db,a)['kind']!='agent':return None,[]
     key=title_key(title)
     for row in db.execute("SELECT * FROM tasks WHERE project=? AND status!='Cancelled' ORDER BY id DESC",(project,)):
         if title_key(row['title'])!=key:continue
-        # A title is only a lookup hint. Reuse requires the same outcome.
-        same=row['description'].strip()==str(a.get('description','')).strip() and json.loads(row['acceptance_criteria'])==a.get('acceptance_criteria')
+        differs=[]
+        if row['description'].strip()!=str(a.get('description','')).strip():differs.append('description')
+        if json.loads(row['acceptance_criteria'])!=a.get('acceptance_criteria'):differs.append('acceptance_criteria')
         for field in ('files','dependencies','checklist'):
-            if field in a and json.loads(row[field])!=a[field]:same=False
+            if field in a and json.loads(row[field])!=a[field]:differs.append(field)
         for field in ('category','priority','scope_size','scope_reason','context_group','model','model_tier','model_reason','verification_level','verification_reason'):
-            if field in a and row[field]!=a[field]:same=False
-        if same:return row
-    return None
+            if field in a and row[field]!=a[field]:differs.append(field)
+        if differs and row['status']=='Done':
+            continue  # delivered work with a new scope is new work; an unfinished one is continued
+        return row,differs
+    return None,[]
+
+def existing_note(differs):
+    if not differs:return 'Identical scope already registered; reuse its recorded state. allow_duplicate=true permits a deliberately separate outcome.'
+    return 'A task with this title already exists with a different '+', '.join(differs)+'. Reuse it, refine it with task_plan(id=...) if its scope must change, or pass allow_duplicate=true for a deliberately separate outcome. Nothing was created.'
 
 def actor_user(db, a):
     row = db.execute('SELECT * FROM users WHERE id=?', (a.get('actor'),)).fetchone()
@@ -623,9 +638,9 @@ def legacy_run(action, a, path=None, locks=None):
             criteria = acceptance_criteria(a.get('acceptance_criteria'))
             coord.validate_scope(a.get('scope_size','Unknown'),a.get('scope_reason',''))
             db.execute('BEGIN IMMEDIATE')
-            same=duplicate_task(db,project,title,a)
+            same,differs=duplicate_task(db,project,title,a)
             if same:
-                return {'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,'note':'Identical scope already registered; reuse its recorded state. allow_duplicate=true permits a deliberately separate outcome.'}
+                return {'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':differs} if differs else {}),'note':existing_note(differs)}
             number = db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE project=?', (project,)).fetchone()[0]
             cur = db.execute('INSERT INTO tasks(project,title,description,priority,updated,checklist,number,category,acceptance_criteria) VALUES(?,?,?,?,?,?,?,?,?)', (project, title, scope, priority(a.get('priority', 2)), now(), json.dumps(checklist(a.get('checklist', []))), number, required(a.get('category','General'), 'category', 80),json.dumps(criteria)))
             import task_cost
@@ -945,6 +960,24 @@ def legacy_run(action, a, path=None, locks=None):
                 else:
                     available.append(task)
             candidates=available
+            # Branches mode: one checkout works one branch at a time, so never
+            # suggest work whose claim would be refused with branch_busy. The
+            # checkout belongs to the branch of other active tasks, or to the
+            # current branch while it holds uncommitted edits.
+            branch_skipped=0
+            settings=coord.settings(project_row)
+            if settings.get('git_mode')=='Branches' and project_row['workspace_root'] and candidates:
+                import git_sync
+                task_branch=lambda t:git_sync.branch_for(settings,{'code':t['code'],'title':t['title'],'context_group':t.get('context_group','')})
+                others={task_branch(task_dict(r,prefix)) for r in db.execute("SELECT * FROM tasks WHERE project=? AND status='In Progress' AND lock_until>? AND owner_id!=?",(project,time.time(),a.get('actor',-1)))}
+                owned=next(iter(others)) if len(others)==1 else None
+                if owned is None and not others:
+                    current=git_sync.state(project_row['workspace_root'])
+                    if current and current[1]:owned=current[0]
+                if owned is not None:
+                    keep=[t for t in candidates if (t['locked'] and t['owner_id']==a.get('actor')) or task_branch(t)==owned]
+                    branch_skipped=len(candidates)-len(keep)
+                    candidates=keep
             if action=='worker_launch' and a.get('id') is not None:candidates=[t for t in candidates if t['id']==a['id']]
             if action=='worker_launch':
                 if not candidates:return {'eligible':False,'reason':'No eligible unreserved work; no model was started.'}
@@ -969,5 +1002,5 @@ def legacy_run(action, a, path=None, locks=None):
                 import context_tools
                 candidates[0]=context_tools.conditional(candidates[0],a['task_seen'])
             import context_tools
-            return {'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'capacity':{'active':active,'limit':limit},'file_conflicts_skipped':conflicts_skipped,'missing_workspace_skipped':missing_root,'invalid_files_skipped':invalid_files,'task': candidates[0] if candidates else None, 'blocked': blocked[:20], 'blocked_total': len(blocked), 'instruction': 'Resume In Progress, then actionable Blocked, then TODO. Claim task and planned files before edits; on conflict choose other work. No candidate can mean locked work or capacity/configuration limits, not an empty backlog. Never invent busywork.'}
+            return {'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'capacity':{'active':active,'limit':limit},'file_conflicts_skipped':conflicts_skipped,'missing_workspace_skipped':missing_root,'invalid_files_skipped':invalid_files,**({'branch_skipped':branch_skipped} if branch_skipped else {}),'task': candidates[0] if candidates else None, 'blocked': blocked[:20], 'blocked_total': len(blocked), 'instruction': 'Resume In Progress, then actionable Blocked, then TODO. Claim task and planned files before edits; on conflict choose other work. No candidate can mean locked work or capacity/configuration limits, not an empty backlog. Never invent busywork.'}
         raise ValueError('Unknown action')

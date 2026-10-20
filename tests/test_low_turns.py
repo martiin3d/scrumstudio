@@ -18,6 +18,9 @@ SCRIPTS=Path(__file__).resolve().parents[1]/'scripts'
 sys.path.insert(0,str(SCRIPTS))
 SPEC=dict(description='Outcome',acceptance_criteria=['Checked.'])
 
+import git_sync as _git_sync
+NEEDS_MERGE_TREE=unittest.skipIf((_git_sync.git_version() or (0,0))<_git_sync.MERGE_TREE_MIN,"git_merge needs git 2.38+ (merge-tree --write-tree)")
+
 class ClaimNextTest(unittest.TestCase):
     setUp=test_app.WorkflowTest.setUp
     tearDown=test_app.WorkflowTest.tearDown
@@ -232,6 +235,7 @@ class GitAutomationTest(unittest.TestCase):
         self.assertEqual(git_sync.branch_for({'git_branch_prefix':'scrum/'},{'code':'WEB-7','title':'Fix Login Página','context_group':''}),'scrum/web-7-fix-login-pagina')
         self.assertEqual(git_sync.branch_for({'git_branch_prefix':'f/'},{'code':'WEB-7','title':'x','context_group':'Auth flow'}),'f/auth-flow')
 
+    @NEEDS_MERGE_TREE
     def test_merge_uses_recorded_parent_after_base_setting_changes(self):
         project,folder=self.project();git=self.repo(folder)
         git('checkout','-qb','develop');git('checkout','-q','main')
@@ -256,6 +260,7 @@ class GitAutomationTest(unittest.TestCase):
         result=git_sync.merge_completed(folder,{'git_base_branch':'main','git_push':'Never'},'manual')
         self.assertIn('origin branch',result['error']);self.assertEqual(git('rev-parse','main'),before)
 
+    @NEEDS_MERGE_TREE
     def test_native_merge_publishes_base_and_preserves_foreign_staging(self):
         project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group')
         task=run('task_create',dict(project=project,title='Merge smoke',files=['a.py'],**SPEC))['id']
@@ -271,6 +276,7 @@ class GitAutomationTest(unittest.TestCase):
         self.assertEqual(git('show',':b.py'),'human staging')
         self.assertNotIn('recovery_task',report)
 
+    @NEEDS_MERGE_TREE
     def test_native_divergent_merge_and_conflict_recovery(self):
         for conflict in (False,True):
             with self.subTest(conflict=conflict):
@@ -461,6 +467,28 @@ class GitAutomationTest(unittest.TestCase):
         (folder/'b.py').write_text('b\nx\n')
         done=run('work_finish',dict(project=project,actor=other,id=single,token=claim2['token'],evidence='ok'))
         self.assertTrue(done['completed']['git_push'][0]['pushed'])
+
+    def test_next_work_prefers_the_branch_the_checkout_is_on(self):
+        project,folder=self.project()
+        git=self.repo(folder)
+        self.enable(project)
+        grouped=run('task_create',dict(project=project,title='Grouped',files=['a.py'],context_group='Auth flow',priority=3,**SPEC))['id']
+        sibling=run('task_create',dict(project=project,title='Sibling',files=['b.py'],context_group='Auth flow',priority=3,**SPEC))['id']
+        single=run('task_create',dict(project=project,title='Readme tweak',files=['README.md'],priority=1,**SPEC))['id']
+        other=run('user_register',{'identity':'agent:second','name':'Second','kind':'agent'})['id']
+        run('agent_checkpoint',{'project':project,'actor':other,'client':'codex','session_used_percent':10,'weekly_used_percent':20})
+        # Clean checkout, nobody active: plain priority order.
+        self.assertEqual(run('next_work',dict(project=project,actor=other))['task']['id'],single)
+        claim=run('task_claim',dict(project=project,id=grouped,actor=self.agent))
+        # Another agent holds the group branch: only same-branch work is suggested, never a claim that would be refused.
+        suggestion=run('next_work',dict(project=project,actor=other))
+        self.assertEqual((suggestion['task']['id'],suggestion['branch_skipped']),(sibling,1))
+        run('work_finish',dict(project=project,actor=self.agent,id=grouped,token=claim['token'],evidence='ok'))
+        # Nobody active but the checkout has uncommitted edits on the group branch: same rule.
+        (folder/'b.py').write_text('b\nx\n')
+        self.assertEqual(run('next_work',dict(project=project,actor=other))['task']['id'],sibling)
+        git('checkout','-q','main');git('checkout','-q','--','b.py')
+        self.assertEqual(run('next_work',dict(project=project,actor=other))['task']['id'],single)
 
     def test_push_failure_is_reported_and_done_stands(self):
         project,folder=self.project()

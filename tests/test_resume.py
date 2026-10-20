@@ -45,6 +45,17 @@ class ResumeTest(unittest.TestCase):
         self.assertNotEqual(plan['items'][0]['id'],original)
         self.assertEqual(run('task_get',dict(project=self.p,id=original))['acceptance_criteria'],SPEC['acceptance_criteria'])
 
+    def test_reworded_unfinished_work_is_reported_not_duplicated(self):
+        original=run('task_create',dict(project=self.p,actor=self.actor,title='Login',files=['a.py'],**SPEC))['id']
+        reworded=run('task_create',dict(project=self.p,actor=self.actor,title='login',description='Resumable outcome, reworded',acceptance_criteria=['Checked.'],files=['a.py','b.py']))
+        self.assertEqual((reworded['id'],reworded['existing'],reworded['differs']),(original,True,['description','files']))
+        self.assertIn('Nothing was created',reworded['note'])
+        plan=run('task_plan',dict(project=self.p,actor=self.actor,items=[dict(key='l',title='Login',description='Other words',acceptance_criteria=['Checked.'])]))
+        self.assertEqual((plan['items'][0]['id'],plan['items'][0]['differs']),(original,['description']))
+        self.assertEqual(len(run('snapshot',dict(project=self.p))['tasks']),1)
+        refined=run('task_plan',dict(project=self.p,actor=self.actor,items=[dict(key='l',id=original,title='Login',description='Other words',acceptance_criteria=['Checked.'])]))
+        self.assertNotIn('existing',refined['items'][0]);self.assertEqual(run('task_get',dict(project=self.p,id=original))['description'],'Other words')
+
     def test_worker_keeps_planning_and_routing_fields(self):
         with patch.object(sys,'argv',['mcp_server.py','--profile','worker']):tools=mcp_server.catalog()
         for name in ('task_create','task_update'):

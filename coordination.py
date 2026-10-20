@@ -193,6 +193,11 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         db.execute('BEGIN IMMEDIATE')
         current=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
         validate_policy(changed)
+        if changed.get('git_merge')=='Group':
+            import git_sync
+            version=git_sync.git_version(current['workspace_root'] or '.')
+            if version and version<git_sync.MERGE_TREE_MIN:
+                raise ValueError(f'git_merge=Group needs git {git_sync.MERGE_TREE_MIN[0]}.{git_sync.MERGE_TREE_MIN[1]}+ on this machine (found {version[0]}.{version[1]})')
         if 'max_active_per_agent' in changed:
             limit=changed['max_active_per_agent']
             if type(limit) is not int or not 1<=limit<=20:
