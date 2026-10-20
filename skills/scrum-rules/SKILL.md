@@ -3,7 +3,7 @@ name: scrum-rules
 description: Apply Scrum Studio task sizing and planning rules - decide when to group or split work so one agent saves tokens and other agents can take tasks in parallel, with no duplicates or speculative backlog.
 ---
 
-Before the first claim, map the whole known authorized scope to existing or new TODO tasks in one `task_plan(project, actor, items)` call (1..10 items: key, title, description, acceptance_criteria; optional id to refine an unlocked unfinished task, files, dependencies by id or key, model_tier). It is atomic and never claims. Search first (`task_search`). A same-title task returns `existing=true` and is never duplicated silently: with no `differs` it is identical, continue it; with `differs=[...]` refine it by `id` if the scope really changed; `allow_duplicate=true` only for a deliberately separate outcome.
+Before the first claim, map the whole known authorized scope to existing or new TODO tasks in one `task_plan(project, actor, items)` call (1..10 items: key, title, description, acceptance_criteria; optional id to refine an unlocked unfinished task, files, dependencies by id or key, model_tier). It is atomic and never claims. Search first (`task_search`). A same-title unfinished task returns `existing=true` and is never duplicated silently: with no `differs` it is identical, continue it; with `differs=[...]` refine it by `id` if the scope really changed; `allow_duplicate=true` only for a deliberately separate outcome.
 
 ## Group or split
 
@@ -33,3 +33,5 @@ The unit is **one result with its own acceptance check**, sized so a session fin
 - State the grouping decision in one line. Sizing policy is changed only by a human (`project_settings` or the web).
 
 Examples and Balanced/Unrestricted details: [details](references/details.md).
+
+Git recovery tasks use the existing checkout and may preserve dirty files/staging; they remain eligible when no other live claim needs the checkout. Never bypass active claims. For direct MCP CLI fallback omit --timeout to use operation-specific bounds (15 seconds ordinary calls, 180 completion writes); never retry an uncertain write without reconciling recorded state.

@@ -969,13 +969,17 @@ def legacy_run(action, a, path=None, locks=None):
             if settings.get('git_mode')=='Branches' and project_row['workspace_root'] and candidates:
                 import git_sync
                 task_branch=lambda t:git_sync.branch_for(settings,{'code':t['code'],'title':t['title'],'context_group':t.get('context_group','')})
-                others={task_branch(task_dict(r,prefix)) for r in db.execute("SELECT * FROM tasks WHERE project=? AND status='In Progress' AND lock_until>? AND owner_id!=?",(project,time.time(),a.get('actor',-1)))}
-                owned=next(iter(others)) if len(others)==1 else None
-                if owned is None and not others:
+                active_rows=db.execute("SELECT * FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchall()
+                branches={task_branch(task_dict(r,prefix)) for r in active_rows}
+                owned=next(iter(branches)) if len(branches)==1 else None
+                if owned is None and not branches:
                     current=git_sync.state(project_row['workspace_root'])
                     if current and current[1]:owned=current[0]
-                if owned is not None:
-                    keep=[t for t in candidates if (t['locked'] and t['owner_id']==a.get('actor')) or task_branch(t)==owned]
+                if owned is not None or branches:
+                    # Recovery deliberately uses the existing checkout (including
+                    # dirty staging), but cannot interrupt another live claim.
+                    keep=[t for t in candidates if (t['locked'] and t['owner_id']==a.get('actor')) or
+                          (not active_rows if t['category']=='Git recovery' else task_branch(t)==owned)]
                     branch_skipped=len(candidates)-len(keep)
                     candidates=keep
             if action=='worker_launch' and a.get('id') is not None:candidates=[t for t in candidates if t['id']==a['id']]

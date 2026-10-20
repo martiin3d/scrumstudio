@@ -58,6 +58,33 @@ class WorktreeTest(unittest.TestCase):
         import coordination
         self.assertEqual(coordination.canonical_paths(folder,[str(left/'a.py')]),coordination.canonical_paths(folder,['a.py']))
 
+    def test_branches_recovery_is_offered_on_dirty_checkout_but_waits_for_live_work(self):
+        project,folder,git=self.setup_repo()
+        run('project_settings',dict(project=project,actor=self.human,git_mode='Branches'))
+        task=self.task(project,'Recover integration','a.py',category='Git recovery')
+        (folder/'b.py').write_text('human edits');git('add','b.py')
+        offer=run('worker_launch',dict(project=project,actor=self.agent))
+        self.assertTrue(offer['eligible']);self.assertEqual(offer['id'],task)
+        claim=run('task_claim',dict(project=project,actor=self.agent,id=task))
+        self.assertTrue(claim['claimed']);self.assertEqual(git('show',':b.py'),'human edits')
+        run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='pause'))
+        run('worker_launch',dict(project=project,actor=self.agent,action='release'))
+        git('reset','--hard','HEAD')  # Only the isolated fixture's disposable edits.
+        other=self.other(project)
+        normal=self.task(project,'Active outcome','b.py')
+        run('task_claim',dict(project=project,actor=other,id=normal))
+        run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',session_used_percent=10,weekly_used_percent=20))
+        selected=run('next_work',dict(project=project,actor=self.agent))
+        self.assertIsNone(selected['task'])
+
+    def test_branches_filter_respects_own_live_task_with_spare_wip_capacity(self):
+        project,folder,git=self.setup_repo()
+        run('project_settings',dict(project=project,actor=self.human,git_mode='Branches',max_active_per_agent=2))
+        first=self.task(project,'Current','a.py');self.task(project,'Different branch','b.py')
+        run('task_claim',dict(project=project,actor=self.agent,id=first))
+        selected=run('next_work',dict(project=project,actor=self.agent,exclude_ids=[first]))
+        self.assertIsNone(selected['task']);self.assertEqual(selected['branch_skipped'],1)
+
     def test_pause_and_resume_reuses_partial_work_without_touching_main(self):
         project,folder,git=self.setup_repo()
         task=self.task(project,'Resume','a.py')
