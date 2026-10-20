@@ -137,10 +137,13 @@ class CoordinationTest(unittest.TestCase):
         args={'project':self.p,'action':'acquire','id':t,'actor':self.b,'token':b['token']}
         r=run('file_locks',dict(args,paths=['free.py','busy.py']))
         self.assertFalse(r['acquired'])
+        self.assertEqual(run('task_get',{'project':self.p,'id':t})['files'],[])
         self.assertFalse(any(l['path'].endswith('free.py') for l in run('file_locks',{'project':self.p})['items']))
         with self.assertRaises(ValueError):
             run('file_locks',dict(args,token='wrong',paths=['free.py']))
-        self.assertTrue(run('file_locks',dict(args,paths=['free.py']))['acquired'])
+        self.assertEqual(run('file_locks',dict(args,paths=['free.py']))['plan_added'],1)
+        self.assertEqual(run('task_get',{'project':self.p,'id':t})['files'],['free.py'])
+        self.assertEqual(run('file_locks',dict(args,paths=['free.py']))['plan_added'],0)
 
     def test_path_normalization_escape_and_workspace_policy(self):
         t=self.task(['src/a.py'])

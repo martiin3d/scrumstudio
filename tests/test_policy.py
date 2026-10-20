@@ -12,6 +12,16 @@ class PolicyTest(unittest.TestCase):
         project,_=self.project()
         current=run('project_settings',{'project':project})
         self.assertEqual((current['task_sizing'],current['session_stop_percent'],current['weekly_stop_percent']),('Small',92,94))
+        self.assertEqual(current['agent_approval_mode'],'Auto review')
+        self.assertFalse(current['agent_followup_tasks'])
+        with self.assertRaises(ValueError):run('project_settings',{'project':project,'actor':self.agent,'agent_followup_tasks':True})
+        with self.assertRaises(ValueError):run('project_settings',{'project':project,'actor':self.human,'agent_followup_tasks':'yes'})
+        self.assertTrue(run('project_settings',{'project':project,'actor':self.human,'agent_followup_tasks':True})['agent_followup_tasks'])
+        with self.assertRaises(ValueError):run('project_settings',{'project':project,'actor':self.agent,'agent_approval_mode':'Ask in chat'})
+        with self.assertRaises(ValueError):run('project_settings',{'project':project,'actor':self.human,'agent_approval_mode':'Bypass all permissions'})
+        self.assertEqual(run('project_settings',{'project':project,'actor':self.human,'agent_approval_mode':'Ask in chat'})['agent_approval_mode'],'Ask in chat')
+        with self.assertRaises(ValueError):run('project_settings',{'project':project,'actor':self.agent,'agent_approval_mode':'Full access'})
+        self.assertEqual(run('project_settings',{'project':project,'actor':self.human,'agent_approval_mode':'Full access'})['agent_approval_mode'],'Full access')
         with self.assertRaises(ValueError):
             run('project_settings',{'project':project,'actor':self.agent,'session_stop_percent':99})
         for fields in [{'task_sizing':'huge'},{'session_stop_percent':0},{'weekly_stop_percent':101},{'usage_check_seconds':301}]:
@@ -22,12 +32,15 @@ class PolicyTest(unittest.TestCase):
 
     def test_snapshot_new_policy_and_old_defaults(self):
         project,path=self.project()
-        run('project_settings',{'project':project,'actor':self.human,'task_sizing':'Balanced','session_stop_percent':88})
+        run('project_settings',{'project':project,'actor':self.human,'task_sizing':'Balanced','session_stop_percent':88,'agent_followup_tasks':True})
         run('project_export',{'project':project})
         file=path/'.scrum/snapshot.json'
         data=json.loads(file.read_text())
         self.assertEqual(data['settings']['session_stop_percent'],88)
+        run('project_restore',{'project':project,'confirm':True})
+        self.assertTrue(run('project_settings',{'project':project})['agent_followup_tasks'])
         data['settings']={key:data['settings'][key] for key in ['max_active_per_agent','require_evidence']}
         file.write_text(json.dumps(data))
         run('project_restore',{'project':project,'confirm':True})
         self.assertEqual(run('project_settings',{'project':project})['task_sizing'],'Small')
+        self.assertFalse(run('project_settings',{'project':project})['agent_followup_tasks'])

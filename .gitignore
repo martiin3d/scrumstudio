@@ -2,6 +2,7 @@
 .scrum/
 data/
 .scrum-migration-*/
+/docs/internal/
 
 # Generated runtime files
 __pycache__/

@@ -11,6 +11,10 @@ from diagnostics import failure
 PUBLIC = Path(__file__).resolve().parent / 'public'
 
 class Handler(BaseHTTPRequestHandler):
+    # Browser preconnect sockets must not keep non-daemon request threads alive
+    # forever during a graceful restart. This bounds socket I/O, not Git jobs.
+    timeout = 5
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/projects':

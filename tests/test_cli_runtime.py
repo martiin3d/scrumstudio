@@ -9,6 +9,13 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 class CliRuntimeTest(unittest.TestCase):
+    def test_worker_python_prefers_existing_desktop_bundle_without_installing(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'data') as folder,patch.object(cli_runtime.Path,'home',return_value=Path(folder)),patch.object(cli_runtime.sys,'platform','win32'):
+            self.assertEqual(cli_runtime.worker_python(),cli_runtime.sys.executable)
+            binary=Path(folder)/'.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe'
+            binary.parent.mkdir(parents=True);binary.touch()
+            self.assertEqual(cli_runtime.worker_python(),str(binary.resolve()))
+
     @unittest.skipUnless(os.name=='nt','Windows desktop discovery')
     def test_real_home_runtime_survives_sandbox_localappdata(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'data') as folder,patch.object(cli_runtime.Path,'home',return_value=Path(folder)),patch.dict(os.environ,{'LOCALAPPDATA':str(Path(folder)/'sandbox'),'SCRUM_CODEX_EXECUTABLE':''}):

@@ -12,7 +12,8 @@ def stamp(folder):
 def notify(action,args):
     # Legacy single-file callers/tests must not notify an unrelated folder registry.
     if 'SCRUM_DB' in os.environ and 'SCRUM_REGISTRY' not in os.environ:return
-    if action not in ('project_control','project_settings','agent_manage','user_manage','git_recovery'):return
+    if action not in ('project_control','project_settings','agent_manage','user_manage','git_recovery','agent_interaction'):return
+    if action=='agent_interaction' and args.get('action') not in ('answer','cancel'):return
     if action=='agent_manage' and args.get('action','list') in ('list','get'):return
     if action=='project_settings' and not set(args)-{'project','actor','measurement_session'}:return
     try:

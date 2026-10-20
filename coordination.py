@@ -7,10 +7,13 @@ import time
 from pathlib import Path
 
 from git_sync import GIT_DEFAULTS, validate as validate_git
-POLICY_DEFAULTS = {'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS}
+POLICY_DEFAULTS = {'agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS}
 
 def validate_policy(changed):
     validate_git(changed)
+    if 'agent_followup_tasks' in changed and (type(changed['agent_followup_tasks']) not in (bool,int) or changed['agent_followup_tasks'] not in (0,1)):raise ValueError('agent_followup_tasks must be boolean')
+    if 'agent_approval_mode' in changed and changed['agent_approval_mode'] not in ('Auto review','Ask in chat','Full access'):
+        raise ValueError('agent_approval_mode must be Auto review, Ask in chat or Full access')
     if 'max_parallel_agents' in changed and (type(changed['max_parallel_agents']) is not int or not 1<=changed['max_parallel_agents']<=20):
         raise ValueError('max_parallel_agents must be 1..20')
     if 'workflow_mode' in changed and changed['workflow_mode'] not in ['Auto','Light','Standard']:
@@ -64,7 +67,7 @@ def migrate(db, separate=False):
 
 
 def settings(row):
-    return {k: bool(row[k]) if k in ['require_evidence','usage_guard','auto_resume_session_quota','git_cleanup'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+    return {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
 
 
 def active_count(db, project, actor, exclude=-1):
@@ -253,8 +256,21 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         held=conflicts(db,paths,task['id'],actor['id'])
         if held:
             return {'acquired':False,'conflicts':held[:20],'conflicts_total':len(held)}
+        import json
+        root=Path(db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]).resolve()
+        discovered=[]
+        for value in a.get('paths',[]):
+            candidate=Path(value)
+            candidate=git_worktrees.logical(root,candidate if candidate.is_absolute() else root/candidate)
+            discovered.append(candidate.relative_to(root).as_posix())
+        previous=json.loads(task['files'] or '[]')
+        updated=file_plan([*previous,*discovered])
+        added=len(updated)-len(previous)
+        if added:
+            db.execute('UPDATE tasks SET files=?,updated=? WHERE id=?',(json.dumps(updated),now(),task['id']))
+            activity(db,task['id'],actor['id'],'files',f'Extended task file plan with {added} reserved files.')
         reserve(db,paths,project,task['id'],actor['id'],a['token'],task['lock_until'],now())
-        return {'acquired':True,'count':len(paths),'lock_until':task['lock_until']}
+        return {'acquired':True,'count':len(paths),'plan_added':added,'lock_until':task['lock_until']}
     force=a.get('force',False)
     if force and actor['kind']!='human':
         raise ValueError('Only a human can force-release another worker\'s files')

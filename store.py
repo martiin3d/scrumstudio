@@ -57,6 +57,9 @@ def connect(path=None, locks=None):
                 db.execute('UPDATE tasks SET number=? WHERE id=?', (counts[row['project']], row['id']))
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS task_project_number ON tasks(project,number)')
         columns = {r['name'] for r in db.execute('PRAGMA table_info(tasks)')}
+        if 'blocked_reason_kind' not in columns:
+            # Old prose is ambiguous: never silently dismiss a possible external constraint.
+            db.execute("ALTER TABLE tasks ADD COLUMN blocked_reason_kind TEXT NOT NULL DEFAULT 'external'")
         for name, spec in [('owner_id', 'INTEGER REFERENCES users(id)'), ('lock_token', 'TEXT'), ('lock_until', 'REAL NOT NULL DEFAULT 0'), ('category', "TEXT NOT NULL DEFAULT 'General'")]:
             if name not in columns:
                 db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {spec}')
@@ -127,6 +130,9 @@ def git_claim(db, project, row, prefix, actor):
         desired=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(row)) or git_sync.branch_for(settings,task)
         if any((git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(r)) or git_sync.branch_for(settings,{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']}))==desired for r in active):
             return {'busy':{'current_branch':desired,'wanted':desired,'reason':'Another active task owns this context-group workspace','dirty':[],'dirty_total':0}}
+        current=git_sync.state(project_row['workspace_root'])
+        if active and (any(r['category']=='Git recovery' for r in active) or (current and current[0]==desired and not git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(row)))):
+            return {'busy':{'current_branch':current[0] if current else 'canonical','wanted':desired,'reason':'Finish active work before reusing the canonical checkout or running Git recovery','dirty':[],'dirty_total':0}}
         active=[]
     # Even a clean working tree belongs to active workers; never switch it.
     if any(git_sync.branch_for(settings,{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']})!=git_sync.branch_for(settings,task) for r in active):
@@ -308,16 +314,20 @@ def resolve_dependents(db, project, completed, prefix, actor):
             continue
         remaining = [i for i in deps if i not in done]
         status = row['status']
-        if status == 'Blocked' and not remaining and not row['blocked_reason'].strip():
+        reason=row['blocked_reason']
+        reason_kind=row['blocked_reason_kind']
+        cleared_reason=bool(reason.strip() and reason_kind=='dependency' and not remaining)
+        if cleared_reason:reason='';reason_kind='external'
+        if status == 'Blocked' and not remaining and not reason.strip():
             status = 'TODO'
         retained=[i for i in deps if db.execute('SELECT status FROM tasks WHERE id=?',(i,)).fetchone()[0]!='Cancelled'] if preserve_done else remaining
-        db.execute('UPDATE tasks SET dependencies=?,status=?,updated=? WHERE id=?', (json.dumps(retained), status, now(), row['id']))
+        db.execute('UPDATE tasks SET dependencies=?,status=?,blocked_reason=?,blocked_reason_kind=?,updated=? WHERE id=?', (json.dumps(retained), status, reason, reason_kind, now(), row['id']))
         telemetry.transition(db,row['id'],status,actor)
         code = f"{prefix}-{row['number']}"
         author = actor_user(db, {'actor': actor})['name'] if actor is not None else 'System'
         resolution='resolved by cancellation' if prerequisite['status']=='Cancelled' else 'resolved by completion'
         dependency_note='dependency completion retained for Git integration' if preserve_done and prerequisite['status']=='Done' else 'dependency removed'
-        activity(db, row['id'], actor, 'comment', f"Blocker {prefix}-{prerequisite['number']} {resolution} by {author}; {dependency_note}; remaining task blockers: {len(remaining)}. Status: {status}." + (' Ready to claim.' if status == 'TODO' and not remaining and not row['blocked_reason'].strip() else ''))
+        activity(db, row['id'], actor, 'comment', f"Blocker {prefix}-{prerequisite['number']} {resolution} by {author}; {dependency_note}; remaining task blockers: {len(remaining)}. Status: {status}." + (' Dependency-linked blocker reason cleared.' if cleared_reason else '') + (' Ready to claim.' if status == 'TODO' and not remaining and not reason.strip() else ''))
         changed.append({'id': row['id'], 'code': code, 'status': status, 'remaining': len(remaining)})
     return changed
 
@@ -431,6 +441,24 @@ def legacy_run(action, a, path=None, locks=None):
         project = int(a['project'])
         project_row = project_exists(db, project)
         prefix = project_prefix(project_row['name'])
+        if action=='project_workspaces':
+            if type(a.get('confirm',False)) is not bool:raise ValueError('confirm must be boolean')
+            human=actor_user(db,a)
+            if human['kind']!='human':raise ValueError('Only a human can archive project workspaces')
+            if a.get('confirm'):
+                db.execute('BEGIN IMMEDIATE')
+                if not runtime.control(db,project)['paused']:raise ValueError('Stop the project before archiving workspaces')
+                if db.execute("SELECT 1 FROM tasks WHERE project=? AND lock_until>?",(project,time.time())).fetchone():raise ValueError('Release live task claims before archiving workspaces')
+            result=git_worktrees.archive(project_row['workspace_root'],a.get('confirm',False))
+            for item in result['workspaces'] if result.get('confirmed') else []:
+                for key in item['tasks']:
+                    row=db.execute('SELECT * FROM tasks WHERE project=? AND uid=?',(project,key)).fetchone()
+                    if not row:continue
+                    message='Workspace archived to '+item['archive']+'; branch '+item['branch']+' retained. Resume in the canonical project only after reconciling these files.'
+                    activity(db,row['id'],human['id'],'comment',message)
+                    if row['status'] not in ('Done','Cancelled'):
+                        db.execute('UPDATE tasks SET continuity=?,updated=? WHERE id=?',((message+'\n'+row['continuity'])[:2000],now(),row['id']))
+            return result
         if action == 'task_attachment':
             import attachments
             return attachments.operation(db,a,project,path)
@@ -439,6 +467,9 @@ def legacy_run(action, a, path=None, locks=None):
             return context_tools.search(db,project,prefix,a)
         if action in ['agent_checkpoint','agent_status','project_control']:
             return runtime.operation(db,action,a,project,actor_user,required,now,activity)
+        if action == 'agent_interaction':
+            import agent_interactions
+            return agent_interactions.operation(db,a,actor_user,now)
         if action == 'project_chat':
             if 'text' in a:
                 author = actor_user(db, a)
@@ -721,7 +752,7 @@ def legacy_run(action, a, path=None, locks=None):
                 if not isinstance(a['continuity'],str) or len(a['continuity'])>2000:
                     raise ValueError('continuity must be text, max 2000 characters')
                 t['continuity']=a['continuity'].strip()
-            for key in ['title', 'description', 'acceptance_criteria', 'status', 'priority', 'blocked_reason', 'dependencies', 'checklist', 'category', 'files','evidence','cancel_reason']:
+            for key in ['title', 'description', 'acceptance_criteria', 'status', 'priority', 'blocked_reason', 'blocked_reason_kind', 'dependencies', 'checklist', 'category', 'files','evidence','cancel_reason']:
                 if key in a:
                     t[key] = a[key]
             if claiming:
@@ -732,6 +763,10 @@ def legacy_run(action, a, path=None, locks=None):
                 t['description']=required(a['description'],'description',12000)
             t['acceptance_criteria']=acceptance_criteria(t['acceptance_criteria'],allow_empty='acceptance_criteria' not in a)
             description(t['blocked_reason'])
+            if t['blocked_reason_kind'] not in ('dependency','external'):
+                raise ValueError('blocked_reason_kind must be dependency or external')
+            if t['blocked_reason'].strip() and t['dependencies'] and a.get('blocked_reason')!=old['blocked_reason'] and 'blocked_reason' in a and 'blocked_reason_kind' not in a:
+                raise ValueError('With dependencies, specify blocked_reason_kind=dependency for dependency-only prose or external for a separate constraint; omit prose when task links suffice')
             priority(t['priority'])
             t['category'] = required(t['category'], 'category', 80)
             t['checklist'] = checklist(t['checklist'])
@@ -774,6 +809,14 @@ def legacy_run(action, a, path=None, locks=None):
             if claiming and t['blocked_reason'].strip():
                 raise ValueError('Resolve the blocker before claiming')
             t['dependencies'] = dependencies(db, project, t['id'], t['dependencies'])
+            if t['blocked_reason_kind']=='dependency':
+                if not t['dependencies'] and (a.get('blocked_reason_kind')=='dependency' or a.get('blocked_reason','').strip()):
+                    raise ValueError('A dependency-linked reason needs task dependencies')
+                pending=any(db.execute('SELECT status FROM tasks WHERE id=?',(dep,)).fetchone()[0] not in ('Done','Cancelled') for dep in t['dependencies'])
+                if not pending:
+                    t['blocked_reason']=''
+                    if t['status']=='Blocked':t['status']='TODO'
+            if not t['blocked_reason'].strip():t['blocked_reason_kind']='external'
             if t['status'] in ['In Progress', 'In Review', 'Done']:
                 for dep in t['dependencies']:
                     if db.execute('SELECT status FROM tasks WHERE id=?', (dep,)).fetchone()['status'] != 'Done':
@@ -791,6 +834,7 @@ def legacy_run(action, a, path=None, locks=None):
                 if git and git.get('busy'):
                     return {'claimed':False,'branch_busy':git['busy'],'hint':'Checkout holds uncommitted work of another branch; finish or hand off that work, or pick other work with exclude_ids.'}
             db.execute('UPDATE tasks SET title=?,description=?,status=?,priority=?,blocked_reason=?,dependencies=?,checklist=?,updated=? WHERE id=? AND project=?', (t['title'], t['description'], t['status'], int(t['priority']), t['blocked_reason'], json.dumps(t['dependencies']), json.dumps(t['checklist']), now(), t['id'], project))
+            db.execute('UPDATE tasks SET blocked_reason_kind=? WHERE id=?',(t['blocked_reason_kind'],t['id']))
             until = old['lock_until']
             token = old['lock_token']
             if claiming:
@@ -820,7 +864,7 @@ def legacy_run(action, a, path=None, locks=None):
             else:
                 db.execute('DELETE FROM file_locks WHERE task=?',(t['id'],))
             previous=task_dict(old,prefix)
-            changes = {key: t[key] for key in ['title','description','acceptance_criteria','status','priority','blocked_reason','dependencies','checklist','category','files','evidence','cancel_reason'] if t[key] != previous[key]}
+            changes = {key: t[key] for key in ['title','description','acceptance_criteria','status','priority','blocked_reason','blocked_reason_kind','dependencies','checklist','category','files','evidence','cancel_reason'] if t[key] != previous[key]}
             if owner != old['owner_id']:
                 changes['owner_id'] = owner
             if changes:
@@ -965,6 +1009,7 @@ def legacy_run(action, a, path=None, locks=None):
             # checkout belongs to the branch of other active tasks, or to the
             # current branch while it holds uncommitted edits.
             branch_skipped=0
+            checkout_recovery=None
             settings=coord.settings(project_row)
             if settings.get('git_mode')=='Branches' and project_row['workspace_root'] and candidates:
                 import git_sync
@@ -974,7 +1019,9 @@ def legacy_run(action, a, path=None, locks=None):
                 owned=next(iter(branches)) if len(branches)==1 else None
                 if owned is None and not branches:
                     current=git_sync.state(project_row['workspace_root'])
-                    if current and current[1]:owned=current[0]
+                    if current and current[1]:
+                        owned=current[0]
+                        checkout_recovery={'branch':current[0],'files':current[1][:100]}
                 if owned is not None or branches:
                     # Recovery deliberately uses the existing checkout (including
                     # dirty staging), but cannot interrupt another live claim.
@@ -984,7 +1031,9 @@ def legacy_run(action, a, path=None, locks=None):
                     candidates=keep
             if action=='worker_launch' and a.get('id') is not None:candidates=[t for t in candidates if t['id']==a['id']]
             if action=='worker_launch':
-                if not candidates:return {'eligible':False,'reason':'No eligible unreserved work; no model was started.'}
+                if not candidates:
+                    reason=(str(branch_skipped)+' ready task(s) need another branch, but this checkout is owned by active work or contains uncommitted edits. Preserve those edits; finish/recover this branch or use Worktrees for isolation.' if branch_skipped else 'No eligible unreserved work; no model was started.')
+                    return {'eligible':False,'reason':reason,**({'checkout_recovery':checkout_recovery} if checkout_recovery and branch_skipped and settings.get('agent_followup_tasks') else {})}
                 selected=candidates[0]
                 if selected['locked'] and selected['owner_id']==a['actor']:
                     db.execute('DELETE FROM worker_launch_offers WHERE project=? AND task=? AND actor!=?',(project,selected['id'],a['actor']))

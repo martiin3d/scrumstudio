@@ -6,6 +6,14 @@ import shutil
 import sys
 
 
+def worker_python():
+    """Prefer the installed desktop runtime for sandboxed shell helpers."""
+    if sys.platform=='win32':
+        bundled=Path.home()/'.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe'
+        if bundled.is_file():return str(bundled.resolve())
+    return sys.executable
+
+
 def model_name(value):
     if not isinstance(value,str) or (value and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,255}',value)):
         raise ValueError('Model must be blank for provider default, or an explicit model ID/alias (max256, no whitespace or command options)')

@@ -253,7 +253,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_resolution_preserves_external_reason_and_project_scope(self):
         first,blocked=[self.task(n) for n in ['Prerequisite','External approval']]
-        self.update(blocked,status='Blocked',dependencies=[first],blocked_reason='Await human approval')
+        self.update(blocked,status='Blocked',dependencies=[first],blocked_reason='Await human approval',blocked_reason_kind='external')
         self.update(first,status='Done')
         t=run('task_get',{'project':self.p,'id':blocked})
         self.assertEqual(t['status'],'Blocked')
@@ -266,6 +266,59 @@ class WorkflowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             run('task_create',{'description':'Test fixture: verify the named workflow outcome', 'acceptance_criteria':['The scenario assertions pass'], 'project':self.p,'title':'Invalid','dependencies':[foreign]})
         self.assertEqual(len(run('snapshot',{'project':self.p})['tasks']),2)
+
+    def test_dependency_prose_clears_only_after_last_prerequisite(self):
+        first,second,dependent=[self.task(n) for n in ['First dependency','Second dependency','Resume recovery']]
+        self.update(dependent,status='Blocked',dependencies=[first,second],blocked_reason='Waiting for verified dependencies',blocked_reason_kind='dependency')
+        self.update(first,status='Done')
+        t=run('task_get',{'project':self.p,'id':dependent})
+        self.assertEqual(t['status'],'Blocked')
+        self.assertEqual(t['blocked_reason'],'Waiting for verified dependencies')
+        self.update(second,status='Done')
+        t=run('task_get',{'project':self.p,'id':dependent})
+        self.assertEqual((t['status'],t['blocked_reason']),('TODO',''))
+        self.assertEqual(run('next_work',{'project':self.p})['task']['id'],dependent)
+        history=run('task_activity',{'project':self.p,'id':dependent})['items']
+        self.assertTrue(any('Dependency-linked blocker reason cleared' in h['text'] for h in history))
+        self.update(second,status='Done')
+        self.assertEqual(history,run('task_activity',{'project':self.p,'id':dependent})['items'])
+
+    def test_dependency_reason_clears_with_git_links_retained_and_cancellation(self):
+        from unittest.mock import patch
+        for resolution in ['Done','Cancelled']:
+            with self.subTest(resolution=resolution):
+                first,dependent=[self.task(n+resolution) for n in ['Prerequisite','Dependent']]
+                self.update(dependent,status='Blocked',dependencies=[first],blocked_reason='Await prerequisite',blocked_reason_kind='dependency')
+                with patch('git_sync.enabled',return_value=True),patch('store.git_done',return_value=None):
+                    self.update(first,status=resolution,**({'cancel_reason':'Superseded'} if resolution=='Cancelled' else {}))
+                t=run('task_get',{'project':self.p,'id':dependent})
+                self.assertEqual((t['status'],t['blocked_reason']),('TODO',''))
+                self.assertEqual(t['dependencies'],[first] if resolution=='Done' else [])
+
+    def test_ambiguous_new_blocker_requires_kind_and_can_be_reclassified(self):
+        first,dependent=[self.task(n) for n in ['Prerequisite','Blocked outcome']]
+        with self.assertRaisesRegex(ValueError,'specify blocked_reason_kind'):
+            self.update(dependent,status='Blocked',dependencies=[first],blocked_reason='Await prerequisite')
+        self.assertEqual(run('task_get',{'project':self.p,'id':dependent})['status'],'TODO')
+        self.update(dependent,status='Blocked',dependencies=[first],blocked_reason='Await prerequisite',blocked_reason_kind='external')
+        self.update(dependent,blocked_reason_kind='dependency')
+        self.update(first,status='Done')
+        self.assertEqual(run('task_get',{'project':self.p,'id':dependent})['status'],'TODO')
+        with self.assertRaisesRegex(ValueError,'needs task dependencies'):
+            self.update(dependent,status='Blocked',blocked_reason='Missing prerequisite',blocked_reason_kind='dependency')
+        with self.assertRaisesRegex(ValueError,'blocked_reason_kind must'):
+            self.update(dependent,blocked_reason_kind='invalid')
+
+    def test_legacy_unclassified_reason_is_not_assumed_to_be_a_dependency(self):
+        from contextlib import closing
+        first,dependent=[self.task(n) for n in ['Legacy prerequisite','Legacy blocker']]
+        self.update(dependent,status='Blocked',dependencies=[first])
+        with closing(sqlite3.connect(os.environ['SCRUM_DB'])) as db:
+            with db:db.execute('UPDATE tasks SET blocked_reason=? WHERE id=?',('Existing ambiguous constraint',dependent))
+        self.update(first,status='Done')
+        t=run('task_get',{'project':self.p,'id':dependent})
+        self.assertEqual((t['status'],t['blocked_reason_kind']),('Blocked','external'))
+        self.assertEqual(t['blocked_reason'],'Existing ambiguous constraint')
 
     def test_activity_pagination_and_comment_during_another_workers_lock(self):
         t=self.task('Discuss')
@@ -335,6 +388,8 @@ class WorkflowTest(unittest.TestCase):
                 self.output=bytearray()
             def makefile(self,*args):
                 return self.input
+            def settimeout(self,value):
+                self.timeout=value
             def sendall(self,data):
                 self.output.extend(data)
         def request(path, body=None, origin=None):

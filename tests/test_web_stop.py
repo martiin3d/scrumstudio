@@ -58,6 +58,15 @@ class WebStopTest(unittest.TestCase):
         record=lifecycle.read_control(port);record['root']='different-checkout'
         lifecycle.control_path(port).write_text(json.dumps(record),encoding='utf-8')
         with self.assertRaisesRegex(ValueError,'Invalid website control'):lifecycle.stop(port)
+
+    def test_idle_browser_preconnect_does_not_block_graceful_shutdown(self):
+        process,port=self.start()
+        idle=socket.create_connection(('127.0.0.1',port),timeout=2)
+        self.addCleanup(idle.close)
+        time.sleep(.1)
+        self.assertEqual(lifecycle.stop(port),0)
+        self.assertEqual(process.wait(timeout=5),0)
+        self.assertFalse(lifecycle.control_path(port).exists())
     def test_cleanup_does_not_remove_new_instance_record(self):
         port=self.free_port();old=lifecycle.publish(port);new=lifecycle.publish(port)
         self.addCleanup(lambda:lifecycle.control_path(port).unlink(missing_ok=True))

@@ -1,3 +1,4 @@
+import os
 import importlib.util
 import json
 from pathlib import Path
@@ -67,6 +68,10 @@ class BridgeTest(unittest.TestCase):
         rpc=Mock();rpc.call.side_effect=RuntimeError('Reservation denied')
         result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
         self.assertTrue(result['should_stop']);self.assertIn('Reservation denied',result['reason'])
+        self.assertNotIn('git_recovery',result)
+        rpc.call.side_effect=RuntimeError('Git branch preparation failed: Dependency branch not integrated')
+        result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
+        self.assertIn('Dependency branch',result['git_recovery'])
         rpc.call.side_effect=None;rpc.call.return_value={'claim_deferred':'File reservation conflict'}
         result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
         self.assertTrue(result['should_stop']);self.assertIn('File reservation conflict',result['reason'])
@@ -174,9 +179,24 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('mcp_servers.scrum-studio.tool_timeout_sec=180',codex)
         allowlist=json.loads(next(arg.split('=',1)[1] for arg in codex if arg.startswith('mcp_servers.scrum-studio.enabled_tools=')))
         self.assertIn('task_claim',allowlist)
+        self.assertIn('task_plan',allowlist)
         self.assertTrue({'user_manage','agent_manage','project_control','project_settings'}.isdisjoint(allowlist))
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox',codex)
         self.assertNotIn('--dangerously-skip-permissions',claude)
+
+    def test_unity_grant_is_limited_to_cache_and_detects_nested_project(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]/'data') as folder,patch.object(agent_bridge.sys,'platform','win32'),patch.dict(os.environ,{'LOCALAPPDATA':folder}):
+            root=Path(folder);cache=(root/'Unity/Caches').as_posix()
+            self.assertNotIn(cache,agent_bridge.worker_filesystem(root))
+            version=root/'Game/ProjectSettings/ProjectVersion.txt';version.parent.mkdir(parents=True);version.write_text('m_EditorVersion: 6000.3.15f1')
+            rules=agent_bridge.worker_filesystem(root)
+            self.assertEqual(rules[cache],'write')
+            self.assertEqual([p for p,mode in rules.items() if mode=='write'],[cache])
+            self.assertTrue(all(mode=='read' for p,mode in rules.items() if p!=cache))
+            with patch.object(agent_bridge.shutil,'which',return_value='cli'):
+                args=agent_bridge.command('codex',root,'Task')
+            value=next(a.split('=',1)[1] for a in args if a.startswith('permissions.scrum-worker.filesystem='))
+            self.assertEqual(tomllib.loads('paths='+value)['paths'][cache],'write')
 
     def test_claude_worker_uses_compact_preapproved_scrum_catalog(self):
         with patch.object(agent_bridge.shutil,'which',return_value='claude'):
@@ -263,6 +283,65 @@ class BridgeChatTest(unittest.TestCase):
 
 
 class ManagedBridgeTest(unittest.TestCase):
+    def test_checkout_recovery_is_on_demand_and_bounded_without_model_calls(self):
+        rpc=Mock();rpc.call.return_value={'items':[{'id':7}]};attempts=set()
+        self.assertFalse(agent_bridge.queue_checkout_recovery(rpc,1,9,{'eligible':False},attempts))
+        rpc.call.assert_not_called()
+        offer={'checkout_recovery':{'branch':'scrum/existing','files':['partial.cs']}}
+        self.assertTrue(agent_bridge.queue_checkout_recovery(rpc,1,9,offer,attempts))
+        self.assertFalse(agent_bridge.queue_checkout_recovery(rpc,1,9,offer,attempts))
+        rpc.call.assert_called_once()
+        self.assertEqual(rpc.call.call_args.args[0],'task_plan')
+        planned=rpc.call.call_args.args[1]['items'][0]
+        self.assertEqual(planned['category'],'Git recovery')
+        self.assertNotIn('files',planned)
+
+    def test_incomplete_recovery_respects_policy_owner_and_attempt_limit(self):
+        task={'id':7,'status':'In Progress','owner_id':9}
+        self.assertTrue(agent_bridge.recover_incomplete(task,9,{}, {},0))
+        for report in [{'should_stop':True},{'control':{'paused':True}},{'profile_enabled':False}]:
+            self.assertFalse(agent_bridge.recover_incomplete(task,9,{},report,0))
+        self.assertFalse(agent_bridge.recover_incomplete(task,9,{7:1},{},0))
+        self.assertFalse(agent_bridge.recover_incomplete(task,8,{},{},0))
+        self.assertFalse(agent_bridge.recover_incomplete(task,9,{},{},1))
+        self.assertFalse(agent_bridge.recover_incomplete(dict(task,status='Blocked'),9,{},{},0))
+
+    def test_incomplete_exit_recovers_same_task_once_and_preserves_result(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
+            rpc=Mock();offers=[]
+            def call(name,args):
+                if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'','generation':1,'model':''}
+                if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                if name=='project_settings':return {'usage_check_seconds':60}
+                if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','profile_enabled':True,'control':{'generation':0,'paused':False}}
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
+                if name=='task_get':return {'id':1,'status':'In Progress','owner_id':9}
+                if name=='worker_launch' and args.get('action')=='reserve':
+                    offers.append(args);return {'eligible':True,'id':1,'code':'FIX-1'}
+                return {}
+            rpc.call.side_effect=call
+            pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={};pool.submit.return_value=future
+            child=Mock();child.poll.return_value=0;child.returncode=0
+            with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--profile','a'*32,'--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge,'command',return_value=['fake']),patch.object(agent_bridge.subprocess,'Popen',return_value=child) as spawn,patch.object(agent_bridge,'final_message',return_value='18 tests passed; report existing.xml'),patch.object(agent_bridge.time,'sleep',side_effect=[None,None,None,KeyboardInterrupt]):
+                agent_bridge.main()
+            self.assertEqual(spawn.call_count,2)
+            self.assertEqual(len(offers),2)
+            self.assertEqual(offers[1]['id'],1)
+            saved=[x.args[1] for x in rpc.call.call_args_list if x.args[0]=='agent_checkpoint' and x.args[1].get('reason')=='Task closure incomplete']
+            self.assertEqual(len(saved),2)
+            self.assertIn('existing.xml',saved[0]['summary'])
+            self.assertIn('limit/policy reached',saved[1]['summary'])
+
+    def test_real_blocker_continues_other_work_without_retrying_unfinished_task(self):
+        for batch in (False,True):
+            self.assertTrue(agent_bridge.continue_after_task({'status':'Blocked'},batch,{}))
+            self.assertTrue(agent_bridge.continue_after_task({'status':'Cancelled'},batch,{}))
+            self.assertFalse(agent_bridge.continue_after_task({'status':'In Progress'},batch,{}))
+        self.assertFalse(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':False}))
+        self.assertTrue(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':True}))
+
     def test_each_completed_task_gets_its_own_model_before_next_launch(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
             folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
@@ -327,7 +406,7 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertIn('Do NOT call work_start or task_claim again',prompt)
             self.assertIn('In Progress',prompt)
             self.assertIn('continue with the next eligible task',prompt)
-            self.assertIn(json.dumps(sys.executable),prompt)
+            self.assertIn(json.dumps(agent_bridge.worker_python()),prompt)
             self.assertIn('--usage-once',prompt)
             self.assertIn('default timeouts cover Git completion',prompt)
             self.assertNotIn('--timeout 15',prompt)
@@ -335,5 +414,11 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertIn('Full task',prompt)
             self.assertIn('acceptance criteria',prompt)
             self.assertIn('do not weaken them',prompt)
+            self.assertIn('Reuse human authorization already granted',prompt)
+            self.assertIn('Do not claim approval is pending without an actual request',prompt)
+            self.assertIn('Never bypass a reviewer rejection',prompt)
+            self.assertIn('do not run --usage-once or probe usage at startup',prompt)
+            self.assertIn('never repeat an unchanged failing launch',prompt)
+            self.assertIn('leave work unfinished when acceptance is unverified',prompt)
             self.assertFalse(any(c.args[0]=='user_register' for c in rpc.call.call_args_list))
             self.assertTrue(any(c.args[0]=='agent_checkpoint' and c.args[1].get('profile_id')=='a'*32 for c in rpc.call.call_args_list))

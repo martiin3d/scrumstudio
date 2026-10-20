@@ -121,7 +121,7 @@ class TelemetryTest(unittest.TestCase):
         dependent=self.task(dependencies=[first,second])
         prose=self.task(dependencies=[first])
         self.update(dependent,status='Blocked')
-        self.update(prose,status='Blocked',blocked_reason='Human approval still required')
+        self.update(prose,status='Blocked',blocked_reason='Human approval still required',blocked_reason_kind='external')
         foreign=run('task_create',{'description':'Test fixture: verify the named workflow outcome', 'acceptance_criteria':['The scenario assertions pass'], 'project':self.q,'title':'Untouched'})['id']
         self.update(first,status='Cancelled',cancel_reason='Discarded prerequisite')
         self.assertEqual(run('task_get',{'project':self.p,'id':dependent})['dependencies'],[second])

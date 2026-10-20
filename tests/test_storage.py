@@ -118,6 +118,7 @@ class StorageTest(unittest.TestCase):
         p,path=self.project()
         first=run('task_create',{'description':'Test fixture: verify the named workflow outcome', 'acceptance_criteria':['The scenario assertions pass'], 'project':p,'title':'API','files':[str(path/'src/api.py')],'actor':self.agent})['id']
         second=run('task_create',{'description':'Test fixture: verify the named workflow outcome', 'acceptance_criteria':['The scenario assertions pass'], 'project':p,'title':'Client','dependencies':[first]})['id']
+        run('task_update',{'project':p,'id':second,'status':'Blocked','blocked_reason':'Wait for API','blocked_reason_kind':'dependency'})
         claim=run('task_claim',{'project':p,'id':first,'actor':self.agent})
         run('task_activity',{'project':p,'id':first,'actor':self.agent,'token':claim['token'],'text':'Built contract'})
         run('project_chat',{'project':p,'actor':self.agent,'recipient':self.human,'task':first,'text':'Review contract'})
@@ -136,6 +137,7 @@ class StorageTest(unittest.TestCase):
         api=next(t for t in tasks if t['title']=='API')
         client=next(t for t in tasks if t['title']=='Client')
         self.assertEqual(client['dependencies'],[api['id']])
+        self.assertEqual(client['blocked_reason_kind'],'dependency')
         self.assertFalse(api['locked'])
         self.assertEqual(api['files'],['src/api.py'])
         self.assertEqual(run('file_locks',{'project':q})['items'],[])

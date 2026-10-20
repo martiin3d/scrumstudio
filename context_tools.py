@@ -32,7 +32,9 @@ def digest(value):
 
 
 def basis(task):
-    return digest({k:task.get(k) for k in ('title','description','acceptance_criteria','status','dependencies','blocked_reason','files','checklist','evidence','attachments')})
+    content={k:task.get(k) for k in ('title','description','acceptance_criteria','status','dependencies','blocked_reason','files','checklist','evidence','attachments')}
+    if task.get('blocked_reason') and task.get('blocked_reason_kind')=='dependency':content['blocked_reason_kind']='dependency'
+    return digest(content)
 
 
 def decorate(task):
@@ -52,6 +54,7 @@ def agent_task(task):
     """Human presentation metadata is available only via full=true/snapshot."""
     source_version=task.get('version')
     result={k:v for k,v in task.items() if k not in ('project','number','uid','updated','created')}
+    if not result.get('blocked_reason'):result.pop('blocked_reason_kind',None)
     result['attachment_count']=len(result.pop('attachments',[]))
     for key in ('model_selection','scope_reason','model_reason','context_group'):
         if not result.get(key):result.pop(key,None)

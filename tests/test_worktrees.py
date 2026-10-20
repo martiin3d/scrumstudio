@@ -37,6 +37,121 @@ class WorktreeTest(unittest.TestCase):
         run('agent_checkpoint',dict(project=project,actor=actor,client='codex',session_used_percent=10,weekly_used_percent=20))
         return actor
 
+    def test_transition_from_branches_reuses_canonical_branch_and_preserves_edits(self):
+        project,folder,git=self.setup_repo()
+        run('project_settings',dict(project=project,actor=self.human,git_mode='Branches'))
+        task=self.task(project,'Resume existing branch','a.py',context_group='storage')
+        original=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        target=original['git']['branch']
+        (folder/'a.py').write_text('unfinished task')
+        (folder/'b.py').write_text('human staging');git('add','b.py')
+        run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='pause'))
+        run('project_settings',dict(project=project,actor=self.human,git_mode='Worktrees'))
+        run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',session_used_percent=10,weekly_used_percent=20))
+        resumed=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        self.assertTrue(resumed['claimed'])
+        self.assertTrue(resumed['git']['reused_canonical'])
+        self.assertEqual(Path(resumed['git']['worktree']),folder)
+        self.assertEqual(git('branch','--show-current'),target)
+        self.assertEqual((folder/'a.py').read_text(),'unfinished task')
+        self.assertEqual(git('show',':b.py'),'human staging')
+
+        import git_worktrees
+        self.assertEqual(git_worktrees.entries(folder),{})
+        other=self.other(project)
+        sibling=self.task(project,'Same branch','b.py',context_group='storage')
+        refused=run('task_claim',dict(project=project,id=sibling,actor=other))
+        self.assertFalse(refused['claimed'])
+        self.assertIn('context-group',refused['branch_busy']['reason'])
+        completed=run('work_finish',dict(project=project,id=task,actor=self.agent,token=resumed['token'],evidence='Fixture outcome verified'))
+        self.assertEqual(completed['completed']['status'],'Done')
+        self.assertEqual(git('show','HEAD:a.py'),'unfinished task')
+        self.assertEqual(git('show',':b.py'),'human staging')
+
+
+    def test_live_git_recovery_prevents_new_parallel_workspace_claim(self):
+        project,folder,git=self.setup_repo()
+        recovery=self.task(project,'Recover current checkout','a.py',category='Git recovery')
+        run('task_claim',dict(project=project,id=recovery,actor=self.agent))
+        normal=self.task(project,'Isolated work','b.py')
+        refused=run('task_claim',dict(project=project,id=normal,actor=self.other(project)))
+        self.assertFalse(refused['claimed'])
+        self.assertIn('Git recovery',refused['branch_busy']['reason'])
+        self.assertEqual(git('branch','--show-current'),'main')
+
+    def test_checkout_recovery_offer_requires_human_opt_in_and_ready_work(self):
+        project,folder,git=self.setup_repo()
+        run('project_settings',dict(project=project,actor=self.human,git_mode='Branches'))
+        self.task(project,'Ready elsewhere','b.py')
+        (folder/'a.py').write_text('uncommitted existing work')
+        offer=run('worker_launch',dict(project=project,actor=self.agent))
+        self.assertFalse(offer['eligible']);self.assertNotIn('checkout_recovery',offer)
+        run('project_settings',dict(project=project,actor=self.human,agent_followup_tasks=True))
+        offer=run('worker_launch',dict(project=project,actor=self.agent))
+        self.assertFalse(offer['eligible'])
+        self.assertEqual(offer['checkout_recovery']['branch'],'main')
+        self.assertIn('a.py',offer['checkout_recovery']['files'])
+
+    def test_archive_preserves_all_files_refs_and_allows_leaving_worktrees(self):
+        project,folder,git=self.setup_repo()
+        task=self.task(project,'Preserve incomplete work','a.py')
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        work=Path(claim['git']['worktree'])
+        (work/'a.py').write_text('partial implementation')
+        (work/'notes.txt').write_text('untracked source')
+        (work/'Library').mkdir();(work/'Library/cache.bin').write_bytes(b'ignored cache retained')
+        preview=run('project_workspaces',dict(project=project,actor=self.human))
+        self.assertEqual(len(preview['workspaces']),1);self.assertTrue(work.exists())
+        with self.assertRaisesRegex(ValueError,'Only a human'):
+            run('project_workspaces',dict(project=project,actor=self.agent,confirm=True))
+        with self.assertRaisesRegex(ValueError,'Stop the project'):
+            run('project_workspaces',dict(project=project,actor=self.human,confirm=True))
+        run('project_control',dict(project=project,actor=self.human,action='stop'))
+        with self.assertRaisesRegex(ValueError,'live task claims'):
+            run('project_workspaces',dict(project=project,actor=self.human,confirm=True))
+        run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='offline'))
+        result=run('project_workspaces',dict(project=project,actor=self.human,confirm=True))
+        backup=Path(result['workspaces'][0]['archive'])
+        self.assertEqual((backup/'a.py').read_text(),'partial implementation')
+        self.assertEqual((backup/'notes.txt').read_text(),'untracked source')
+        self.assertEqual((backup/'Library/cache.bin').read_bytes(),b'ignored cache retained')
+        self.assertFalse((backup/'.git').exists());self.assertFalse(work.exists())
+        self.assertEqual((folder/'a.py').read_text(),'a\n')
+        self.assertTrue(git('rev-parse','--verify',claim['git']['branch']))
+        self.assertEqual(git('worktree','list','--porcelain').count('worktree '),1)
+        self.assertIn('Workspace archived',run('task_get',dict(project=project,id=task))['continuity'])
+        self.assertEqual(run('project_settings',dict(project=project,actor=self.human,git_mode='Branches'))['git_mode'],'Branches')
+
+    def test_archive_failure_restores_files_and_registry(self):
+        project,folder,git=self.setup_repo()
+        task=self.task(project,'Recover archive failure','a.py')
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        work=Path(claim['git']['worktree']);(work/'a.py').write_text('must survive')
+        run('project_control',dict(project=project,actor=self.human,action='stop'))
+        run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='offline'))
+        native=_git_sync._git
+        def fail_remove(root,*args,**kwargs):
+            if args[:2]==('worktree','remove'):return subprocess.CompletedProcess(args,1,'','fixture removal failed')
+            return native(root,*args,**kwargs)
+        with patch.object(_git_sync,'_git',side_effect=fail_remove),self.assertRaisesRegex(ValueError,'fixture removal failed'):
+            run('project_workspaces',dict(project=project,actor=self.human,confirm=True))
+        self.assertEqual((work/'a.py').read_text(),'must survive')
+        import git_worktrees
+        self.assertTrue(git_worktrees.entries(folder))
+        self.assertTrue((work/'.git').is_file())
+
+    def test_discovered_reserved_files_are_included_in_automatic_commit(self):
+        project,folder,git=self.setup_repo()
+        task=self.task(project,'Include discovered assembly','a.py')
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        work=Path(claim['git']['worktree'])
+        acquired=run('file_locks',dict(project=project,id=task,actor=self.agent,token=claim['token'],action='acquire',paths=[str(work/'b.py')]))
+        self.assertEqual(acquired['plan_added'],1)
+        self.assertEqual(run('task_get',dict(project=project,id=task))['files'],['a.py','b.py'])
+        (work/'b.py').write_text('discovered dependency')
+        run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Fixture dependency verified'))
+        self.assertEqual(subprocess.run(['git','-C',str(work),'show','HEAD:b.py'],capture_output=True,text=True,check=True).stdout,'discovered dependency')
+
     def test_parallel_claims_preserve_dirty_canonical_checkout_and_distinct_indexes(self):
         project,folder,git=self.setup_repo()
         (folder/'a.py').write_text('human');git('add','a.py')

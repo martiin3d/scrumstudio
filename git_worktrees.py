@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import subprocess
+import shutil
 from pathlib import Path
 
 
@@ -87,6 +88,12 @@ def prepare(root,settings,task):
         dependency=git.branch_for(settings,dep)
         if dependency!=target and git._git(root,'show-ref','--verify','--quiet','refs/heads/'+dependency).returncode==0 and git._git(root,'merge-base','--is-ancestor',dependency,destination).returncode:
             raise ValueError('Dependency branch '+dependency+' is not integrated into the workspace destination')
+    # A project can switch from Branches to Worktrees while unfinished work
+    # still owns its original checkout. Git cannot check that branch out twice.
+    # Reuse that checkout without registering it as a disposable worktree.
+    current=git._git(root,'symbolic-ref','--short','HEAD')
+    if not existing and not path.exists() and not current.returncode and current.stdout.strip()==target:
+        return {'branch':target,'worktree':str(root),'canonical_root':str(root),'parent':git.parent_branch(root,target),'reused_canonical':True}
     if path.exists():
         current=git._git(path,'symbolic-ref','--short','HEAD')
         common=git._git(path,'rev-parse','--path-format=absolute','--git-common-dir')
@@ -120,6 +127,57 @@ def save(root,saved):
         with os.fdopen(fd,'w',encoding='utf-8') as stream:json.dump(saved,stream)
         os.replace(temporary,location)
     finally:Path(temporary).unlink(missing_ok=True)
+
+
+def archive(root,confirm=False):
+    """Detach managed checkouts, preserving every file and all branch refs."""
+    import git_sync as git
+    if not root:raise ValueError('Project has no registered workspace folder')
+    root=Path(root).resolve()
+    with git.checkout_lock(root):
+        saved=entries(root);groups={}
+        for key,item in saved.items():
+            if item.get('cleaned'):continue
+            path=Path(workspace(root,key))
+            common=git._git(path,'rev-parse','--path-format=absolute','--git-common-dir')
+            original=git._git(root,'rev-parse','--path-format=absolute','--git-common-dir')
+            head=git._git(path,'symbolic-ref','--short','HEAD')
+            if common.returncode or original.returncode or common.stdout.strip()!=original.stdout.strip() or head.returncode or head.stdout.strip()!=item['branch']:
+                raise ValueError('Workspace repository/branch does not match its registry; preserved for recovery')
+            groups.setdefault(str(path),{'path':str(path),'branch':item['branch'],'tasks':[]})['tasks'].append(key)
+        if not confirm:return {'workspaces':list(groups.values()),'confirmed':False}
+        reports=[]
+        for location,item in groups.items():
+            path=Path(location)
+            if not path.is_relative_to(root/'.scrum/local/worktrees') or path==root:
+                raise ValueError('Refusing to detach a path outside managed worktrees')
+            archive_root=root/'.scrum/local/worktree-archives'
+            if not archive_root.resolve().is_relative_to(root/'.scrum/local'):
+                raise ValueError('Archive path escapes project-local storage')
+            archive_root.mkdir(parents=True,exist_ok=True)
+            archive_dir=Path(tempfile.mkdtemp(prefix='workspace-',dir=archive_root))
+            contents=archive_dir/'files';contents.mkdir()
+            manifest=dict(item,head=git._git(path,'rev-parse','HEAD').stdout.strip(),state='preserving')
+            record=archive_dir/'manifest.json';record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+            moved=[]
+            try:
+                for child in list(path.iterdir()):
+                    if child.name=='.git':continue
+                    shutil.move(str(child),str(contents/child.name));moved.append(child.name)
+                removed=git._git(root,'worktree','remove','--force',str(path),timeout=30)
+                if removed.returncode:raise ValueError('Could not detach preserved worktree: '+removed.stderr[-400:])
+            except BaseException:
+                if (path/'.git').is_file():
+                    for name in reversed(moved):
+                        if not (path/name).exists():shutil.move(str(contents/name),str(path/name))
+                manifest['state']='recovery_required';record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+                raise
+            manifest['state']='archived';record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+            for key in item['tasks']:saved.pop(key,None)
+            save(root,saved)
+            reports.append(dict(item,archive=str(contents),head=manifest['head']))
+        save(root,{key:value for key,value in saved.items() if not value.get('cleaned')})
+        return {'workspaces':reports,'confirmed':True,'branches_preserved':True}
 
 
 def queue_cleanup(root,merge,actor):

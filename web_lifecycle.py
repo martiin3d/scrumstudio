@@ -48,7 +48,7 @@ def stop(port):
             if json.load(response).get('stopping') is not True:raise ValueError('Unexpected shutdown response')
     except OSError:
         raise ValueError('Website did not accept shutdown; no process was killed. It may be stopped, stale or a different service.') from None
-    for _ in range(50):
+    for _ in range(150):
         current=read_control(port)
         if current is None or current['token']!=record['token']:
             print('Scrum Studio website stopped. MCP and project data are unchanged.')

@@ -35,3 +35,5 @@ The unit is **one result with its own acceptance check**, sized so a session fin
 Examples and Balanced/Unrestricted details: [details](references/details.md).
 
 Git recovery tasks use the existing checkout and may preserve dirty files/staging; they remain eligible when no other live claim needs the checkout. Never bypass active claims. For direct MCP CLI fallback omit --timeout to use operation-specific bounds (15 seconds ordinary calls, 180 completion writes); never retry an uncertain write without reconciling recorded state.
+
+Within an already authorized outcome, agents may register the minimum concrete recovery/prerequisite tasks needed to proceed. Search/reuse first, use task_plan atomically, link real blockers, and release the current claim before switching. Planning does not authorize unrelated features or unlimited retries. Do not perform routine replanning, create busywork, or duplicate completed outcomes.
