@@ -108,6 +108,35 @@ def project_exists(db, project):
         raise ValueError('Project not found')
     return row
 
+def git_claim(db, project, row, prefix, actor):
+    """Branch policy at claim time; returns a report or a {'busy':...} refusal."""
+    import git_sync
+    project_row=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
+    if not git_sync.enabled(coord.settings(project_row)):return None
+    task={'code':f"{prefix}-{row['number']}",'title':row['title'],'context_group':row['context_group'] if 'context_group' in row.keys() else ''}
+    report=git_sync.on_claim(project_row['workspace_root'],coord.settings(project_row),task)
+    if report and report.get('busy'):
+        activity(db,row['id'],actor,'comment','git: claim refused, checkout has uncommitted work on branch '+report['busy']['current_branch']+' (wanted '+report['busy']['wanted']+').')
+    elif report and (report.get('created') or report.get('switched') or report.get('error')):
+        activity(db,row['id'],actor,'comment','git: '+('created' if report.get('created') else 'switched to' if report.get('switched') else 'ERROR')+' branch '+report['branch']+(' ('+report['error']+')' if report.get('error') else '')+'.')
+    return report
+
+def git_done(db, project, t, prefix, actor):
+    """Commit/push policy when a task first becomes Done."""
+    import git_sync
+    project_row=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
+    settings=coord.settings(project_row)
+    if not git_sync.enabled(settings):return None
+    group=(t.get('context_group') or '').strip()
+    members=[];group_done=True
+    if group:
+        members=[{'id':r['id'],'code':f"{prefix}-{r['number']}",'status':r['status']} for r in db.execute('SELECT id,number,status FROM tasks WHERE project=? AND context_group=? ORDER BY id',(project,group))]
+        group_done=all(m['status'] in ('Done','Cancelled') for m in members)
+    task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
+    report=git_sync.on_done(db,project_row['workspace_root'],settings,task,project,actor,group_done,members)
+    if report:activity(db,t['id'],actor,'comment',git_sync.describe(report))
+    return report
+
 def project_prefix(name):
     letters = ''.join(c for c in unicodedata.normalize('NFKD', name) if c.isalpha() and not unicodedata.combining(c))
     return (letters[:3] or 'PRJ').upper()
@@ -141,6 +170,19 @@ def task_dict(row, prefix, include_cost=False):
     t['locked'] = t['lock_until'] > time.time()
     import context_tools
     return context_tools.decorate(t)
+
+def title_key(value):
+    return ' '.join(unicodedata.normalize('NFKC',value).casefold().split())
+
+def duplicate_task(db, project, title, a):
+    """Same-title unfinished/Done task for an agent re-planning after a resume."""
+    allow=a.get('allow_duplicate',False)
+    if type(allow) is not bool:raise ValueError('allow_duplicate must be boolean')
+    if allow or a.get('actor') is None or actor_user(db,a)['kind']!='agent':return None
+    key=title_key(title)
+    for row in db.execute("SELECT id,number,title,status FROM tasks WHERE project=? AND status!='Cancelled' ORDER BY id DESC",(project,)):
+        if title_key(row['title'])==key:return row
+    return None
 
 def actor_user(db, a):
     row = db.execute('SELECT * FROM users WHERE id=?', (a.get('actor'),)).fetchone()
@@ -228,6 +270,10 @@ def run(action, a):
     result=_run(action,a)
     import idle_signals
     idle_signals.notify(action,a)
+    import git_sync
+    if git_sync.PENDING and isinstance(result,dict):
+        pushes=git_sync.flush(run)
+        if pushes:result['git_push']=pushes
     return result
 
 def _run(action, a):
@@ -349,6 +395,26 @@ def legacy_run(action, a, path=None, locks=None):
             return coord.operation(db,action,a,project_row,actor_user,activity,now)
         if action=='project_metrics':
             return telemetry.metrics(db,project,a.get('days',30),a.get('include_series',False))
+        if action=='git_note':  # internal: record a post-transaction git outcome
+            activity(db,a['id'],a.get('actor'),'comment',a['text'])
+            return {'saved':True}
+        if action=='task_changes':
+            row=db.execute('SELECT files FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone()
+            if not row:
+                raise ValueError('Task not found')
+            root=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]
+            if not root:
+                raise ValueError('Project has no workspace folder; open the project folder first')
+            subset=a.get('files')
+            if subset is not None:
+                subset=coord.file_plan(subset)
+            import git_changes
+            planned=json.loads(row['files'] or '[]')
+            view=git_changes.review(root,planned,a.get('max_lines',200),include_diff=a.get('diff',True),scope=subset)
+            if not view:
+                raise ValueError('Could not inspect the checkout (git unavailable or timed out)')
+            view['id']=a['id'];view['planned']=planned
+            return view
         if action=='task_timing':
             if not db.execute('SELECT 1 FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone():
                 raise ValueError('Task not found')
@@ -454,6 +520,9 @@ def legacy_run(action, a, path=None, locks=None):
             held=coord.conflicts(db,paths,row['id'],actor['id'])
             if held:
                 return {'claimed':False,'conflicts':held[:20],'conflicts_total':len(held)}
+            git=git_claim(db,project,row,prefix,actor['id']) if row['lock_until'] <= time.time() else None
+            if git and git.get('busy'):
+                return {'claimed':False,'branch_busy':git['busy'],'hint':'Checkout holds uncommitted work of another branch; finish or hand off that work, or pick other work with exclude_ids.'}
             seconds = a.get('lease_seconds', 3600)
             if type(seconds) is not int or not 60 <= seconds <= 14400:
                 raise ValueError('lease_seconds must be 60..14400')
@@ -466,7 +535,15 @@ def legacy_run(action, a, path=None, locks=None):
             telemetry.transition(db,row['id'],'In Progress',actor['id'])
             if row['lock_until'] <= time.time():
                 activity(db, row['id'], actor['id'], 'claim', 'Claimed task; status In Progress.')
-            return {'claimed':True,'id': row['id'], 'code': f"{prefix}-{row['number']}", 'owner_id': actor['id'], 'token': token, 'lock_until': until, 'status': 'In Progress','files_reserved':len(paths)}
+            claimed={'claimed':True,'id': row['id'], 'code': f"{prefix}-{row['number']}", 'owner_id': actor['id'], 'token': token, 'lock_until': until, 'status': 'In Progress','files_reserved':len(paths)}
+            if row['lock_until'] <= time.time():
+                # Fresh claim: tell the worker which planned files were already edited on
+                # disk (not its work) so it reviews them before building on them.
+                import git_changes
+                baseline=git_changes.dirty(root,plan)
+                if baseline:claimed['dirty_planned']=baseline[:20]
+                if git:claimed['git']=git
+            return claimed
         if action == 'snapshot':
             return {'runtime':runtime.summary(db,project),'settings':coord.settings(project_row),'users': [dict(r) for r in db.execute('SELECT * FROM users ORDER BY name,id')], 'tasks': [task_dict(r, prefix) for r in db.execute('SELECT * FROM tasks WHERE project=? ORDER BY priority,id', (project,))], 'notes': [dict(r, items=json.loads(r['items'])) for r in db.execute('SELECT * FROM notes WHERE project=? ORDER BY id DESC', (project,))]}
         if action == 'task_plan':
@@ -478,6 +555,9 @@ def legacy_run(action, a, path=None, locks=None):
             criteria = acceptance_criteria(a.get('acceptance_criteria'))
             coord.validate_scope(a.get('scope_size','Unknown'),a.get('scope_reason',''))
             db.execute('BEGIN IMMEDIATE')
+            same=duplicate_task(db,project,title,a)
+            if same:
+                return {'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,'note':'Same title already registered; reuse it instead of repeating work. allow_duplicate=true only for a deliberately separate outcome.'}
             number = db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE project=?', (project,)).fetchone()[0]
             cur = db.execute('INSERT INTO tasks(project,title,description,priority,updated,checklist,number,category,acceptance_criteria) VALUES(?,?,?,?,?,?,?,?,?)', (project, title, scope, priority(a.get('priority', 2)), now(), json.dumps(checklist(a.get('checklist', []))), number, required(a.get('category','General'), 'category', 80),json.dumps(criteria)))
             import task_cost
@@ -623,6 +703,9 @@ def legacy_run(action, a, path=None, locks=None):
                 held=coord.conflicts(db,paths,t['id'],a['actor'])
                 if held:
                     return {'claimed':False,'conflicts':held[:20],'conflicts_total':len(held)}
+                git=git_claim(db,project,old,prefix,a['actor']) if old['lock_until'] <= time.time() else None
+                if git and git.get('busy'):
+                    return {'claimed':False,'branch_busy':git['busy'],'hint':'Checkout holds uncommitted work of another branch; finish or hand off that work, or pick other work with exclude_ids.'}
             db.execute('UPDATE tasks SET title=?,description=?,status=?,priority=?,blocked_reason=?,dependencies=?,checklist=?,updated=? WHERE id=? AND project=?', (t['title'], t['description'], t['status'], int(t['priority']), t['blocked_reason'], json.dumps(t['dependencies']), json.dumps(t['checklist']), now(), t['id'], project))
             until = old['lock_until']
             token = old['lock_token']
@@ -674,6 +757,10 @@ def legacy_run(action, a, path=None, locks=None):
             result = {'id': t['id'], 'code': t['code'], 'status': t['status'], 'unblocked': unblocked[:20], 'unblocked_total': len(unblocked)}
             if claiming:
                 result.update(claimed=True,token=token, lock_until=until, owner_id=owner,files_reserved=len(paths))
+                if git:result['git']=git
+            if t['status']=='Done' and old['status']!='Done':
+                git=git_done(db,project,dict(t,context_group=a.get('context_group',old['context_group'])),prefix,a.get('actor') if a.get('actor') is not None else owner)
+                if git:result['git']=git
             return result
         if action=='cli_usage_summary':
             import execution_usage
@@ -748,7 +835,10 @@ def legacy_run(action, a, path=None, locks=None):
             # A prose blocker requires an agent decision; never silently clear it.
             candidates = [t for t in tasks if t['status'] == 'In Progress' and ready(t)]
             candidates += [t for t in tasks if t['status'] == 'Blocked' and t['dependencies'] and ready(t) and not t['blocked_reason']]
-            candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t)]
+            # Own paused work (handoff continuity) resumes before fresh TODO work.
+            mine=lambda t: a.get('actor') is not None and t['owner_id']==a.get('actor') and bool(t.get('continuity'))
+            candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and mine(t)]
+            candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and not mine(t)]
             excluded=a.get('exclude_ids',[])
             if not isinstance(excluded,list) or len(excluded)>100 or any(type(i) is not int for i in excluded):
                 raise ValueError('exclude_ids must be a list of at most 100 task IDs')

@@ -21,7 +21,7 @@ The website is the human-facing dashboard. The MCP server exposes the same proje
 2. Prefer small, independently verifiable outcomes. Explain cohesive grouping; avoid speculative backlog and one-task-per-file fragmentation.
 3. Resume with the latest relevant retrospective, cached policy and a review of obsolete own file reservations.
 4. Claim a task and planned files, do useful work between calls, and record meaningful progress or blockers.
-5. Complete only with actual verification evidence. On interruption, save recorded progress and remaining checks, return unfinished work to TODO and release owned reservations.
+5. Review the task's own uncommitted diff once (`task_changes`, computed from git without a model call) and record a short before/after assessment with the finish call. Complete only with actual verification evidence. On interruption, save recorded progress and remaining checks, return unfinished work to TODO and release owned reservations.
 
 Task creation alone does not authorize execution. The skills provide procedural guidance; the server enforces supported state, ownership and policy checks.
 
@@ -32,6 +32,10 @@ Task creation alone does not authorize execution. The skills provide procedural 
 ### What improves
 
 Organization, traceability and session continuity improve clearly. A later agent can recover the task specification, latest progress, pending checks and ownership without reconstructing the entire conversation. Claims and file reservations help prevent overlapping work across agents. These benefits matter most in longer projects, interrupted sessions and concurrent work.
+
+Interrupted sessions are where the setup pays for itself: a resumed worker receives the task, its continuity and the diff already on disk (`task_changes`) instead of re-exploring the checkout, which is the most expensive phase of a fresh session. Uninterrupted small tasks still pay the coordination calls without that return.
+
+Optional git automation (project setting, off by default) moves the checkout to a branch per context group or task at claim time, commits per task or group at Done and pushes when the group completes, all in server code at existing coordination points; the agent spends no turns on git and failures are reported on the task without undoing Done.
 
 ### What still costs time
 

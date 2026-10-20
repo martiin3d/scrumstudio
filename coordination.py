@@ -5,9 +5,11 @@ import secrets
 import time
 from pathlib import Path
 
-POLICY_DEFAULTS = {'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1}
+from git_sync import GIT_DEFAULTS, validate as validate_git
+POLICY_DEFAULTS = {'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS}
 
 def validate_policy(changed):
+    validate_git(changed)
     if 'max_parallel_agents' in changed and (type(changed['max_parallel_agents']) is not int or not 1<=changed['max_parallel_agents']<=20):
         raise ValueError('max_parallel_agents must be 1..20')
     if 'workflow_mode' in changed and changed['workflow_mode'] not in ['Auto','Light','Standard']:
@@ -146,6 +148,22 @@ def own_task(db, a):
     return row
 
 
+def resumable(db, project_row, actor, limit=5):
+    """Own unfinished work left by an earlier session: resume it, never redo it."""
+    from store import project_prefix
+    prefix=project_prefix(project_row['name'])
+    rows=db.execute("SELECT id,number,title,status,continuity,lock_until,files FROM tasks WHERE project=? AND owner_id=? AND status IN ('In Progress','TODO','Blocked','In Review') AND (status='In Progress' OR continuity!='') ORDER BY updated DESC,id DESC LIMIT ?",(project_row['id'],actor,limit)).fetchall()
+    result=[]
+    for r in rows:
+        item={'id':r['id'],'code':f"{prefix}-{r['number']}",'title':r['title'],'status':r['status'],'continuity':(r['continuity'] or '')[:400]}
+        if r['status']=='In Progress' and r['lock_until']<=time.time():
+            # Crash or expired claim without a handoff: report the edits on disk.
+            import git_changes,json
+            item['interrupted']=True
+            item['edits']=git_changes.summary(project_row['workspace_root'],json.loads(r['files'] or '[]'))
+        result.append(item)
+    return result
+
 def page_locks(db, project=None, actor=None, after=0, limit=20):
     if type(limit) is not int or not 1<=limit<=100 or type(after) is not int or after<0:
         raise ValueError('Use a nonnegative after cursor and limit 1..100')
@@ -201,7 +219,8 @@ def operation(db, action, a, project_row, actor_user, activity, now):
     if action == 'session_resume':
         actor=actor_user(db,a)
         return {'settings':settings(project_row),'active_tasks':active_count(db,project,actor['id']),
-                'own_file_locks':page_locks(db,project=project,actor=actor['id'],after=a.get('after',0),limit=a.get('limit',20))}
+                'own_file_locks':page_locks(db,project=project,actor=actor['id'],after=a.get('after',0),limit=a.get('limit',20)),
+                'resume':resumable(db,project_row,actor['id'])}
     mode=a.get('action','list')
     if mode=='list':
         if a.get('own'):

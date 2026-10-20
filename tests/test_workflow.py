@@ -66,12 +66,25 @@ class CompactWorkflowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             run('project_settings',dict(project=self.p,actor=human,workflow_mode='Invalid'))
 
+    def test_concurrent_workers_claim_in_one_start_call(self):
+        task=self.task()
+        other=run('user_register',dict(identity='agent:second',name='Second',kind='agent'))['id']
+        run('agent_checkpoint',dict(project=self.p,actor=other,client='codex',session_used_percent=1,weekly_used_percent=1))
+        result=self.start(task)
+        self.assertEqual(result['workflow']['effective'],'Standard')
+        self.assertTrue(result['claim']['claimed'])
+        self.assertEqual(result['task']['status'],'In Progress')
+        rival=run('work_start',dict(project=self.p,actor=other,client='codex',id=task,claim=True,session_used_percent=1,weekly_used_percent=1))
+        self.assertFalse(rival.get('claim',{}).get('claimed'))
+        self.assertEqual(run('task_get',dict(project=self.p,id=task))['owner_id'],self.actor)
+
     def test_concurrent_workers_and_bad_close_do_not_complete(self):
         task=self.task()
         other=run('user_register',dict(identity='agent:second',name='Second',kind='agent'))['id']
         run('agent_checkpoint',dict(project=self.p,actor=other,client='codex',session_used_percent=1,weekly_used_percent=1))
-        self.assertEqual(self.start(task)['workflow']['effective'],'Standard')
-        claim=run('task_claim',dict(project=self.p,actor=self.actor,id=task))
+        started=self.start(task)
+        self.assertEqual(started['workflow']['effective'],'Standard')
+        claim=started['claim']
         with self.assertRaises(ValueError):
             run('work_finish',dict(project=self.p,actor=self.actor,id=task,token=claim['token'],evidence='Checked',close_session=True,client='codex',retrospective_items=['']))
         self.assertEqual(run('task_get',dict(project=self.p,id=task))['status'],'In Progress')

@@ -139,6 +139,18 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox',codex)
         self.assertNotIn('--dangerously-skip-permissions',claude)
 
+    def test_claude_worker_uses_compact_preapproved_scrum_catalog(self):
+        with patch.object(agent_bridge.shutil,'which',return_value='claude'):
+            claude=agent_bridge.command('claude',Path.cwd(),'Task')
+        self.assertIn('--strict-mcp-config',claude)
+        config=Path(next(arg.split('=',1)[1] for arg in claude if arg.startswith('--mcp-config=')))
+        server=json.loads(config.read_text(encoding='utf-8'))['mcpServers']['scrum-studio']
+        self.assertIn('--worker-schema',server['args'])
+        allowed=next(arg.split('=',1)[1] for arg in claude if arg.startswith('--allowedTools=')).split(',')
+        self.assertIn('mcp__scrum-studio__work_start',allowed)
+        self.assertFalse(any('project_control' in name or name=='Bash' for name in allowed))
+        self.assertIn('--permission-mode=acceptEdits',claude)
+
     def test_exited_child_is_never_signalled(self):
         child=Mock();child.poll.return_value=0
         agent_bridge.stop_child(child)
@@ -266,6 +278,8 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertIn('You review performance.',prompt)
             self.assertIn('persistent agent actor is 9',prompt)
             self.assertIn('Claim an eligible task',prompt)
+            self.assertIn('claim=true',prompt)
+            self.assertIn('Start AND claim in one call: work_start',prompt)
             self.assertIn('continue with the next eligible task',prompt)
             self.assertIn(json.dumps(sys.executable),prompt)
             self.assertIn('--usage-once',prompt)

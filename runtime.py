@@ -159,6 +159,7 @@ def handoff(db, project, actor, why, text, now, activity):
         db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor=?',(project,actor))
     tasks=db.execute("SELECT * FROM tasks WHERE project=? AND owner_id=? AND lock_until>?",(project,actor,time.time())).fetchall()
     stamp=now()
+    root=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()['workspace_root'] if tasks else ''
     for task in tasks:
         status='TODO' if task['status']=='In Progress' else task['status']
         db.execute('UPDATE tasks SET status=?,lock_token=NULL,lock_until=0,updated=? WHERE id=?',(status,stamp,task['id']))
@@ -173,6 +174,10 @@ def handoff(db, project, actor, why, text, now, activity):
         if not text and task['continuity']:
             prior='\n'.join(line for line in task['continuity'].splitlines() if not line.startswith(('Paused:','Next:')))
             if prior and not any(prior in part for part in parts):parts.append(prior[:800])
+        import git_changes
+        # Factual edit list from local code: the next session knows what to inspect.
+        edits=git_changes.summary(root,json.loads(task['files'] or '[]'))
+        if edits:parts.append(edits)
         if len(parts)==1:parts.append('No progress recorded; inspect partial edits.')
         parts.append('Next: reclaim task/files, inspect partial edits, resume unchecked work; retain recorded verification unless changes invalidate it.')
         continuity='\n'.join(parts)[:2000]

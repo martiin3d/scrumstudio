@@ -43,7 +43,9 @@ def operation(action, a, call):
             result['next'].pop('settings', None) # already returned by resume
             if a.get('claim', False):
                 pending = resume['own_file_locks'].get('items', [])
-                if result['workflow']['effective']!='Light':
+                light=result['workflow']['effective']=='Light'
+                if result['workflow']['reason']=='Standard selected by project policy':
+                    # A human chose explicit Standard claims for this project.
                     result['claim_deferred']='Standard workflow required: '+result['workflow']['reason']
                 elif pending:
                     result['claim_deferred']='Review own locks before claiming'
@@ -52,11 +54,13 @@ def operation(action, a, call):
                 else:
                     candidate=result['next']['task']
                     try:
-                        result['claim']=call('task_claim',base | {'id':a['id'],'require_light':True,'retro_seen':a.get('retro_seen')} | {k:a[k] for k in ('files','token') if k in a})
+                        # Standard (concurrent workers, larger scope) claims through the
+                        # same atomic task_claim checks: dependencies, WIP, file conflicts.
+                        result['claim']=call('task_claim',base | {'id':a['id'],'retro_seen':a.get('retro_seen')} | ({'require_light':True} if light else {}) | {k:a[k] for k in ('files','token') if k in a})
                         result['task']=call('task_get',{'project':project,'id':a['id']}) if result['claim'].get('claimed') else candidate
                         if result['claim'].get('claimed'):
                             result['task']['status']='In Progress'
-                        else:
+                        elif light:
                             result['workflow']['effective']='Standard'
                             result['workflow']['reason']='File reservation conflict'
                     except ValueError as error:
@@ -65,6 +69,7 @@ def operation(action, a, call):
     else:
         base = {'project': project, 'actor': a['actor']}
         if a.get('use_batch') and a.get('client') not in ('codex','claude'):raise ValueError('Batch completion requires client')
+        if type(a.get('claim_next',False)) is not bool:raise ValueError('claim_next must be boolean')
         if a.get('close_session'):
             items=a.get('retrospective_items',[])
             if a.get('client') not in ['codex','claude'] or not isinstance(items,list) or len(items)>100 or any(not isinstance(v,str) or not v.strip() or len(v)>4000 for v in items):
@@ -77,7 +82,13 @@ def operation(action, a, call):
                 raise ValueError('Other own work/reservations require explicit handoff before closing')
         update = base | {k: a[k] for k in ('id', 'token', 'evidence', 'checklist', 'log','continuity','usage_report') if k in a}
         update['status'] = 'Done'
-        completed = call('task_update', update)
+        # A retried finish (lost response, resumed session) must not re-record
+        # or ask the worker to redo verified delivery.
+        current=call('task_get',{'project':project,'id':a['id']})
+        if current.get('status')=='Done':
+            completed={'id':current['id'],'code':current['code'],'status':'Done','already_done':True}
+        else:
+            completed = call('task_update', update)
         # Completion commits before selection. A later selection failure never
         # rolls back verified delivery or asks the worker to complete it again.
         result = {'completed': completed}
@@ -94,6 +105,17 @@ def operation(action, a, call):
                     result['session']=call('agent_checkpoint',base|{'client':a['client'],'action':'offline'})
             else:
                 result['next'] = call('next_work', base | seen)
+            following=result.get('next') or {}
+            if a.get('claim_next') and not a.get('close_session') and following.get('task') and not following.get('should_stop'):
+                # One call per task: complete, then claim and load the next one.
+                try:
+                    claim=call('task_claim', base | {'id':following['task']['id']})
+                    if claim.get('claimed'):
+                        result['next']={**{k:v for k,v in following.items() if k!='task'},'task':call('task_get',{'project':project,'id':claim['id']}),'claim':claim}
+                    else:
+                        following['claim']=claim
+                except ValueError as error:
+                    following['claim_deferred']=str(error)
         except (ValueError, OSError) as error:
             result['close_error' if a.get('close_session') else 'next_error'] = str(error)
     return result if a.get('verbose', False) else decision_payload(result)

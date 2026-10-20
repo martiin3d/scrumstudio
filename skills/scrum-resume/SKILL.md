@@ -1,15 +1,12 @@
 ---
 name: scrum-resume
-description: Start or resume a Scrum Studio session using shared policy and safe optional Light claiming.
+description: Start or resume a Scrum Studio session and continue unfinished work from its saved continuity instead of repeating it.
 ---
 
-Use [shared resume policy](references/session-policy.md), which links to [core guidance](../scrum-work/references/core-guidance.md); resolve both relative to their respective installed skill directories. Match the checkout folder and reuse persistent identity. Call work_start(project,client,actor or identity+name,settings_seen?,task_seen?) with actual quota per [scrum-usage](../scrum-usage/SKILL.md). Cache returned measurement_session. Concurrent workers need distinct identities.
+Follow steps 1–2 of [scrum-work](../scrum-work/SKILL.md): `work_start` once with real quota ([scrum-usage](../scrum-usage/SKILL.md)), then continue the tasks listed in `resume` before anything new.
 
-For stalled MCP calls, storage errors or approval decisions, follow the transport recovery guidance in the installed scrum-work core reference. Do not repeat a potentially committed write or use fallback transport to bypass policy.
-
-Review returned own file locks. Release only obsolete own locks; paginate session_resume if has_more. should_stop ends work. Missing/omitted cached fields stay cached; next.no_candidate is not proof that the backlog is empty.
-
-Known authorized Light work may pass id,claim=true,files. Only claim.claimed=true grants a token; old locks, conflicts or Standard defer claiming. Otherwise task_claim explicitly. Never recover a lost token with another identity. verbose=true is for diagnostics only.
-
-Treat next_work, preflight offers and batch headers as navigation only. Load current full scope through task_get or work_start(id) before editing; a header version does not carry acceptance criteria or other execution detail. Preserve the current task's acceptance criteria, blockers, checklist, evidence and continuity. Resume from its continuity and keep verified work unless changes invalidate it. Default task reads omit note history. Request task_get(include_notes=true) for references, notes_content=true for necessary content only. next_work never returns retrospectives or human notes. pending_ai_notes is only a counter; when nonzero, load pending task reminders with include_notes=true,notes_content=true (notes_audience=agent by default), then mark reminders done once resolved. Do not reload cached history or rewrite previous summaries.
-
+- Review `own_file_locks`; release only obsolete own locks; paginate `session_resume` if `has_more`.
+- If you know the task to continue, `work_start(id, claim=true)` loads and claims it in the same call. Otherwise read its `continuity` and evidence with `task_get`, claim it again, inspect partial edits, then finish the unchecked work. Do not re-plan, re-create or re-verify what is already recorded.
+- `interrupted=true` (claim expired without handoff) and handoff continuity both list the files edited on disk: `task_changes(id)` returns their uncommitted diff in one bounded call. Start from that diff plus `continuity`, not from a fresh exploration; its `unplanned` list tells you which checkout changes are not this task's.
+- `next.no_candidate` is not proof that the backlog is empty. `verbose=true` is for diagnostics only.
+- A stalled write: inspect state before retrying; never repeat a possibly committed write.

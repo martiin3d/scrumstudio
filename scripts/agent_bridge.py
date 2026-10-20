@@ -27,7 +27,7 @@ import idle_signals
 
 # Only the board workflow authorized by Start/Wakeup; never provider, human,
 # project administration, filesystem, network or arbitrary tool approvals.
-SCRUM_WORK_TOOLS=('work_start','next_work','task_get','task_search','task_claim','task_release','task_update','work_finish','agent_checkpoint','file_locks','note_check')
+SCRUM_WORK_TOOLS=('work_start','next_work','task_get','task_search','task_claim','task_release','task_update','task_changes','work_finish','agent_checkpoint','file_locks','note_check')
 
 def skill_options():
     """Hide optional Scrum catalog entries for this run; files stay readable."""
@@ -63,7 +63,47 @@ def command(client,folder,prompt,model=''):
         options+=['-c','permissions.scrum-worker.filesystem={'+','.join(json.dumps(path.as_posix())+'="read"' for path in read_paths)+'}']
         options+=['-c','mcp_servers.scrum-studio.command='+json.dumps(sys.executable),'-c','mcp_servers.scrum-studio.args='+json.dumps([str(ROOT/'mcp_server.py'),'--worker-schema']),'-c','mcp_servers.scrum-studio.enabled_tools='+json.dumps(SCRUM_WORK_TOOLS),'-c','mcp_servers.scrum-studio.default_tools_approval_mode="approve"']
         return [executable,*options,'exec','--json','--skip-git-repo-check','--cd',str(folder),*model_args,'-']
-    return [executable,'-p','--output-format','stream-json','--verbose',*model_args,'Follow the Scrum task instructions supplied on stdin.']
+    # Claude CLI: same worker catalog as Codex. A config file (not inline JSON)
+    # survives Windows .cmd quoting; --strict-mcp-config keeps the user's other
+    # MCP servers (and their tool tokens) out of worker runs. Headless -p cannot
+    # answer permission prompts, so the Scrum tools and workspace edits are
+    # pre-approved explicitly; nothing bypasses permissions.
+    return [executable,'-p','Follow the Scrum task instructions supplied on stdin.','--output-format','stream-json','--verbose',*model_args,
+            '--mcp-config='+str(claude_mcp_config()),'--strict-mcp-config','--permission-mode=acceptEdits',
+            '--allowedTools='+','.join(CLAUDE_WORK_TOOLS+tuple('mcp__scrum-studio__'+name for name in SCRUM_WORK_TOOLS))]
+
+CLAUDE_WORK_TOOLS=('Read','Edit','Write','Glob','Grep','Bash(python:*)','Bash(python3:*)','Bash(py:*)','Bash(git status:*)','Bash(git diff:*)')
+
+def claude_mcp_config():
+    path=ROOT/'data'/'claude-worker-mcp.json'
+    text=json.dumps({'mcpServers':{'scrum-studio':{'type':'stdio','command':sys.executable,'args':[str(ROOT/'mcp_server.py'),'--worker-schema']}}},indent=2)
+    try:
+        if path.read_text(encoding='utf-8')==text:return path
+    except OSError:pass
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=path.with_suffix('.tmp');temporary.write_text(text,encoding='utf-8');os.replace(temporary,path)
+    return path
+
+def preclaim(rpc,project,actor,client,task,observed):
+    """Claim the offered task before inference; any failure falls back to the worker claiming."""
+    try:
+        result=rpc.call('work_start',{'project':project,'actor':actor,'client':client,'id':task,'claim':True,**observed})
+    except RuntimeError:
+        return {}
+    if result.get('checkpoint',{}).get('should_stop'):
+        return {'should_stop':True,'reason':result['checkpoint'].get('reason','Stop/quota policy')}
+    claim=result.get('claim') or {}
+    if not claim.get('claimed') or not result.get('task'):
+        return {}
+    return {'task':result['task'],'token':claim['token']}
+
+def preclaimed_prompt(started):
+    task=started['task']
+    return ('\nThe supervisor already ran work_start and claimed '+str(task.get('code'))+' for you (In Progress). Do NOT call work_start, task_claim or task_get for it.'
+            ' Its token is '+json.dumps(started['token'])+'; pass it to task_update/work_finish and never print or log it.'
+            ' Full task (acceptance criteria, checklist, files, evidence, continuity): '+json.dumps(task,ensure_ascii=False,separators=(',',':'))+
+            '\nIf continuity is present, resume from it and never redo recorded work. Edit, verify, then finish in one call: work_finish with evidence and continuity if anything remains.'
+            ' Quota is supervised outside the model; call agent_checkpoint only to pause or when a long step ends.')
 
 def chat_event(rpc,project,actor,text):
     # Visibility must not interrupt a worker or invalidate a committed handoff.
@@ -301,13 +341,24 @@ def main():
                     if offer.get('batch'):
                         prompt+='\nSequential batch headers (max3; load each scope only as needed): '+json.dumps(offer['batch'],separators=(',',':'))+'. Reuse this context. Work only on the current task; others stay unclaimed/TODO. Complete each using work_finish(use_batch=true,client=\"'+args.client+'\") without close_session. Continue ONLY with the returned next task after a fresh claim; when batch_done/session offline, exit. The server rechecks model/dependencies/locks. Never mark the whole batch In Progress.'
                         prompt=prompt.replace('Verify, work_finish(close_session=true), exit;','Verify each task individually, then exit when the batch is finished;').replace('ONLY for '+str(offer.get('code')),'starting with '+str(offer.get('code')))
-                    prompt+='\nRead references/core-guidance.md from the installed scrum-work skill directory for shared policy; resolve installed skill references relative to each skill directory, never the target checkout. Read references/session-policy.md from the installed scrum-resume skill directory when resuming. Preflight, next_work, task_search and batch headers are navigation only: load current full scope with task_get or work_start(id) before editing, and preserve its acceptance criteria, blockers, checklist, evidence and continuity. Claim only the current task/files. Use the codebase-memory graph workflow when installed and direct-source coverage fallback otherwise. Specialist skills/tools are loaded only on demand.'
+                    prompt+='\nFollow the installed scrum-work skill; read its references/core-guidance.md only for batches or MCP recovery; resolve installed skill references relative to each skill directory, never the target checkout. Preflight, next_work, task_search and batch headers are navigation only: load current full scope with task_get or work_start(id) before editing, and preserve its acceptance criteria, blockers, checklist, evidence and continuity. If the task has continuity, resume from it and never redo recorded work or re-create tasks. Claim only the current task/files. Use codebase-memory when installed, otherwise direct source reads. Specialist skills/tools are loaded only on demand.'
                     if automatic:
                         prompt=prompt.replace('This human Wakeup authorizes the existing backlog.','Human-enabled session-quota autoresume continues the previously authorized backlog after a verified reset.')
                     if role:
                         prompt+='\nRole instructions:\n'+role+'\nScrum ownership, quota, Stop and verification rules apply; do not weaken them.'
                     prompt+='\nPython: '+json.dumps(sys.executable)+' (PowerShell: &). Fresh quota: this executable + '+json.dumps(str(ROOT/'scripts/agent_bridge.py'))+' --project '+str(args.project)+' --client '+args.client+' --usage-once'+(' --usage-file '+json.dumps(args.usage_file) if args.usage_file else '')+'. Planning/attachments/specialist tools or stalled MCP: same executable + '+json.dumps(str(ROOT/'scripts/mcp_client.py'))+' --tool TOOL --timeout 15, JSON stdin; never print tokens.'
-                    prompt+='\nValidated provider quota: '+json.dumps(observed)+'. work_start with actor/project/client, id=' + str(offer.get('id')) + ' and these fields while original observed_at is fresh; never replace the timestamp. Supervisor refreshes quota; safe agent_checkpoint reuses it, no startup probe. Approval-required calls strictly sequentially; wait for results. On sandbox denial request the minimum required access normally (skills/Python included). Never bypass reviewer rejection or weaken sandbox/quota policy.'
+                    prompt+='\nValidated provider quota: '+json.dumps(observed)+'. Start AND claim in one call: work_start with actor/project/client, id=' + str(offer.get('id')) + ', claim=true (files only to change the planned set) and these fields while original observed_at is fresh; never replace the timestamp. claim.claimed=true gives the token; use task_claim only after claim_deferred or claimed=false. Supervisor refreshes quota; safe agent_checkpoint reuses it, no startup probe. Approval-required calls strictly sequentially; wait for results. On sandbox denial request the minimum required access normally (skills/Python included). Never bypass reviewer rejection or weaken sandbox/quota policy.'
+                    # Supervisor pre-claim: start the session and claim the offered task
+                    # in local code, so the model spends no turns on work_start/task_get.
+                    started=preclaim(rpc,args.project,actor,args.client,offer['id'],observed)
+                    if started.get('should_stop'):
+                        release_launch(rpc,args.project,actor)
+                        print('Wakeup held: '+started['reason'],flush=True)
+                        chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: Wakeup held: '+started['reason'])
+                        time.sleep(2)
+                        continue
+                    if started.get('task'):
+                        prompt=prompt[:prompt.index('\nValidated provider quota: ')].replace('Claim an eligible task/files (claimed=true) ONLY for ','Work ONLY on ')+preclaimed_prompt(started)
                     log_path=folder/'.scrum'/'local'/('worker-'+args.client+'-'+args.worker+'.log')
                     output=open(log_path,'a',encoding='utf-8');log_offset=output.tell()
                     options={'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {'start_new_session':True}
@@ -317,7 +368,7 @@ def main():
                         seen_model=''
                         with tempfile.TemporaryFile(mode='w+b') as prompt_input:
                             prompt_input.write(prompt.encode('utf-8'));prompt_input.seek(0)
-                            child=subprocess.Popen(command(args.client,folder,prompt,selected_model),cwd=folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,**options)
+                            child=subprocess.Popen(command(args.client,folder,prompt,selected_model),cwd=folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**os.environ,'SCRUM_BRIDGE_WORKER':'1'},**options)
                     except (OSError,RuntimeError,ValueError) as error:
                         run_id=''
                         release_launch(rpc,args.project,actor)
