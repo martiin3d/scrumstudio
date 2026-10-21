@@ -193,7 +193,7 @@ def _commit(root, settings, task, message):
     stat = _git(root, 'diff', '--shortstat', 'HEAD~1', 'HEAD').stdout.strip()
     return {'committed': True, 'sha': sha, 'summary': stat}
 
-def on_done(db, root, settings, task, project, actor, group_done, group_members):
+def on_done(db, root, settings, task, project, actor, group_done, group_members,dependency_checkpoint=False):
     """Commit at Done according to policy and queue a push when the unit is complete.
 
     task: dict with id, code, title, files, context_group. group_done: every task of
@@ -203,7 +203,7 @@ def on_done(db, root, settings, task, project, actor, group_done, group_members)
     report={'branch':branch_for(settings,task),'queued':True}
     current=getattr(_jobs,'current',None)
     if current is None:return {'error':'Git job requires a committed coordination transaction'}
-    current.append(dict(root=root,settings=dict(settings),task=dict(task),project=project,actor=actor,group_done=group_done,members=group_members,report=report))
+    current.append(dict(root=root,settings=dict(settings),task=dict(task),project=project,actor=actor,group_done=group_done,members=group_members,dependency_checkpoint=dependency_checkpoint,report=report))
     return report
 
 
@@ -269,6 +269,9 @@ def _finish(item):
         if current is None:return dict(report,error='git unavailable or not a repository')
         if current[0]!=report['branch']:return dict(report,error='Checkout branch changed; automatic commit and push refused')
         group=(task.get('context_group') or '').strip();unit_done=item['group_done'] if group else True
+        if item.get('dependency_checkpoint'):
+            unit_done=True
+            report['note']='Published a completed dependency checkpoint; unfinished context-group tasks remain pending'
         if settings.get('git_commit','Task')=='Task' or not group:
             report['commit']=_commit(root,settings,task,f"{task['code']}: {task['title']}")
         elif unit_done:
@@ -335,7 +338,7 @@ def flush(call,jobs,result,external_project=None):
         try:outcome=_finish(item)
         except (OSError,ValueError,subprocess.SubprocessError) as error:
             outcome={'branch':branch_for(item['settings'],item['task']),'error':str(error)[:300]}
-        if outcome.get('error') and item['settings'].get('git_merge')=='Group' and item['group_done']:
+        if outcome.get('error') and item['settings'].get('git_merge')=='Group' and (item['group_done'] or item.get('dependency_checkpoint')):
             outcome['merge']={'merged':False,'error':outcome['error']}
         item['report'].clear();item['report'].update(outcome)
         if result.get('id')==item['task']['id']:result['git']=outcome

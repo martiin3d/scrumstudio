@@ -16,3 +16,5 @@ Use codebase-memory when installed (search symbols, trace, read snippets, check 
 
 ## Local MCP recovery
 If the desktop MCP stalls, distinguish transport latency from storage failure with the bundled diagnostic. Use `scripts/mcp_client.py --tool TOOL` only when the local server responds and the desktop transport is stalled; same policy and reservations apply. Never blindly retry an uncertain write, expose tokens, or use a fallback to evade a rejection. Approval-required calls run sequentially.
+
+Git preparation recovery also handles claim_deferred replies: the supervisor links a waiting task to one scoped recovery and starts it through normal claims, without another human Wakeup. Completed dependency checkpoints can publish before their context group finishes when per-task commit and Group merge are enabled; this does not finish pending tasks or permit cleanup. A genuine external recovery blocker leaves other independent work eligible.

@@ -165,9 +165,19 @@ def git_done(db, project, t, prefix, actor):
         members=[{'id':r['id'],'code':f"{prefix}-{r['number']}",'status':r['status'],'files':json.loads(r['files'])} for r in db.execute('SELECT id,number,status,files FROM tasks WHERE project=? AND context_group=? ORDER BY id',(project,group))]
         group_done=all(m['status'] in ('Done','Cancelled') for m in members)
     task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
+    dependency_checkpoint=False
+    if group and not group_done and settings.get('git_merge')=='Group' and settings.get('git_commit')=='Task':
+        done={r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status='Done'",(project,))}
+        members_done={m['id'] for m in members if m['status']=='Done'}
+        source=git_sync.branch_for(settings,task)
+        for dependent in db.execute("SELECT id,number,title,context_group,dependencies,blocked_reason FROM tasks WHERE project=? AND status IN ('TODO','Blocked')",(project,)):
+            deps=json.loads(dependent['dependencies'])
+            other={'code':f"{prefix}-{dependent['number']}",'title':dependent['title'],'context_group':dependent['context_group']}
+            if members_done.intersection(deps) and all(dep in done for dep in deps) and not dependent['blocked_reason'].strip() and git_sync.branch_for(settings,other)!=source:
+                dependency_checkpoint=True;break
     root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(t))
     task['git_branch']=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(t))
-    report=git_sync.on_done(db,root,settings,task,project,actor,group_done,members)
+    report=git_sync.on_done(db,root,settings,task,project,actor,group_done,members,dependency_checkpoint=dependency_checkpoint)
     # The Git job runs after this database transaction commits.
     if report and not report.get('queued'):activity(db,t['id'],actor,'comment',git_sync.describe(report))
     return report
@@ -503,8 +513,9 @@ def legacy_run(action, a, path=None, locks=None):
         if action=='project_metrics':
             return telemetry.metrics(db,project,a.get('days',30),a.get('include_series',False))
         if action=='git_recovery_next':
-            row=db.execute("SELECT id FROM tasks WHERE project=? AND category='Git recovery' AND status='TODO' AND lock_until<=? AND NOT EXISTS (SELECT 1 FROM tasks active WHERE active.project=tasks.project AND active.status='In Progress' AND active.lock_until>?) ORDER BY id LIMIT 1",(project,time.time(),time.time())).fetchone()
-            return dict(row) if row else None
+            done={r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status='Done'",(project,))}
+            rows=db.execute("SELECT id,dependencies,blocked_reason FROM tasks WHERE project=? AND category='Git recovery' AND status='TODO' AND lock_until<=? AND NOT EXISTS (SELECT 1 FROM tasks active WHERE active.project=tasks.project AND active.status='In Progress' AND active.lock_until>?) ORDER BY id",(project,time.time(),time.time())).fetchall()
+            return next(({'id':row['id']} for row in rows if not row['blocked_reason'].strip() and all(dep in done for dep in json.loads(row['dependencies']))),None)
         if action=='git_note':  # internal: record a post-transaction git outcome
             activity(db,a['id'],a.get('actor'),'comment',a['text'])
             return {'saved':True}

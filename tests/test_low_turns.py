@@ -236,6 +236,31 @@ class GitAutomationTest(unittest.TestCase):
         self.assertEqual(git_sync.branch_for({'git_branch_prefix':'f/'},{'code':'WEB-7','title':'x','context_group':'Auth flow'}),'f/auth-flow')
 
     @NEEDS_MERGE_TREE
+    def test_ready_cross_group_dependency_publishes_checkpoint_before_group_finishes(self):
+        project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group',git_commit='Task')
+        first=run('task_create',dict(project=project,title='Verified prerequisite',files=['a.py'],context_group='Source',**SPEC))['id']
+        pending=run('task_create',dict(project=project,title='Later source work',files=['b.py'],context_group='Source',**SPEC))['id']
+        dependent=run('task_create',dict(project=project,title='Other context needs prerequisite',files=['b.py'],context_group='Other',dependencies=[first],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent));(folder/'a.py').write_text('verified prerequisite')
+        result=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Verified prerequisite'))
+        report=result['completed']['git']
+        self.assertTrue(report['push']['pushed']);self.assertTrue(report['merge']['merged'])
+        self.assertEqual(git('show','main:a.py'),'verified prerequisite')
+        self.assertEqual(run('task_get',dict(project=project,id=pending))['status'],'TODO')
+        self.assertTrue(run('task_claim',dict(project=project,id=dependent,actor=self.agent))['claimed'])
+
+    def test_checkpoint_does_not_publish_when_cross_group_work_still_has_prerequisites(self):
+        project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group',git_commit='Task')
+        first=run('task_create',dict(project=project,title='Verified piece',files=['a.py'],context_group='Source',**SPEC))['id']
+        pending=run('task_create',dict(project=project,title='Other prerequisite',files=['b.py'],context_group='Source',**SPEC))['id']
+        run('task_create',dict(project=project,title='Not ready yet',context_group='Other',dependencies=[first,pending],**SPEC))
+        before=git('rev-parse','main')
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent));(folder/'a.py').write_text('verified')
+        result=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Verified'))
+        self.assertNotIn('merge',result['completed']['git'])
+        self.assertEqual(git('rev-parse','main'),before)
+
+    @NEEDS_MERGE_TREE
     def test_merge_uses_recorded_parent_after_base_setting_changes(self):
         project,folder=self.project();git=self.repo(folder)
         git('checkout','-qb','develop');git('checkout','-q','main')

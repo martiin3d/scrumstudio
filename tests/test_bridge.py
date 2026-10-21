@@ -75,6 +75,9 @@ class BridgeTest(unittest.TestCase):
         rpc.call.side_effect=None;rpc.call.return_value={'claim_deferred':'File reservation conflict'}
         result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
         self.assertTrue(result['should_stop']);self.assertIn('File reservation conflict',result['reason'])
+        self.assertNotIn('git_recovery',result)
+        rpc.call.return_value={'claim_deferred':'Git branch preparation failed: Dependency branch not integrated'}
+        self.assertIn('Dependency branch',agent_bridge.preclaim(rpc,1,9,'codex',70,{})['git_recovery'])
 
     def test_plain_config_startup_failure_is_reported_without_other_log_content(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as folder:
@@ -283,6 +286,53 @@ class BridgeChatTest(unittest.TestCase):
 
 
 class ManagedBridgeTest(unittest.TestCase):
+    def test_deferred_git_failure_starts_recovery_without_another_wakeup(self):
+        import git_sync
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
+            folder=Path(temporary);(folder/'.scrum/local').mkdir(parents=True)
+            rpc=Mock();offers=[]
+            def call(name,args):
+                if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                if name=='user_register':return {'id':9}
+                if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                if name=='project_settings':return {'usage_check_seconds':300,'agent_followup_tasks':True}
+                if name=='agent_checkpoint':return {'should_stop':False,'reason':'','control':{'generation':0,'paused':False}}
+                if name=='worker_launch' and args['action']=='reserve':
+                    selected=args.get('id',1);offers.append(selected)
+                    return {'eligible':True,'id':selected,'code':'FIX-'+str(selected)}
+                if name=='work_start':
+                    if args['id']==1:return {'claim_deferred':'Git branch preparation failed: Dependency branch is not integrated'}
+                    return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':7,'code':'FIX-7','category':'Git recovery'}}
+                if name=='task_plan':return {'items':[{'id':7,'status':'TODO'}]}
+                if name=='task_get':return {'id':1,'dependencies':[]}
+                return {}
+            rpc.call.side_effect=call
+            pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':1};pool.submit.return_value=future
+            child=Mock();child.poll.return_value=None
+            with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(git_sync,'state',return_value=('scrum/source',[])),patch.object(git_sync,'_git',return_value=Mock(stdout='verified-head')),patch.object(agent_bridge,'command',return_value=['fake']),patch.object(agent_bridge.subprocess,'Popen',return_value=child) as spawn,patch.object(agent_bridge,'stop_child'),patch.object(agent_bridge.time,'sleep',side_effect=[None,None,KeyboardInterrupt]):
+                agent_bridge.main()
+            self.assertEqual(offers,[1,7]);spawn.assert_called_once()
+            self.assertTrue(any(c.args[0]=='task_update' and c.args[1].get('blocked_reason_kind')=='dependency' for c in rpc.call.call_args_list))
+
+    def test_preparation_recovery_links_waiting_task_without_replacing_its_dependencies(self):
+        rpc=Mock()
+        def call(name,args):
+            if name=='task_plan':return {'items':[{'id':7,'status':'TODO'}]}
+            if name=='task_get':return {'id':12,'dependencies':[3,4]}
+            return {}
+        rpc.call.side_effect=call
+        offer={'id':12,'checkout_recovery':{'branch':'scrum/source','head':'verified-head','files':[],'error':'Dependency branch not integrated'}}
+        self.assertEqual(agent_bridge.queue_checkout_recovery(rpc,1,9,offer,set()),7)
+        update=next(c.args[1] for c in rpc.call.call_args_list if c.args[0]=='task_update')
+        self.assertEqual(update['dependencies'],[3,4,7])
+        self.assertEqual(update['blocked_reason_kind'],'dependency')
+        self.assertEqual(update['status'],'Blocked')
+
+    def test_completed_recovery_is_not_queued_as_new_work(self):
+        rpc=Mock();rpc.call.return_value={'items':[{'id':7,'status':'Done','existing':True}]}
+        self.assertFalse(agent_bridge.queue_checkout_recovery(rpc,1,9,{'checkout_recovery':{'branch':'source'}},set()))
+        rpc.call.assert_called_once()
+
     def test_checkout_recovery_is_on_demand_and_bounded_without_model_calls(self):
         rpc=Mock();rpc.call.return_value={'items':[{'id':7}]};attempts=set()
         self.assertFalse(agent_bridge.queue_checkout_recovery(rpc,1,9,{'eligible':False},attempts))

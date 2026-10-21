@@ -4,6 +4,7 @@ Run explicitly with --allow-run. Wakeup starts only this bridge's CLI worker;
 Stop interrupts only its process group, then records an automatic handoff.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -49,12 +50,19 @@ def queue_checkout_recovery(rpc,project,actor,offer,attempted):
     attempted.add(fingerprint)  # An uncertain write must not cause a retry loop.
     branch=str(issue['branch'])
     result=rpc.call('task_plan',{'project':project,'actor':actor,'items':[{
-        'key':'checkout-recovery','title':('Recover checkout for available work: '+branch)[:200],
-        'description':'The human enabled autonomous recovery tasks. Ready authorized work cannot start because of checkout/preparation state on '+branch+'. Inspect saved task continuity and current Git state, reserve discovered files, and recover branch availability without losing work. Preserve unrelated edits/staging; no blanket commit, discard, stash or force push. Commit/publish only verified related outcomes under the recorded Git policy. If recovery needs an external action, record a precise blocker and exit; never repeat an unchanged attempt. Concrete error: '+str(issue.get('error','Uncommitted work prevents switching to another ready task.'))[:700]+'. Diagnostic paths: '+json.dumps(issue.get('files',[])[:20]),
+        'key':'checkout-recovery','title':('Recover checkout for available work: '+branch)[:185]+' '+hashlib.sha256(fingerprint.encode()).hexdigest()[:8],
+        'description':'The human enabled autonomous recovery tasks. Ready authorized work cannot start because of checkout/preparation state on '+branch+'. Inspect saved task continuity and current Git state, reserve discovered files, and recover branch availability without losing work. Preserve unrelated edits/staging; no blanket commit, discard, stash or force push. Commit/publish only verified related outcomes under the recorded Git policy. If a completed prerequisite is not integrated, reconcile its recorded parent chain and publish the verified commits needed by the waiting task; unfinished context-group work must stay unfinished. If recovery needs an external action, record a precise blocker and exit; never repeat an unchanged attempt. Concrete error: '+str(issue.get('error','Uncommitted work prevents switching to another ready task.'))[:700]+'. Diagnostic paths: '+json.dumps(issue.get('files',[])[:20]),
         'acceptance_criteria':['Ready work can proceed without losing partial/unrelated work, or a concrete external blocker is recorded with resumable continuity.'],
         'category':'Git recovery','priority':1,'scope_size':'Small','scope_reason':'One concrete checkout recovery; no new feature.',
         'model_tier':'standard','model_reason':'Scoped Git state recovery.'}]})
-    return bool(result.get('items'))
+    recovery=next((item for item in result.get('items',[]) if item.get('status','TODO')=='TODO'),None)
+    if not recovery:return False
+    if offer.get('id'):
+        waiting=rpc.call('task_get',{'project':project,'id':offer['id']})
+        rpc.call('task_update',{'project':project,'id':waiting['id'],'actor':actor,'status':'Blocked',
+            'dependencies':list(dict.fromkeys([*waiting['dependencies'],recovery['id']])),
+            'blocked_reason':'Waiting for scoped Git preparation recovery','blocked_reason_kind':'dependency'})
+    return recovery['id']
 
 
 def interactive_command(cmd,client,project,actor,folder,model,policy):
@@ -167,7 +175,7 @@ def preclaim(rpc,project,actor,client,task,observed):
         busy=claim.get('branch_busy') or {}
         branch_reason=('Checkout branch '+str(busy.get('current_branch','unknown'))+' cannot switch to '+str(busy.get('wanted','task branch'))+': '+str(busy.get('reason') or 'uncommitted work must be preserved')) if busy else ''
         reason=result.get('claim_deferred') or claim.get('reason') or branch_reason or 'Task ownership was not granted; inspect dependencies, file reservations and workflow policy'
-        return {'should_stop':True,'reason':str(reason)[:500]}
+        return {'should_stop':True,'reason':str(reason)[:500],**({'git_recovery':str(reason)[:1000]} if 'Git branch preparation failed:' in str(reason) else {})}
     return {'task':result['task'],'token':claim['token'],**{k:claim[k] for k in ('dirty_planned','git') if k in claim}}
 
 def preclaimed_prompt(started):
@@ -434,7 +442,9 @@ def main():
                     if not offer.get('eligible'):
                         if policy.get('agent_followup_tasks') and offer.get('checkout_recovery'):
                             try:
-                                if queue_checkout_recovery(rpc,args.project,actor,offer,checkout_attempts):
+                                queued=queue_checkout_recovery(rpc,args.project,actor,offer,checkout_attempts)
+                                if queued:
+                                    pending_recovery=queued;pending_start=True
                                     chat_event(rpc,args.project,actor,'Checkout blocks ready work. A scoped recovery task was registered/reused; normal Stop, quota and claim checks apply.')
                             except RuntimeError as error:chat_event(rpc,args.project,actor,'Could not register checkout recovery: '+str(error)[:400])
                         reason=offer.get('reason','No eligible unreserved work; no model was started.')
@@ -472,8 +482,10 @@ def main():
                             import git_sync
                             state=git_sync.state(folder)
                             if state:
-                                issue={'branch':state[0],'files':state[1][:100],'error':started['git_recovery']}
-                                try:queue_checkout_recovery(rpc,args.project,actor,{'checkout_recovery':issue},checkout_attempts)
+                                issue={'branch':state[0],'head':git_sync._git(folder,'rev-parse','HEAD').stdout.strip(),'files':state[1][:100],'error':started['git_recovery']}
+                                try:
+                                    queued=queue_checkout_recovery(rpc,args.project,actor,{'id':offer['id'],'checkout_recovery':issue},checkout_attempts)
+                                    if queued:pending_recovery=queued;pending_start=True
                                 except RuntimeError as error:chat_event(rpc,args.project,actor,'Git preparation recovery could not be registered: '+str(error)[:400])
                         print('Wakeup held: '+started['reason'],flush=True)
                         chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: Wakeup held: '+started['reason'])
