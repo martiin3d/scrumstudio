@@ -166,7 +166,7 @@ def git_done(db, project, t, prefix, actor):
         group_done=all(m['status'] in ('Done','Cancelled') for m in members)
     task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
     dependency_checkpoint=False
-    if group and not group_done and settings.get('git_merge')=='Group' and settings.get('git_commit')=='Task':
+    if group and settings.get('git_merge')=='Group' and (settings.get('git_commit')=='Task' or group_done):
         members_done={m['id'] for m in members if m['status']=='Done'}
         source=git_sync.branch_for(settings,task)
         for dependent in db.execute("SELECT id,number,title,context_group,dependencies FROM tasks WHERE project=? AND status IN ('TODO','Blocked')",(project,)):
@@ -926,6 +926,12 @@ def legacy_run(action, a, path=None, locks=None):
                 result['deleted']=db.execute('DELETE FROM notes WHERE '+obsolete,(project,)).rowcount
                 result['backup']=str(backup)
             return result
+        if action == 'note_delete':
+            if actor_user(db,a)['kind']!='human':raise ValueError('Only an active human can delete notes')
+            if type(a.get('id')) is not int:raise ValueError('Note id must be an integer')
+            cur=db.execute('DELETE FROM notes WHERE project=? AND id=?',(project,a['id']))
+            if not cur.rowcount:raise ValueError('Note not found in this project')
+            return {'id':a['id'],'deleted':True}
         if action == 'note_add':
             kind = a['kind']
             if kind not in ['Daily', 'Retrospective', 'Review']:

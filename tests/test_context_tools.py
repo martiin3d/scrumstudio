@@ -11,6 +11,30 @@ class ContextTest(unittest.TestCase):
     def task(self,title='Bounded fix'):
         return run('task_create',dict(project=self.p,title=title,description='A concrete fix',acceptance_criteria=['Regression passes.']))['id']
 
+    def test_human_can_delete_one_note_without_changing_task_or_other_project(self):
+        human=run('user_register',dict(identity='human:notes',name='Notes human',kind='human'))['id']
+        task=self.task();run('task_update',dict(project=self.p,id=task,actor=self.actor,continuity='Keep saved progress'))
+        before=run('task_get',dict(project=self.p,id=task))
+        note=run('note_add',dict(project=self.p,task=task,audience='agent',kind='Review',title='Temporary reminder',items=['Check one detail']))['id']
+        base=dict(project=self.p,id=note)
+        with self.assertRaises(ValueError):run('note_delete',base|{'actor':self.actor})
+        with self.assertRaises(ValueError):run('note_delete',base|{'actor':human,'project':self.q})
+        self.assertEqual(run('task_get',dict(project=self.p,id=task))['pending_ai_notes'],1)
+        result=run('note_delete',base|{'actor':human})
+        self.assertTrue(result['deleted'])
+        after=run('task_get',dict(project=self.p,id=task,include_notes=True,notes_content=True))
+        self.assertEqual(after['notes']['items'],[])
+        self.assertNotIn('pending_ai_notes',after)
+        for field in ('status','continuity','evidence','dependencies','checklist'):
+            self.assertEqual(after[field],before[field])
+        with self.assertRaises(ValueError):run('note_delete',base|{'actor':human})
+
+    def test_delete_human_note_preserves_other_notes(self):
+        human=run('user_register',dict(identity='human:delete',name='Human',kind='human'))['id']
+        ids=[run('note_add',dict(project=self.p,kind='Review',title=name,items=['Human text']))['id'] for name in ['Remove','Keep']]
+        run('note_delete',dict(project=self.p,id=ids[0],actor=human))
+        self.assertEqual([n['id'] for n in run('snapshot',dict(project=self.p))['notes']],[ids[1]])
+
     def test_summary_version_and_staleness(self):
         task=self.task()
         run('task_update',dict(project=self.p,id=task,actor=self.actor,continuity='Result: diagnosed. Next: implement fix.'))

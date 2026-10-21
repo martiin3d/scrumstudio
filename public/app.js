@@ -113,9 +113,10 @@ function render(){
     document.querySelectorAll('.column').forEach(c=>{c.ondragover=e=>e.preventDefault();c.ondrop=async e=>{e.preventDefault();const id=Number(e.dataTransfer.getData('text/plain'));const t=state.tasks.find(t=>t.id===id);if(!t)return;if(c.dataset.status==='Blocked'||(['Done','Cancelled'].includes(c.dataset.status)&&t.status!==c.dataset.status)){openTask({...t,status:c.dataset.status});return;}try{await moveTask(id,c.dataset.status);await refresh();}catch(e){error(e);}};});
   }else{
     const notes=state.notes;
-    $('#content').innerHTML=notes.length?'<div class="notes">'+notes.map(n=>`<article class="note ${n.done?'done':''}"><small>${esc(new Date(n.created).toLocaleString())} · ${n.audience==='agent'?'AI reminder':'Human only'} · ${esc(n.kind)}</small><h3>${esc(n.title)}</h3>${n.task?`<p>Task: <button data-note-task="${n.task}">${esc(state.tasks.find(t=>t.id===n.task)?.code||n.task)}</button></p>`:''}<ul>${n.items.map(i=>`<li>${esc(i)}</li>`).join('')}</ul>${n.kind==='Review'?`<label><input type="checkbox" data-note="${n.id}" ${n.done?'checked':''}> ${n.done?'Done':'Not done'}</label>`:''}</article>`).join('')+'</div>':`<div class="empty"><h2>No notes yet.</h2><p>Notes are optional. Task state and continuity are the agent session reminder.</p></div>`;
+    $('#content').innerHTML=notes.length?'<div class="notes">'+notes.map(n=>`<article class="note ${n.done?'done':''}"><small>${esc(new Date(n.created).toLocaleString())} · ${n.audience==='agent'?'AI reminder':'Human only'} · ${esc(n.kind)}</small><h3>${esc(n.title)}</h3>${n.task?`<p>Task: <button data-note-task="${n.task}">${esc(state.tasks.find(t=>t.id===n.task)?.code||n.task)}</button></p>`:''}<ul>${n.items.map(i=>`<li>${esc(i)}</li>`).join('')}</ul>${n.kind==='Review'?`<label><input type="checkbox" data-note="${n.id}" ${n.done?'checked':''}> ${n.done?'Done':'Not done'}</label>`:''}<button type="button" class="danger" data-delete-note="${n.id}">Delete note</button></article>`).join('')+'</div>':`<div class="empty"><h2>No notes yet.</h2><p>Notes are optional. Task state and continuity are the agent session reminder.</p></div>`;
     document.querySelectorAll('[data-note-task]').forEach(b=>b.onclick=()=>{const task=state.tasks.find(t=>t.id===Number(b.dataset.noteTask));if(task)openTask(task);});
     document.querySelectorAll('[data-note]').forEach(c=>c.onchange=async()=>{try{await api('note_check',{project,id:+c.dataset.note,done:c.checked});await refresh();}catch(e){error(e);}});
+    document.querySelectorAll('[data-delete-note]').forEach(b=>b.onclick=async()=>{b.disabled=true;try{if(await deleteNote(Number(b.dataset.deleteNote)))await refresh();}catch(e){error(e);}finally{b.disabled=false;}});
   }
 }
 function renderTaskList(tasks,view){
@@ -324,7 +325,8 @@ function mountTaskNotes(t){
     const result=await api('task_get',{project:selected,id:t.id,include_notes:true,notes_content:true,notes_audience:'all',notes_after:after});
     if(!section.isConnected)return;
     const notes=result.notes;after=notes.next_cursor;
-    list.insertAdjacentHTML('beforeend',notes.items.map(n=>`<article class="activity-entry"><b>${n.audience==='agent'?'AI reminder':'Human only'} · ${esc(n.title)}</b><ul>${n.items.map(item=>`<li>${esc(item)}</li>`).join('')}</ul></article>`).join('')||'<p>No related notes.</p>');
+    list.insertAdjacentHTML('beforeend',notes.items.map(n=>`<article class="activity-entry"><b>${n.audience==='agent'?'AI reminder':'Human only'} · ${esc(n.title)}</b><ul>${n.items.map(item=>`<li>${esc(item)}</li>`).join('')}</ul><button type="button" class="danger" data-delete-note="${n.id}">Delete note</button></article>`).join('')||'<p>No related notes.</p>');
+    list.querySelectorAll('[data-delete-note]').forEach(b=>b.onclick=async()=>{b.disabled=true;try{if(await deleteNote(Number(b.dataset.deleteNote),selected)){b.closest('article').remove();refreshVersions={};}}catch(e){error(e);}finally{b.disabled=false;}});
     button.hidden=!notes.has_more;button.textContent='Load more related notes';
   }catch(e){list.textContent=e.message;}finally{button.disabled=false;}};
 }
@@ -374,6 +376,11 @@ function mountActivity(t){
     catch(e){$('#activity-error').textContent=e.message;}finally{button.disabled=false;}
   };
   load().catch(e=>{if(section.isConnected)$('#activity-error').textContent=e.message;});
+}
+async function deleteNote(id,selected=project){
+  if(!actor)throw Error('Choose a human user before deleting a note.');
+  if(!confirm('Delete this note permanently? Task history and continuity will be preserved.'))return false;
+  await api('note_delete',{project:selected,actor,id});return true;
 }
 function openNote(){
   if(!project)return openProject();

@@ -76,7 +76,19 @@ def validate(changed):
 
 def _git(root, *args, timeout=3):
     flags = 0x08000000 if os.name == 'nt' else 0
-    return subprocess.run(['git', '--literal-pathspecs', '-C', str(root), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=flags,env={**os.environ,'GIT_TERMINAL_PROMPT':'0','GCM_INTERACTIVE':'never'})
+    # A caller launched inside another worktree can export a foreign index or
+    # object store. Keep normal identity/credential config, but scope paths to -C.
+    locations={'GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_PREFIX','GIT_CEILING_DIRECTORIES','GIT_NAMESPACE','GIT_SHALLOW_FILE','GIT_QUARANTINE_PATH'}
+    env={k:v for k,v in os.environ.items() if k.upper() not in locations}
+    env.update(GIT_TERMINAL_PROMPT='0',GCM_INTERACTIVE='never',GIT_OPTIONAL_LOCKS='0')
+    return subprocess.run(['git', '--literal-pathspecs', '-C', str(root), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=flags,env=env)
+
+
+def is_ancestor(root,source,target):
+    result=_git(root,'merge-base','--is-ancestor',source,target)
+    if result.returncode not in (0,1):
+        raise ValueError('Cannot verify Git ancestry: '+(result.stderr or result.stdout).strip()[-300:])
+    return result.returncode==0
 
 def slug(text, limit=48):
     text = unicodedata.normalize('NFKD', text or '')
@@ -132,7 +144,7 @@ def _on_claim(root, settings, task):
     for dep in task.get('dependencies',[]):
         dependency=branch_for(settings,dep)
         if dependency==target:continue
-        if _git(root,'rev-parse','--verify','--quiet','refs/heads/'+dependency).returncode==0 and _git(root,'merge-base','--is-ancestor',dependency,destination).returncode!=0:
+        if _git(root,'rev-parse','--verify','--quiet','refs/heads/'+dependency).returncode==0 and not is_ancestor(root,dependency,destination):
             return {'branch':target,'error':'Dependency branch '+dependency+' is not integrated into '+destination+'; integrate it before claiming'}
     if branch == target:
         return {'branch': target}
@@ -214,29 +226,46 @@ def parent_branch(root,source):
     except (OSError,subprocess.SubprocessError):return ''
 
 
-def merge_completed(root,settings,source):
+def merge_completed(root,settings,source,*,capture_before=False,expected_source=None,expected_parent=None):
     """Merge immutable commits without changing the working tree or index."""
     base=parent_branch(root,source)
+    if expected_parent is not None and base!=expected_parent:return {'merged':False,'error':'Recorded origin changed concurrently; agent must re-evaluate'}
     if not base or base=='HEAD' or base==source:return {'merged':False,'error':'Recorded origin branch is missing or invalid; an agent must confirm the destination without guessing'}
+    incoming=_git(root,'rev-parse','--verify','refs/heads/'+source)
+    if incoming.returncode:return {'merged':False,'error':'Source or target branch is missing'}
+    tip=incoming.stdout.strip()
+    if expected_source is not None and tip!=expected_source:return {'merged':False,'error':'Source changed concurrently; agent must re-evaluate'}
+    for attempt in range(3):
+        if parent_branch(root,source)!=base:return {'merged':False,'error':'Recorded origin changed concurrently; agent must re-evaluate'}
+        try:report=_merge_completed_once(root,settings,source,base,tip)
+        except ValueError as error:return {'merged':False,'error':str(error)}
+        retry=report.pop('retryable',False)
+        if not retry or attempt==2:
+            if not capture_before:report.pop('_before',None)
+            return report
+
+
+def _merge_completed_once(root,settings,source,base,tip):
+    """Retry only a proven target-ref race, keeping the original source fixed."""
     target='refs/heads/'+base
     current=_git(root,'rev-parse','--verify',target)
-    incoming=_git(root,'rev-parse','--verify','refs/heads/'+source)
-    if current.returncode or incoming.returncode:return {'merged':False,'error':'Source or target branch is missing'}
-    before=current.stdout.strip();tip=incoming.stdout.strip()
+    if current.returncode:return {'merged':False,'error':'Source or target branch is missing'}
+    before=current.stdout.strip()
+    already=is_ancestor(root,tip,before)
     trees=_git(root,'worktree','list','--porcelain')
     if trees.returncode:return {'merged':False,'error':'Cannot inspect target worktrees'}
     target_checkout=None
     for record in trees.stdout.split('\n\n'):
         if 'branch '+target in record.splitlines():
             target_checkout=next((line[9:] for line in record.splitlines() if line.startswith('worktree ')),None)
-    if target_checkout:
+    if target_checkout and not already:
         canonical=settings.get('workspace_root','')
         current_state=state(target_checkout)
         if settings.get('git_mode')!='Worktrees' or not canonical or Path(target_checkout).resolve()!=Path(canonical).resolve() or not current_state or current_state[1]:
             return {'merged':False,'error':'Target branch is checked out or dirty in a protected worktree; agent review required'}
-    if _git(root,'merge-base','--is-ancestor',tip,before).returncode==0:
+    if already:
         merged=before
-    elif _git(root,'merge-base','--is-ancestor',before,tip).returncode==0:
+    elif is_ancestor(root,before,tip):
         merged=tip
     else:
         version=git_version(root)
@@ -247,12 +276,18 @@ def merge_completed(root,settings,source):
         made=_git(root,'commit-tree',tree.stdout.splitlines()[0],'-p',before,'-p',tip,'-m','Merge '+source+' into '+base,timeout=10)
         if made.returncode:return {'merged':False,'error':'Could not create merge commit: '+made.stderr[-300:]}
         merged=made.stdout.strip()
-    if target_checkout:
+    if already:
+        update=None  # No ref/index/worktree mutation, including on dirty targets.
+    elif target_checkout:
         if _git(root,'rev-parse',target).stdout.strip()!=before:return {'merged':False,'error':'Target changed concurrently; agent must re-evaluate'}
         update=_git(target_checkout,'merge','--ff-only','--no-edit',merged,timeout=10)
     else:update=_git(root,'update-ref',target,merged,before)
-    if update.returncode:return {'merged':False,'error':'Target changed concurrently; agent must re-evaluate'}
-    report={'merged':True,'target':base,'sha':merged,'source':source,'source_sha':tip}
+    if update is not None and update.returncode:
+        latest=_git(root,'rev-parse','--verify',target)
+        raced=not target_checkout and latest.returncode==0 and latest.stdout.strip()!=before and is_ancestor(root,before,latest.stdout.strip())
+        return {'merged':False,'retryable':raced,'error':'Target changed concurrently; agent must re-evaluate' if raced else 'Could not update target ref; agent review required'}
+    report={'merged':True,'target':base,'sha':merged,'source':source,'source_sha':tip,'_before':before}
+    if already:report['already_integrated']=True
     if settings.get('git_push')!='Never':
         try:
             pushed=_git(root,'push','--quiet',settings.get('git_remote','origin'),merged+':'+target,timeout=PUSH_TIMEOUT)
@@ -260,6 +295,33 @@ def merge_completed(root,settings,source):
             else:report['pushed']=True
         except (OSError,subprocess.SubprocessError) as error:report.update(error=str(error)[:300],pushed=False)
     return report
+
+def merge_dependency_checkpoint(root,settings,source):
+    """Propagate verified work only through parents with no unknown additions."""
+    chain=[];seen={source};branch=source
+    for _ in range(16):
+        parent=parent_branch(root,branch)
+        if not parent:break
+        if parent in seen:return {'merged':False,'error':'Recorded parent cycle; agent review required'}
+        seen.add(parent);chain.append((branch,parent));branch=parent
+    else:return {'merged':False,'error':'Recorded parent chain exceeds the automatic bound'}
+    report=merge_completed(root,settings,source,capture_before=True,expected_parent=chain[0][1] if chain else None)
+    before=report.pop('_before',None)
+    if report.get('error') or not report.get('merged'):return report
+    incoming=report['source_sha'];current=report['sha']
+    for branch,parent in chain[1:]:
+        target=_git(root,'rev-parse','--verify','refs/heads/'+parent)
+        if target.returncode:return dict(report,pending_target=parent,error='Recorded ancestor target is missing; agent review required')
+        if not (is_ancestor(root,before,target.stdout.strip()) or is_ancestor(root,before,incoming)):
+            return dict(report,pending_target=parent,error='Intermediate branch '+branch+' contains additional history not verified for automatic propagation')
+        following=merge_completed(root,settings,branch,capture_before=True,expected_source=current,expected_parent=parent)
+        before=following.pop('_before',None)
+        report.setdefault('ancestor_merges',[]).append(following)
+        if following.get('error') or not following.get('merged'):
+            return dict(report,pending_target=parent,error='Ancestor integration: '+following.get('error','not completed'))
+        incoming=following['source_sha'];current=following['sha']
+    return report
+
 
 def _finish(item):
     root=item['root'];settings=item['settings'];task=item['task']
@@ -271,7 +333,7 @@ def _finish(item):
         group=(task.get('context_group') or '').strip();unit_done=item['group_done'] if group else True
         if item.get('dependency_checkpoint'):
             unit_done=True
-            report['note']='Published a completed dependency checkpoint; unfinished context-group tasks remain pending'
+            report['note']='Published a completed dependency checkpoint; remaining tasks retain their own status'
         if settings.get('git_commit','Task')=='Task' or not group:
             report['commit']=_commit(root,settings,task,f"{task['code']}: {task['title']}")
         elif unit_done:
@@ -297,7 +359,7 @@ def _finish(item):
             if (not commit.get('committed') and commit.get('reason')!='nothing to commit') or (settings.get('git_push')!='Never' and not report.get('push',{}).get('pushed')):
                 report['merge']={'merged':False,'error':'Commit or source publication failed; agent review required'}
             elif commit.get('committed') or commit.get('reason')=='nothing to commit':
-                try:report['merge']=merge_completed(root,settings,report['branch'])
+                try:report['merge']=(merge_dependency_checkpoint if item.get('dependency_checkpoint') else merge_completed)(root,settings,report['branch'])
                 except (OSError,ValueError,subprocess.SubprocessError) as error:report['merge']={'merged':False,'error':str(error)[:300]}
     if settings.get('git_cleanup') and report.get('merge',{}).get('merged') and not report['merge'].get('error'):
         import git_worktrees
@@ -326,6 +388,8 @@ def describe(report):
         parts.append('push: ' + push['reason'])
     if report.get('merge'):
         merge=report['merge'];parts.append('merged into '+merge['target'] if merge.get('merged') and not merge.get('error') else 'MERGE FAILED: '+merge.get('error','unknown'))
+        if merge.get('ancestor_merges'):
+            parts.append('ancestor integration: '+', '.join(m.get('target','unknown') for m in merge['ancestor_merges'] if m.get('merged') and not m.get('error')))
     if report.get('cleanup'):parts.append('cleanup: '+report['cleanup'].get('reason','pending worker exit'))
     if report.get('note'):
         parts.append(report['note'])
@@ -343,10 +407,10 @@ def flush(call,jobs,result,external_project=None):
         item['report'].clear();item['report'].update(outcome)
         if result.get('id')==item['task']['id']:result['git']=outcome
         project=external_project if external_project is not None else item['project']
-        destination=parent_branch(item['root'],outcome['branch']) if item['settings'].get('git_merge')=='Group' else ''
+        destination=(outcome.get('merge',{}).get('pending_target') or parent_branch(item['root'],outcome['branch'])) if item['settings'].get('git_merge')=='Group' else ''
         if outcome.get('merge',{}).get('error'):
             try:
-                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description='Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+'. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+outcome['merge']['error'],acceptance_criteria=['Target contains the source outcome, conflicts are resolved and verification is recorded.','Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
+                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description='Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+outcome['merge']['error'],acceptance_criteria=['Target contains the source outcome, conflicts are resolved and verification is recorded.','Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
                 outcome['recovery_task']=recovery
                 import idle_signals
                 idle_signals.notify('git_recovery',{'project':project})

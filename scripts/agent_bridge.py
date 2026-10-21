@@ -35,9 +35,14 @@ def continue_after_task(task, batch_run, released):
     return bool(released.get('batch_complete')) if batch_run else task.get('status')=='Done'
 
 
+def unfinished_owned(task,actor):
+    return task.get('owner_id')==actor and (task.get('status')=='In Progress' or
+        (task.get('status')=='TODO' and bool(task.get('continuity')) and not task.get('blocked_reason')))
+
+
 def recover_incomplete(task,actor,attempts,report,exit_code):
     """One bounded closure recovery; never infer completion from exit code 0."""
-    return (exit_code==0 and task.get('status')=='In Progress' and task.get('owner_id')==actor
+    return (exit_code==0 and unfinished_owned(task,actor)
             and attempts.get(task.get('id'),0)<1 and not report.get('should_stop')
             and not report.get('control',{}).get('paused') and report.get('profile_enabled',True))
 
@@ -385,7 +390,7 @@ def main():
                 if not error and offered_task is not None:
                     finished=rpc.call('task_get',{'project':args.project,'id':released.get('batch_current',offered_task)})
                 retry=recover_incomplete(finished,actor,incomplete_attempts,report,child.returncode)
-                unfinished=finished.get('status')=='In Progress' and finished.get('owner_id')==actor
+                unfinished=unfinished_owned(finished,actor)
                 summary=f'CLI exit {child.returncode}. '+(error or 'Consult task history before resuming.')
                 if unfinished:
                     summary=('Worker exited before closing this task. '+('One automatic closure recovery is queued. ' if retry else 'Automatic recovery limit/policy reached; do not loop. ')+
@@ -452,7 +457,7 @@ def main():
                         chat_event(rpc,args.project,actor,'Wakeup skipped: '+reason)
                         time.sleep(2)
                         continue
-                    prompt=f'Use scrum-work and scrum-resume for project {args.project} in {folder}. Your persistent agent actor is {actor}; reuse it. This human Wakeup authorizes the existing backlog. Claim an eligible task/files (claimed=true) ONLY for '+str(offer.get('code'))+' (id '+str(offer.get('id'))+'). Verify, work_finish(close_session=true), exit; the supervisor will continue with the next eligible task. Respect Stop/quota/WIP/dependencies/reservations; save only unfinished task facts, retain valid checks, never poll models.'
+                    prompt=f'Use scrum-work and scrum-resume for project {args.project} in {folder}. Your persistent agent actor is {actor}; reuse it. This human Wakeup authorizes the existing backlog. Claim an eligible task/files (claimed=true) ONLY for '+str(offer.get('code'))+' (id '+str(offer.get('id'))+'). Complete all acceptance, verify, work_finish(close_session=true), exit; the supervisor will continue with the next eligible task. Partial implementation alone is no reason to hand off. Respect Stop/quota/WIP/dependencies/reservations; save unfinished facts only for a real interruption, retain valid checks, never poll models.'
                     if policy.get('agent_followup_tasks'):
                         prompt+=' The human enabled scoped autonomous follow-up tasks. For a concrete blocker within the authorized outcome, search existing work and use task_plan to create/refine minimal recovery/prerequisite tasks with acceptance criteria and real dependencies. If recovery must reuse partial edits on this branch, keep the same context_group. Do this only when needed, not at every task. Save/release current work before switching; the supervisor selects and claims eligible work. Never invent speculative backlog.'
                     prompt+=' Failed verification is work to diagnose, not by itself an external blocker. Fix scoped code, missing references and render/capture setup in this task; use a changed hypothesis and targeted check, never an unchanged retry loop. Blocked requires a concrete unmet prerequisite or external constraint, with attempted repair and the action needed to resume; a retry count alone is not a blocker. If a session must end while repair remains possible, save continuity and release as TODO instead. Required verification still pending means not Done. Reserve supporting files and Unity .meta sidecars belonging to your outputs; acquired reservations also extend the Git file plan.'

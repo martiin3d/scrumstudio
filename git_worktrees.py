@@ -86,7 +86,7 @@ def prepare(root,settings,task):
     destination='refs/heads/'+target if exists else parent
     for dep in task.get('dependencies',[]):
         dependency=git.branch_for(settings,dep)
-        if dependency!=target and git._git(root,'show-ref','--verify','--quiet','refs/heads/'+dependency).returncode==0 and git._git(root,'merge-base','--is-ancestor',dependency,destination).returncode:
+        if dependency!=target and git._git(root,'show-ref','--verify','--quiet','refs/heads/'+dependency).returncode==0 and not git.is_ancestor(root,dependency,destination):
             raise ValueError('Dependency branch '+dependency+' is not integrated into the workspace destination')
     # A project can switch from Branches to Worktrees while unfinished work
     # still owns its original checkout. Git cannot check that branch out twice.

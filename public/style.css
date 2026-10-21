@@ -33,3 +33,5 @@ html[data-theme=dark] :is(.task-editor-meta,.task-editor-meta fieldset){border-c
 .card .resume-hint{color:#e8da9a;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 .interaction-card{border:1px solid #648b75;border-radius:10px;padding:18px;margin:0 0 16px}.interaction-question{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto}.interaction-options{display:flex;flex-wrap:wrap;gap:10px}.interaction-answer{margin-top:12px}.interaction-result{color:#b24e46}
+
+[data-delete-note]{display:block;margin-top:12px}

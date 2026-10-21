@@ -250,6 +250,24 @@ class GitAutomationTest(unittest.TestCase):
         self.assertTrue(run('task_claim',dict(project=project,id=dependent,actor=self.agent))['claimed'])
 
     @NEEDS_MERGE_TREE
+    def test_last_group_task_propagates_dependency_through_its_parent_chain(self):
+        project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group',git_commit='Task')
+        first=run('task_create',dict(project=project,title='Final source outcome',files=['a.py'],context_group='Source',**SPEC))['id']
+        dependent=run('task_create',dict(project=project,title='Consumer',files=['b.py'],context_group='Other',dependencies=[first],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        git('branch','middle','main');git('branch','foundation','main')
+        git('config','branch.scrum/source.scrum-parent','middle')
+        git('config','branch.middle.scrum-parent','foundation')
+        git('config','branch.foundation.scrum-parent','main')
+        (folder/'a.py').write_text('verified dependency')
+        result=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Checked'))
+        report=result['completed']['git']
+        self.assertNotIn('recovery_task',report)
+        self.assertEqual([r['target'] for r in report['merge']['ancestor_merges']],['foundation','main'])
+        self.assertEqual(git('show','main:a.py'),'verified dependency')
+        self.assertTrue(run('task_claim',dict(project=project,id=dependent,actor=self.agent))['claimed'])
+
+    @NEEDS_MERGE_TREE
     def test_checkpoint_publishes_verified_piece_even_before_other_prerequisites_finish(self):
         project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group',git_commit='Task')
         first=run('task_create',dict(project=project,title='Verified piece',files=['a.py'],context_group='Source',**SPEC))['id']

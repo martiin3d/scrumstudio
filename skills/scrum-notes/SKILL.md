@@ -10,7 +10,7 @@ Use the scrum-studio MCP and the intended project ID. Resolve the project with `
 - Retrospective: record observed process issues and concrete improvements, each as a bullet item. Use task=id for a task-specific lesson; omit task only for genuinely project-wide guidance. No new lesson means no retrospective. Use [scrum-close](../scrum-close/SKILL.md) for closing a work session.
 - Review: record human decisions, checks and follow-ups with relevant task IDs and concise evidence. New Review notes start not done.
 - Use `note_check(project, id, done=true|false)` to mark a Review note done or not done. For a known task, resolve IDs with `task_get(project,id,include_notes=true)` (paginated notes_after/notes_limit); request notes_content=true only for needed content. Use snapshot only for an explicitly required project-wide audit. The checkbox applies to the whole note, not individual bullet items; use separate Review notes when actions need independent tracking.
-- The MCP appends notes; it cannot edit existing note text or check Daily/Retrospective notes. Human-requested note_cleanup is a separate narrow maintenance exception. Add a clearly titled correction if needed rather than claiming to modify history.
+- The MCP appends notes; it cannot edit existing note text or check Daily/Retrospective notes. Explicit human requests can delete one note with note_delete(project,id,actor=<active human>); never delete notes autonomously. Human-requested note_cleanup is a separate narrow maintenance exception. Add a clearly titled correction if needed rather than claiming to modify history.
 
 Reuse session context, avoid duplicate notes, and do not load full history unless the request requires it. Report the saved note ID or checkbox result briefly.
 

@@ -24,3 +24,5 @@ venv/
 # Operating-system metadata
 .DS_Store
 Thumbs.db
+
+docs/investigations/

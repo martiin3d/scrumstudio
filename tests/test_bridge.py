@@ -355,8 +355,20 @@ class ManagedBridgeTest(unittest.TestCase):
         self.assertFalse(agent_bridge.recover_incomplete(task,8,{},{},0))
         self.assertFalse(agent_bridge.recover_incomplete(task,9,{},{},1))
         self.assertFalse(agent_bridge.recover_incomplete(dict(task,status='Blocked'),9,{},{},0))
+        handed_off=dict(task,status='TODO',continuity='Done: partial; Next: remaining acceptance')
+        self.assertTrue(agent_bridge.recover_incomplete(handed_off,9,{},{},0))
+        self.assertFalse(agent_bridge.recover_incomplete(handed_off,9,{7:1},{},0))
+        self.assertFalse(agent_bridge.recover_incomplete(handed_off,8,{},{},0))
+        self.assertFalse(agent_bridge.recover_incomplete(dict(handed_off,continuity=''),9,{},{},0))
+        self.assertFalse(agent_bridge.recover_incomplete(dict(handed_off,blocked_reason='External decision'),9,{},{},0))
 
     def test_incomplete_exit_recovers_same_task_once_and_preserves_result(self):
+        self.assert_incomplete_exit_recovers('In Progress')
+
+    def test_partial_todo_exit_recovers_same_task_once_without_another_wakeup(self):
+        self.assert_incomplete_exit_recovers('TODO')
+
+    def assert_incomplete_exit_recovers(self,status):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
             folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
             rpc=Mock();offers=[]
@@ -367,7 +379,7 @@ class ManagedBridgeTest(unittest.TestCase):
                 if name=='project_settings':return {'usage_check_seconds':60}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','profile_enabled':True,'control':{'generation':0,'paused':False}}
                 if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
-                if name=='task_get':return {'id':1,'status':'In Progress','owner_id':9}
+                if name=='task_get':return {'id':1,'status':status,'owner_id':9,'continuity':'Done: partial; Next: remaining acceptance'}
                 if name=='worker_launch' and args.get('action')=='reserve':
                     offers.append(args);return {'eligible':True,'id':1,'code':'FIX-1'}
                 return {}
