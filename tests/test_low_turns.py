@@ -249,16 +249,18 @@ class GitAutomationTest(unittest.TestCase):
         self.assertEqual(run('task_get',dict(project=project,id=pending))['status'],'TODO')
         self.assertTrue(run('task_claim',dict(project=project,id=dependent,actor=self.agent))['claimed'])
 
-    def test_checkpoint_does_not_publish_when_cross_group_work_still_has_prerequisites(self):
+    @NEEDS_MERGE_TREE
+    def test_checkpoint_publishes_verified_piece_even_before_other_prerequisites_finish(self):
         project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group',git_commit='Task')
         first=run('task_create',dict(project=project,title='Verified piece',files=['a.py'],context_group='Source',**SPEC))['id']
         pending=run('task_create',dict(project=project,title='Other prerequisite',files=['b.py'],context_group='Source',**SPEC))['id']
         run('task_create',dict(project=project,title='Not ready yet',context_group='Other',dependencies=[first,pending],**SPEC))
-        before=git('rev-parse','main')
         claim=run('task_claim',dict(project=project,id=first,actor=self.agent));(folder/'a.py').write_text('verified')
         result=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Verified'))
-        self.assertNotIn('merge',result['completed']['git'])
-        self.assertEqual(git('rev-parse','main'),before)
+        self.assertTrue(result['completed']['git']['merge']['merged'])
+        self.assertEqual(git('show','main:a.py'),'verified')
+        self.assertEqual(git('show','main:b.py'),'b')
+        self.assertEqual(run('task_get',dict(project=project,id=pending))['status'],'TODO')
 
     @NEEDS_MERGE_TREE
     def test_merge_uses_recorded_parent_after_base_setting_changes(self):

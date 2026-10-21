@@ -167,13 +167,12 @@ def git_done(db, project, t, prefix, actor):
     task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
     dependency_checkpoint=False
     if group and not group_done and settings.get('git_merge')=='Group' and settings.get('git_commit')=='Task':
-        done={r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status='Done'",(project,))}
         members_done={m['id'] for m in members if m['status']=='Done'}
         source=git_sync.branch_for(settings,task)
-        for dependent in db.execute("SELECT id,number,title,context_group,dependencies,blocked_reason FROM tasks WHERE project=? AND status IN ('TODO','Blocked')",(project,)):
+        for dependent in db.execute("SELECT id,number,title,context_group,dependencies FROM tasks WHERE project=? AND status IN ('TODO','Blocked')",(project,)):
             deps=json.loads(dependent['dependencies'])
             other={'code':f"{prefix}-{dependent['number']}",'title':dependent['title'],'context_group':dependent['context_group']}
-            if members_done.intersection(deps) and all(dep in done for dep in deps) and not dependent['blocked_reason'].strip() and git_sync.branch_for(settings,other)!=source:
+            if members_done.intersection(deps) and git_sync.branch_for(settings,other)!=source:
                 dependency_checkpoint=True;break
     root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(t))
     task['git_branch']=git_worktrees.branch(project_row['workspace_root'],git_worktrees.identity(t))
