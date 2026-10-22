@@ -67,7 +67,7 @@ def migrate(db, separate=False):
 
 
 def settings(row):
-    return {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+    return {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup','git_pause_blocked'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
 
 
 def active_count(db, project, actor, exclude=-1):
@@ -196,6 +196,10 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         db.execute('BEGIN IMMEDIATE')
         current=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
         validate_policy(changed)
+        if any(key in changed and changed[key]!=current[key] for key in ('git_mode','workspace_root')):
+            import git_paused
+            if git_paused.any_pending(current['workspace_root']):
+                raise ValueError('Restore or reconcile preserved blocked work before changing Git mode or workspace_root')
         if changed.get('git_merge')=='Group':
             import git_sync
             version=git_sync.git_version(current['workspace_root'] or '.')

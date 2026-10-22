@@ -66,7 +66,7 @@ TOOLS = [
 ]
 
 for _name,_description,_schema in TOOLS:
-    if _name=='project_settings':_schema['properties'].update(git_merge={'type':'string','enum':['Off','Group']},git_cleanup=B)
+    if _name=='project_settings':_schema['properties'].update(git_merge={'type':'string','enum':['Off','Group']},git_cleanup=B,git_pause_blocked=B)
     if _name=='worker_launch':_schema['properties']['id']=I
     if _name in ('task_create','task_update'):_schema['properties'].update(VERIFICATION,context_group={'type':'string','maxLength':80})
     if _name in ('task_create','task_update'):_schema['properties'].update(model=S,model_tier={'type':'string','enum':['auto','economy','standard','advanced'],'description':'Auto defaults to standard independently of size; economy for mechanical low-risk work, advanced for difficult reasoning. Choose with a reason during existing planning.'},model_reason=S)

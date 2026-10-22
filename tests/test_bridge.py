@@ -169,6 +169,7 @@ class BridgeTest(unittest.TestCase):
             codex=agent_bridge.command('codex',Path.cwd(),'Task')
             claude=agent_bridge.command('claude',Path.cwd(),'Task')
         self.assertEqual(codex[-1],'-')
+        self.assertIn('--ephemeral',codex)
         self.assertNotIn('Task',codex);self.assertNotIn('Task',claude)
         self.assertIn('permissions.scrum-worker.extends=":workspace"',codex)
         read_arg=next(arg for arg in codex if arg.startswith('permissions.scrum-worker.filesystem='))

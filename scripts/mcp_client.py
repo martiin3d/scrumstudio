@@ -8,6 +8,15 @@ import threading
 
 ROOT=Path(__file__).resolve().parents[1]
 
+
+def server_stamp():
+    paths=list(ROOT.glob('*.py'))+list((ROOT/'scripts').glob('*.py'))
+    result=[]
+    for path in sorted(paths):
+        try:info=path.stat();result.append((str(path),info.st_mtime_ns,info.st_size))
+        except OSError:result.append((str(path),None,None))
+    return tuple(result)
+
 def tool_timeout(name,args,default=20):
     # Completion may publish source and target (60 seconds each) after Done.
     # Leave room for commit/merge and bookkeeping without slowing ordinary calls.
@@ -30,18 +39,18 @@ class JsonClient:
         self.process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',errors='replace')
         self.messages=queue.Queue()
         self.sequence=0
-        threading.Thread(target=self._read,daemon=True).start()
+        threading.Thread(target=self._read,args=(self.process,self.messages),daemon=True).start()
 
-    def _read(self):
+    def _read(self,process,messages):
         try:
-            for line in self.process.stdout:
+            for line in process.stdout:
                 try:
                     value=json.loads(line)
-                    if isinstance(value,dict):self.messages.put(value)
+                    if isinstance(value,dict):messages.put(value)
                 except ValueError:
                     continue
         finally:
-            self.messages.put(None)
+            messages.put(None)
 
     def send(self,message):
         self.process.stdin.write(json.dumps(message)+'\n');self.process.stdin.flush()
@@ -88,6 +97,7 @@ class JsonClient:
 
 class ScrumClient(JsonClient):
     def __init__(self,timeout=20):
+        self._initialize_timeout=timeout;self._source_stamp=server_stamp()
         super().__init__([sys.executable,str(ROOT/'mcp_server.py')])
         try:
             self.rpc('initialize',{'protocolVersion':'2024-11-05','capabilities':{},'clientInfo':{'name':'scrum-control-bridge','version':'1'}},timeout=timeout)
@@ -96,8 +106,15 @@ class ScrumClient(JsonClient):
             self.close();raise
 
     def call(self,name,args,timeout=None):
+        if not getattr(self,'_request_uncertain',False) and getattr(self,'_source_stamp',None) is not None and self._source_stamp!=server_stamp():
+            # Between completed RPCs only. Never replay a write or stop a worker.
+            self.close();self.__init__(timeout=self._initialize_timeout)
         if timeout is None:timeout=tool_timeout(name,args)
-        result=self.rpc('tools/call',{'name':name,'arguments':args},timeout=timeout)
+        try:result=self.rpc('tools/call',{'name':name,'arguments':args},timeout=timeout)
+        except RuntimeError:
+            self._request_uncertain=True
+            raise
+        self._request_uncertain=False
         if not isinstance(result,dict):raise RuntimeError('Malformed MCP tool response')
         if result.get('isError'):
             raise ToolError(result)

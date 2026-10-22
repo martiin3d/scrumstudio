@@ -224,6 +224,54 @@ class GitAutomationTest(unittest.TestCase):
     def enable(self,project,**more):
         return run('project_settings',dict(project=project,actor=self.human,git_mode='Branches',git_base_branch='main',max_parallel_agents=5,**more))
 
+    def test_blocked_work_yields_checkout_natively_and_restores_on_claim(self):
+        project,folder=self.project();git=self.repo(folder)
+        self.enable(project,git_pause_blocked=True,git_push='Never',usage_guard=False)
+        task=run('task_create',dict(project=project,title='Partial',files=['a.py'],**SPEC))['id']
+        other=run('task_create',dict(project=project,title='Other',files=['b.py'],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        (folder/'a.py').write_text('preserved partial')
+        run('task_update',dict(project=project,id=task,actor=self.agent,token=claim['token'],status='Blocked',blocked_reason='Needs an external input',continuity='Continue existing partial edits.'))
+        # Navigation must not mutate the checkout.
+        run('next_work',dict(project=project,actor=self.agent))
+        self.assertEqual((folder/'a.py').read_text(),'preserved partial')
+        offered=run('worker_launch',dict(project=project,actor=self.agent,client='codex'))
+        self.assertTrue(offered['eligible']);self.assertEqual(offered['id'],other)
+        with self.assertRaisesRegex(ValueError,'preserved blocked work'):
+            run('project_settings',dict(project=project,actor=self.human,git_mode='Off'))
+        self.assertEqual((folder/'a.py').read_text(),'a\n')
+        claim=run('task_claim',dict(project=project,id=other,actor=self.agent))
+        run('work_finish',dict(project=project,id=other,actor=self.agent,token=claim['token'],evidence='Checked'))
+        run('task_update',dict(project=project,id=task,actor=self.human,status='TODO',blocked_reason=''))
+        resumed=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        self.assertIn('restored_checkpoint',resumed['git'])
+        self.assertEqual((folder/'a.py').read_text(),'preserved partial')
+
+    def test_blocked_checkpoint_setting_is_human_only_and_strict(self):
+        project,_=self.project()
+        self.assertFalse(run('project_settings',dict(project=project))['git_pause_blocked'])
+        with self.assertRaises(ValueError):run('project_settings',dict(project=project,actor=self.agent,git_pause_blocked=True))
+        with self.assertRaises(ValueError):run('project_settings',dict(project=project,actor=self.human,git_pause_blocked='yes'))
+
+    def test_worker_never_checkpoints_unknown_staged_or_disabled_work(self):
+        import git_paused
+        for case in ('disabled','staged','unrelated','stop'):
+            with self.subTest(case=case):
+                project,folder=self.project();git=self.repo(folder)
+                self.enable(project,git_pause_blocked=case!='disabled',usage_guard=False)
+                task=run('task_create',dict(project=project,title='Partial',files=['a.py'],**SPEC))['id']
+                run('task_create',dict(project=project,title='Other',files=['b.py'],**SPEC))
+                claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+                branch=git('branch','--show-current');(folder/'a.py').write_text('keep me')
+                run('task_update',dict(project=project,id=task,actor=self.agent,token=claim['token'],status='Blocked',blocked_reason='External input'))
+                if case=='staged':git('add','a.py')
+                if case=='unrelated':(folder/'human.txt').write_text('keep too')
+                if case=='stop':run('project_control',dict(project=project,actor=self.human,action='stop'))
+                offered=run('worker_launch',dict(project=project,actor=self.agent,client='codex'))
+                self.assertFalse(offered.get('eligible',False))
+                self.assertEqual((folder/'a.py').read_text(),'keep me')
+                self.assertFalse(git_paused.pending(folder,branch))
+
     def test_settings_validation_and_defaults(self):
         project,folder=self.project()
         s=run('project_settings',dict(project=project))
@@ -450,6 +498,25 @@ class GitAutomationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'not integrated'):
             run('task_claim',dict(project=project,id=second,actor=self.agent))
         self.assertEqual(run('task_get',dict(project=project,id=second))['status'],'TODO')
+
+    @NEEDS_MERGE_TREE
+    def test_stale_consumer_refreshes_from_parent_for_all_dependencies_without_recovery(self):
+        for mode in ('Branches','Worktrees'):
+            with self.subTest(mode=mode):
+                project,folder=self.project();git=self.repo(folder);self.enable(project,git_merge='Group',git_push='Never')
+                run('project_settings',dict(project=project,actor=self.human,git_mode=mode))
+                git('branch','scrum/consumer','main');git('config','branch.scrum/consumer.scrum-parent','main')
+                deps=[run('task_create',dict(project=project,title='Dependency '+str(n),context_group='Dependency '+str(n),files=[name],**SPEC))['id'] for n,name in enumerate(['b.py','c.py'])]
+                consumer=run('task_create',dict(project=project,title='Resume consumer',context_group='Consumer',dependencies=deps,files=['a.py'],**SPEC))['id']
+                for task,name in zip(deps,['b.py','c.py']):
+                    claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+                    work=Path(claim['git'].get('worktree') or folder);(work/name).write_text('verified '+name)
+                    run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Checked'))
+                claimed=run('task_claim',dict(project=project,id=consumer,actor=self.agent))
+                self.assertTrue(claimed['claimed']);self.assertEqual(claimed['git']['refreshed_from'],'main')
+                work=Path(claimed['git'].get('worktree') or folder)
+                for name in ['b.py','c.py']:self.assertEqual((work/name).read_text(),'verified '+name)
+                self.assertFalse(any(t['category']=='Git recovery' for t in run('snapshot',dict(project=project))['tasks']))
 
     def test_failed_request_discards_git_jobs(self):
         import git_sync

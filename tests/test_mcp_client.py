@@ -17,6 +17,41 @@ spec.loader.exec_module(cli)
 
 
 class McpClientTest(unittest.TestCase):
+    def test_updated_server_reloads_before_call_without_replaying_writes(self):
+        client=cli.ScrumClient.__new__(cli.ScrumClient)
+        client._source_stamp=('old',);client._initialize_timeout=7
+        def initialize(timeout):client._source_stamp=('new',)
+        with patch.object(cli,'server_stamp',return_value=('new',)),patch.object(client,'close') as close,patch.object(cli.ScrumClient,'__init__',side_effect=initialize) as init,patch.object(client,'rpc',return_value={'content':[{'text':'{}'}]}) as rpc:
+            client.call('task_update',{'status':'Done'})
+            client.call('projects',{})
+            close.assert_called_once();init.assert_called_once_with(timeout=7)
+            self.assertEqual(rpc.call_count,2)
+        with patch.object(cli,'server_stamp',return_value=('new',)),patch.object(client,'rpc',side_effect=RuntimeError('uncertain write')) as rpc:
+            with self.assertRaisesRegex(RuntimeError,'uncertain write'):client.call('task_update',{'status':'Done'})
+            rpc.assert_called_once()
+
+    def test_reconnect_does_not_receive_eof_from_old_reader(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'data') as folder:
+            env=dict(SCRUM_REGISTRY=str(Path(folder)/'registry.db'))
+            with patch.dict(os.environ,env),patch.object(cli,'server_stamp',return_value=('first',)) as stamp:
+                client=cli.ScrumClient(timeout=10)
+                try:
+                    self.assertEqual(client.call('projects',{}),[])
+                    previous=client.process;stamp.return_value=('second',)
+                    self.assertEqual(client.call('projects',{}),[])
+                    self.assertIsNot(client.process,previous)
+                    self.assertIsNotNone(previous.poll())
+                finally:client.close()
+
+    def test_uncertain_write_is_not_interrupted_by_automatic_reload(self):
+        client=cli.ScrumClient.__new__(cli.ScrumClient)
+        client._source_stamp=('old',);client._initialize_timeout=7
+        client._request_uncertain=True
+        with patch.object(cli,'server_stamp',return_value=('new',)),patch.object(client,'close') as close,patch.object(client,'rpc',return_value={'content':[{'text':'{}'}]}) as rpc:
+            client.call('task_get',{'id':1})
+            close.assert_not_called();rpc.assert_called_once()
+            self.assertFalse(client._request_uncertain)
+
     def test_default_completion_budget_covers_two_pushes_without_widening_reads(self):
         client=cli.ScrumClient.__new__(cli.ScrumClient)
         cases=[('work_finish',{},180),('task_update',{'status':'Done'},180),

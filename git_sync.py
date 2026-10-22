@@ -16,7 +16,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-GIT_DEFAULTS = {'git_cleanup':False, 'git_merge':'Off', 'git_mode': 'Off', 'git_commit': 'Task', 'git_push': 'Group', 'git_base_branch': '', 'git_branch_prefix': 'scrum/', 'git_remote': 'origin'}
+GIT_DEFAULTS = {'git_pause_blocked':False, 'git_cleanup':False, 'git_merge':'Off', 'git_mode': 'Off', 'git_commit': 'Task', 'git_push': 'Group', 'git_base_branch': '', 'git_branch_prefix': 'scrum/', 'git_remote': 'origin'}
 _jobs = threading.local()
 PUSH_TIMEOUT = 60   # network; a first push of a large branch is slow, and GIT_TERMINAL_PROMPT=0 keeps it from hanging
 MERGE_TREE_MIN = (2, 38)  # `git merge-tree --write-tree`
@@ -57,6 +57,7 @@ def checkout_lock(root):
 
 
 def validate(changed):
+    if 'git_pause_blocked' in changed and (type(changed['git_pause_blocked']) not in (bool,int) or changed['git_pause_blocked'] not in (0,1)):raise ValueError('git_pause_blocked must be boolean')
     if 'git_cleanup' in changed and (type(changed['git_cleanup']) not in (bool,int) or changed['git_cleanup'] not in (0,1)):raise ValueError('git_cleanup must be boolean')
     if 'git_merge' in changed and changed['git_merge'] not in ('Off','Group'):raise ValueError('git_merge must be Off or Group')
     if 'git_mode' in changed and changed['git_mode'] not in ('Off', 'Branches','Worktrees'):
@@ -131,6 +132,54 @@ def on_claim(root, settings, task):
     except (OSError,ValueError,subprocess.SubprocessError) as error:
         return {'branch':branch_for(settings,task),'error':str(error)[:300]}
 
+def refresh_parent(root,settings,task,target,missing,workspace=None):
+    """Refresh an idle branch only to the exact tree already accepted by its parent."""
+    if not task.get('allow_parent_refresh') or settings.get('git_merge')!='Group':return None
+    parent=parent_branch(root,target)
+    if not parent or parent==target:return None
+    before=_git(root,'rev-parse','--verify','refs/heads/'+target)
+    incoming=_git(root,'rev-parse','--verify','refs/heads/'+parent)
+    if before.returncode or incoming.returncode:return None
+    old=before.stdout.strip();tip=incoming.stdout.strip()
+    if not all(is_ancestor(root,dep,tip) for dep in missing):return None
+    trees=_git(root,'worktree','list','--porcelain')
+    if trees.returncode:raise ValueError('Cannot inspect stale branch worktrees')
+    checked=None
+    for record in trees.stdout.split('\n\n'):
+        if 'branch refs/heads/'+target in record.splitlines():
+            checked=next((line[9:] for line in record.splitlines() if line.startswith('worktree ')),None)
+    if checked:
+        allowed={Path(root).resolve()}
+        if workspace:allowed.add(Path(workspace).resolve())
+        current=state(checked)
+        if Path(checked).resolve() not in allowed or not current or current!=(target,[]):return None
+    if not is_ancestor(root,old,tip):
+        if (git_version(root) or (0,0))<MERGE_TREE_MIN:return None
+        tree=_git(root,'merge-tree','--write-tree',old,tip,timeout=10)
+        accepted=_git(root,'rev-parse',tip+'^{tree}')
+        if tree.returncode or accepted.returncode or tree.stdout.splitlines()[0]!=accepted.stdout.strip():return None
+        merged=_git(root,'commit-tree',accepted.stdout.strip(),'-p',old,'-p',tip,'-m','Synchronize '+target+' from recorded parent '+parent,timeout=10)
+        if merged.returncode:raise ValueError('Could not record verified parent synchronization')
+        tip=merged.stdout.strip()
+    if checked:
+        if _git(root,'rev-parse','refs/heads/'+target).stdout.strip()!=old:raise ValueError('Stale branch changed concurrently')
+        updated=_git(checked,'merge','--ff-only','--no-edit',tip,timeout=20)
+    else:updated=_git(root,'update-ref','refs/heads/'+target,tip,old)
+    if updated.returncode:raise ValueError('Could not fast-forward stale branch; preserve current work for review')
+    return parent
+
+
+def refresh_index_state(root):
+    """Refresh stat metadata once; never stage content or alter an existing index delta."""
+    current=state(root)
+    if current and current[1] and _git(root,'diff','--cached','--quiet').returncode==0:
+        with checkout_lock(root):
+            if _git(root,'diff','--cached','--quiet').returncode==0:
+                result=_git(root,'update-index','--refresh',timeout=5)
+                if result.returncode in (0,1):return state(root)
+    return current
+
+
 def _on_claim(root, settings, task):
     """Move the checkout to the task's branch. Returns {'branch','switched'|'created'} or {'busy':...}/{'error':...}."""
     if not enabled(settings) or not root:
@@ -141,13 +190,20 @@ def _on_claim(root, settings, task):
         return {'branch': target, 'error': 'git unavailable or not a repository'}
     branch, dirty = current
     destination=target if _git(root,'rev-parse','--verify','--quiet','refs/heads/'+target).returncode==0 else settings.get('git_base_branch') or 'HEAD'
+    missing=[]
     for dep in task.get('dependencies',[]):
         dependency=branch_for(settings,dep)
         if dependency==target:continue
         if _git(root,'rev-parse','--verify','--quiet','refs/heads/'+dependency).returncode==0 and not is_ancestor(root,dependency,destination):
-            return {'branch':target,'error':'Dependency branch '+dependency+' is not integrated into '+destination+'; integrate it before claiming'}
+            missing.append(dependency)
+    refreshed=refresh_parent(root,settings,task,target,missing) if missing else None
+    if missing and not refreshed:
+        return {'branch':target,'error':'Dependency branch '+missing[0]+' is not integrated into '+destination+'; integrate it before claiming'}
+    extra={'refreshed_from':refreshed} if refreshed else {}
     if branch == target:
-        return {'branch': target}
+        import git_paused
+        restored=git_paused.restore(root,target,task.get('code'),task.get('allow_checkpoint_restore',True))
+        return {'branch': target,**extra,**({'restored_checkpoint':restored} if restored else {})}
     if dirty:
         return {'busy': {'current_branch': branch, 'wanted': target, 'dirty': dirty[:20], 'dirty_total': len(dirty)}}
     try:
@@ -170,7 +226,9 @@ def _on_claim(root, settings, task):
             outcome = 'created'
         if result.returncode:
             return {'branch': target, 'error': (result.stderr or result.stdout).strip()[:300] or 'checkout failed'}
-        return {'branch': target, outcome: True, 'previous': branch}
+        import git_paused
+        restored=git_paused.restore(root,target,task.get('code'),task.get('allow_checkpoint_restore',True))
+        return {'branch': target, outcome: True, 'previous': branch,**extra,**({'restored_checkpoint':restored} if restored else {})}
     except (OSError, subprocess.SubprocessError) as error:
         return {'branch': target, 'error': str(error)[:300]}
 

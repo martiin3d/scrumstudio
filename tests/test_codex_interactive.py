@@ -13,6 +13,31 @@ import agent_bridge
 
 
 class InteractiveTest(unittest.TestCase):
+    def test_background_sessions_are_temporary_in_all_permission_modes_and_outcomes(self):
+        # No provider/model call: exercise the actual adapter with a native
+        # protocol fixture, including failed turns and both review modes.
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]/'data') as folder:
+            server=Path(folder)/'temporary_worker.py'
+            server.write_text('''import json,sys
+for line in sys.stdin:
+ request=json.loads(line);method=request.get('method')
+ if method=='initialize':print(json.dumps({'id':request['id'],'result':{}}),flush=True)
+ elif method=='thread/start':
+  params=request['params']
+  assert params['ephemeral'] is True
+  assert params['approvalPolicy']==sys.argv[1]
+  assert params['approvalsReviewer']==sys.argv[2]
+  print(json.dumps({'id':request['id'],'result':{'thread':{'id':'temporary','ephemeral':True}}}),flush=True)
+ elif method=='turn/start':
+  print(json.dumps({'method':'turn/completed','params':{'threadId':'temporary','turn':{'status':sys.argv[3]}}}),flush=True)
+  break
+''',encoding='utf-8')
+            for full_access,reviewer in [(False,'auto_review'),(False,'user'),(True,'auto_review')]:
+                for status in ('completed','failed'):
+                    with self.subTest(full_access=full_access,reviewer=reviewer,status=status),contextlib.redirect_stdout(io.StringIO()):
+                        result=client.run([sys.executable,str(server),'never' if full_access else 'on-request',reviewer,status],1,9,folder,'task',rpc=Mock(),reviewer=reviewer,full_access=full_access)
+                        self.assertEqual(result,0 if status=='completed' else 1)
+
     def test_full_access_is_explicit_and_reaches_native_configuration(self):
         cmd=['codex','-c','approval_policy="on-request"','-c','default_permissions="scrum-worker"','exec','--json']
         result=agent_bridge.interactive_command(cmd,'codex',4,9,Path.cwd(),'model',{'agent_approval_mode':'Full access'})
@@ -51,6 +76,7 @@ for line in sys.stdin:
  if m=='initialize':emit({'id':i,'result':{}})
  elif m=='thread/start':
   assert x['params']['approvalPolicy']=='never'
+  assert x['params']['ephemeral'] is True
   emit({'id':i,'result':{'thread':{'id':'fixture'},'model':'fixture-model'}})
  elif m=='turn/start':
   emit({'id':i,'result':{}})

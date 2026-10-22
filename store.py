@@ -2,6 +2,7 @@ import json
 import git_worktrees
 import os
 import sqlite3
+import subprocess
 import unicodedata
 import time
 import secrets
@@ -145,8 +146,12 @@ def git_claim(db, project, row, prefix, actor):
         if active:raise ValueError('Finish active work before Git recovery')
         current=git_sync.state(project_row['workspace_root'])
         return {'branch':current[0] if current else 'unknown','recovery':True}
+    task['allow_parent_refresh']=not active
+    task['allow_checkpoint_restore']=not active
     task['dependencies']=[{'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']} for r in db.execute('SELECT number,title,context_group FROM tasks WHERE project=? AND id IN ('+','.join('?' for _ in json.loads(row['dependencies']))+')',[project,*json.loads(row['dependencies'])])] if json.loads(row['dependencies']) else []
     report=git_sync.on_claim(project_row['workspace_root'],settings,task)
+    if report and report.get('refreshed_from'):
+        activity(db,row['id'],actor,'comment','git: synchronized '+report['branch']+' with its recorded parent '+report['refreshed_from']+' before claiming; no model recovery needed.')
     if report and report.get('busy'):
         activity(db,row['id'],actor,'comment','git: claim refused, checkout has uncommitted work on branch '+report['busy']['current_branch']+' (wanted '+report['busy']['wanted']+').')
     elif report and (report.get('created') or report.get('switched') or report.get('error')):
@@ -1034,10 +1039,31 @@ def legacy_run(action, a, path=None, locks=None):
                 branches={task_branch(task_dict(r,prefix)) for r in active_rows}
                 owned=next(iter(branches)) if len(branches)==1 else None
                 if owned is None and not branches:
-                    current=git_sync.state(project_row['workspace_root'])
+                    try:current=git_sync.refresh_index_state(project_row['workspace_root'])
+                    except (ValueError,OSError,subprocess.SubprocessError):current=git_sync.state(project_row['workspace_root'])
                     if current and current[1]:
                         owned=current[0]
                         checkout_recovery={'branch':current[0],'files':current[1][:100]}
+                        # Mutate only at the supervisor's existing launch boundary,
+                        # never during board reads or next_work navigation.
+                        if action=='worker_launch' and settings.get('git_pause_blocked') and any(task_branch(t)!=owned and t['category']!='Git recovery' for t in candidates):
+                            unfinished=[t for t in tasks if task_branch(t)==owned and t['status'] not in ('Done','Cancelled')]
+                            safe=unfinished and all(t['status']=='Blocked' and t['owner_id']==a.get('actor') for t in unfinished)
+                            reserved=any(Path(lock['path']).is_relative_to(Path(project_row['workspace_root']).resolve()) for lock in db.execute('SELECT path FROM file_locks WHERE lock_until>?',(time.time(),)))
+                            if safe and not reserved:
+                                import git_paused
+                                planned=[]
+                                for t in unfinished:planned.extend(git_worktrees.files(project_row['workspace_root'],t['files']))
+                                try:
+                                    with git_sync.checkout_lock(project_row['workspace_root']):
+                                        paused=git_paused.pause(project_row['workspace_root'],owned,planned,[t['code'] for t in unfinished])
+                                    if paused:
+                                        for t in unfinished:activity(db,t['id'],a['actor'],'comment','git: unfinished edits preserved in a private local checkpoint; restored automatically on this branch before resuming. Not merged or pushed.')
+                                        owned=None;checkout_recovery=None
+                                except (ValueError,OSError,subprocess.SubprocessError) as error:
+                                    # Preservation errors keep the branch busy. Its
+                                    # durable manifest prevents destructive retries.
+                                    checkout_recovery['error']='Local checkpoint needs reconciliation: '+str(error)[:300]+'. Inspect the saved manifest in .scrum/local/git-paused/ before repeating work.'
                 if owned is not None or branches:
                     # Recovery deliberately uses the existing checkout (including
                     # dirty staging), but cannot interrupt another live claim.

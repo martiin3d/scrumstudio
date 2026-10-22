@@ -52,6 +52,90 @@ class NativeGitRecoveryTest(unittest.TestCase):
         self.git('config','branch.middle.scrum-parent','foundation')
         self.git('config','branch.foundation.scrum-parent','main')
 
+    def stale_consumer(self):
+        tip=self.source()
+        self.git('checkout','-qb','dependency-one')
+        (self.root/'b.txt').write_text('first dependency\n');self.git('commit','-qam','dependency one')
+        self.git('checkout','-qb','dependency-two')
+        (self.root/'c.txt').write_text('second dependency\n');self.git('add','c.txt');self.git('commit','-qm','dependency two')
+        self.git('update-ref','refs/heads/main',self.git('rev-parse','HEAD'),self.base)
+        task={'git_branch':'feature','allow_parent_refresh':True,'dependencies':[{'git_branch':'dependency-one'},{'git_branch':'dependency-two'}]}
+        return tip,task,dict(self.settings,git_merge='Group')
+
+    def test_claim_refreshes_all_missing_dependencies_in_one_native_fast_forward(self):
+        _,task,settings=self.stale_consumer()
+        result=git_sync.on_claim(self.root,settings,task)
+        self.assertEqual(result['refreshed_from'],'main');self.assertNotIn('error',result)
+        self.assertEqual(self.git('rev-parse','feature'),self.git('rev-parse','main'))
+        self.assertEqual((self.root/'a.txt').read_text(),'verified\n')
+        self.assertEqual((self.root/'b.txt').read_text(),'first dependency\n')
+        self.assertEqual((self.root/'c.txt').read_text(),'second dependency\n')
+
+    def test_stale_refresh_preserves_dirty_work_and_existing_staging(self):
+        tip,task,settings=self.stale_consumer();self.git('checkout','-q','feature')
+        (self.root/'a.txt').write_text('unfinished\n');(self.root/'b.txt').write_text('human staging\n');self.git('add','b.txt')
+        index=(self.root/'.git/index').read_bytes()
+        result=git_sync.on_claim(self.root,settings,task)
+        self.assertIn('error',result);self.assertEqual(self.git('rev-parse','feature'),tip)
+        self.assertEqual((self.root/'.git/index').read_bytes(),index)
+        self.assertEqual((self.root/'a.txt').read_text(),'unfinished\n')
+        git_sync.refresh_index_state(self.root)
+        self.assertEqual((self.root/'.git/index').read_bytes(),index)
+
+    @unittest.skipIf((git_sync.git_version() or (0,0))<git_sync.MERGE_TREE_MIN,'needs merge-tree')
+    def test_metadata_only_divergence_preserves_history_and_exact_accepted_parent_tree(self):
+        tip,task,settings=self.stale_consumer()
+        tree=self.git('rev-parse','feature^{tree}')
+        historical=self.git('commit-tree',tree,'-p',tip,'-p',self.base,'-m','Previous integration receipt')
+        self.git('update-ref','refs/heads/feature',historical,tip)
+        result=git_sync.on_claim(self.root,settings,task)
+        self.assertEqual(result['refreshed_from'],'main')
+        self.assertEqual(self.git('rev-parse','feature^{tree}'),self.git('rev-parse','main^{tree}'))
+        self.assertTrue(git_sync.is_ancestor(self.root,historical,'feature'))
+
+    def test_stale_refresh_requires_idle_branch_and_enabled_integration(self):
+        tip,task,settings=self.stale_consumer()
+        for changed,policy in [(dict(task,allow_parent_refresh=False),settings),(task,dict(settings,git_merge='Off'))]:
+            result=git_sync.on_claim(self.root,policy,changed)
+            self.assertIn('error',result);self.assertEqual(self.git('rev-parse','feature'),tip)
+
+    def test_parent_refresh_never_discards_additional_consumer_files(self):
+        _,task,settings=self.stale_consumer();self.git('checkout','-q','feature')
+        (self.root/'extra.txt').write_text('unverified consumer output\n')
+        self.git('add','extra.txt');self.git('commit','-qm','Additional consumer work')
+        before=self.git('rev-parse','HEAD')
+        result=git_sync.on_claim(self.root,settings,task)
+        self.assertIn('error',result);self.assertEqual(self.git('rev-parse','HEAD'),before)
+        self.assertEqual((self.root/'extra.txt').read_text(),'unverified consumer output\n')
+
+    def test_existing_managed_worktree_refresh_preserves_canonical_staging(self):
+        self.source();self.git('checkout','-q','main')
+        task={'id':1,'git_branch':'feature','allow_parent_refresh':True}
+        settings=dict(self.settings,git_mode='Worktrees',git_merge='Group',git_base_branch='main')
+        initial=git_sync.on_claim(self.root,settings,task);work=Path(initial['worktree'])
+        self.git('checkout','-qb','dependency','feature')
+        (self.root/'b.txt').write_text('verified dependency\n');self.git('commit','-qam','Dependency')
+        self.git('update-ref','refs/heads/main',self.git('rev-parse','HEAD'),self.base)
+        (self.root/'a.txt').write_text('human staging\n');self.git('add','a.txt')
+        index=(self.root/'.git/index').read_bytes()
+        result=git_sync.on_claim(self.root,settings,dict(task,dependencies=[{'git_branch':'dependency'}]))
+        self.assertEqual(result['refreshed_from'],'main');self.assertEqual(Path(result['worktree']),work)
+        self.assertEqual((work/'b.txt').read_text(),'verified dependency\n')
+        self.assertEqual((self.root/'.git/index').read_bytes(),index)
+
+    def test_diverged_consumer_or_unpublished_dependency_keeps_recovery_boundary(self):
+        tip,task,settings=self.stale_consumer()
+        self.git('branch','unpublished',tip)
+        # A prerequisite not accepted in main must not be pulled from its branch.
+        self.git('checkout','-q','unpublished');(self.root/'d.txt').write_text('unverified\n')
+        self.git('add','d.txt');self.git('commit','-qm','not accepted')
+        result=git_sync.on_claim(self.root,settings,dict(task,dependencies=task['dependencies']+[{'git_branch':'unpublished'}]))
+        self.assertIn('error',result);self.assertEqual(self.git('rev-parse','feature'),tip)
+        self.git('checkout','-q','feature');(self.root/'a.txt').write_text('own divergent work\n');self.git('commit','-qam','diverged')
+        before=self.git('rev-parse','HEAD')
+        result=git_sync.on_claim(self.root,settings,task)
+        self.assertIn('error',result);self.assertEqual(self.git('rev-parse','HEAD'),before)
+
     def test_verified_dependency_propagates_through_recorded_parent_chain(self):
         tip=self.source();self.parent_chain()
         result=git_sync.merge_dependency_checkpoint(self.root,self.settings,'feature')

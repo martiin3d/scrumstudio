@@ -84,16 +84,20 @@ def prepare(root,settings,task):
         raise ValueError('Worktrees require a local origin branch')
     exists=git._git(root,'show-ref','--verify','--quiet','refs/heads/'+target).returncode==0
     destination='refs/heads/'+target if exists else parent
+    missing=[]
     for dep in task.get('dependencies',[]):
         dependency=git.branch_for(settings,dep)
         if dependency!=target and git._git(root,'show-ref','--verify','--quiet','refs/heads/'+dependency).returncode==0 and not git.is_ancestor(root,dependency,destination):
-            raise ValueError('Dependency branch '+dependency+' is not integrated into the workspace destination')
+            missing.append(dependency)
+    refreshed=git.refresh_parent(root,settings,task,target,missing,workspace=path) if missing else None
+    if missing and not refreshed:raise ValueError('Dependency branch '+missing[0]+' is not integrated into the workspace destination')
+    extra={'refreshed_from':refreshed} if refreshed else {}
     # A project can switch from Branches to Worktrees while unfinished work
     # still owns its original checkout. Git cannot check that branch out twice.
     # Reuse that checkout without registering it as a disposable worktree.
     current=git._git(root,'symbolic-ref','--short','HEAD')
     if not existing and not path.exists() and not current.returncode and current.stdout.strip()==target:
-        return {'branch':target,'worktree':str(root),'canonical_root':str(root),'parent':git.parent_branch(root,target),'reused_canonical':True}
+        return {'branch':target,'worktree':str(root),'canonical_root':str(root),'parent':git.parent_branch(root,target),'reused_canonical':True,**extra}
     if path.exists():
         current=git._git(path,'symbolic-ref','--short','HEAD')
         common=git._git(path,'rev-parse','--path-format=absolute','--git-common-dir')
@@ -112,7 +116,7 @@ def prepare(root,settings,task):
         if value['branch']==target:value.pop('cleanup',None)
     saved[identity(task)]={'path':str(path),'branch':target}
     save(root,saved)
-    return {'branch':target,'worktree':str(path),'canonical_root':str(root),'parent':git.parent_branch(root,target)}
+    return {'branch':target,'worktree':str(path),'canonical_root':str(root),'parent':git.parent_branch(root,target),**extra}
 
 
 def inspection_root(root,task):
@@ -229,6 +233,8 @@ def cleanup(root,actor,related_work=None):
             if related_work is None or related_work(source):
                 results.append(dict(result,reason='related unfinished work or unknown task state'));continue
             try:
+                import git_paused
+                if git_paused.pending(root,source):raise ValueError('branch contains preserved unfinished work')
                 path=workspace(root,next(k for k,v in saved.items() if v is item))
                 common=git._git(path,'rev-parse','--path-format=absolute','--git-common-dir')
                 original=git._git(root,'rev-parse','--path-format=absolute','--git-common-dir')

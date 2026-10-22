@@ -135,7 +135,7 @@ def command(client,folder,prompt,model='',policy_folder=None):
         rules=worker_filesystem(policy_folder or folder)
         options+=['-c','permissions.scrum-worker.filesystem={'+','.join(json.dumps(path)+'='+json.dumps(mode) for path,mode in rules.items())+'}']
         options+=['-c','mcp_servers.scrum-studio.tool_timeout_sec=180','-c','mcp_servers.scrum-studio.enabled=true','-c','mcp_servers.scrum-studio.command='+json.dumps(sys.executable),'-c','mcp_servers.scrum-studio.args='+json.dumps([str(ROOT/'mcp_server.py'),'--worker-schema']),'-c','mcp_servers.scrum-studio.enabled_tools='+json.dumps(SCRUM_WORK_TOOLS),'-c','mcp_servers.scrum-studio.default_tools_approval_mode="approve"']
-        return [executable,*options,'exec','--json','--skip-git-repo-check','--cd',str(folder),*model_args,'-']
+        return [executable,*options,'exec','--ephemeral','--json','--skip-git-repo-check','--cd',str(folder),*model_args,'-']
     # Claude CLI: same worker catalog as Codex. A config file (not inline JSON)
     # survives Windows .cmd quoting. Preserve configured project MCP servers
     # (for example Unity or codebase-memory) instead of hiding required tools. Headless -p cannot

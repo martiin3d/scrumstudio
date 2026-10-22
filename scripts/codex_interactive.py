@@ -76,7 +76,9 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
                 result=message.get('result',{})
                 if message['id']=='scrum:init':
                     send({'jsonrpc':'2.0','method':'initialized'})
-                    request('thread/start',{'cwd':str(cwd),'approvalPolicy':'never' if full_access else 'on-request','approvalsReviewer':reviewer,**({'model':model} if model else {})},'scrum:thread')
+                    # Task continuity and worker diagnostics live in SCRUM. Do
+                    # not persist an extra Codex sidebar chat for every launch.
+                    request('thread/start',{'cwd':str(cwd),'ephemeral':True,'approvalPolicy':'never' if full_access else 'on-request','approvalsReviewer':reviewer,**({'model':model} if model else {})},'scrum:thread')
                 elif message['id']=='scrum:thread':
                     thread=result['thread']['id'];event('thread.started',thread_id=thread)
                     if result.get('model'):event('system',subtype='init',model=result['model'])
