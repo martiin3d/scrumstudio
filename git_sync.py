@@ -3,13 +3,14 @@
 Policy lives in project settings (git_mode, git_commit, git_push, git_base_branch,
 git_branch_prefix, git_remote). Everything runs in local code at claim and Done
 time, never through a model turn. Checkout preparation failures refuse the claim. Commit/push jobs run after the
-database transaction, scoped to explicit files; errors are reported while Done
-stands. No Git operation makes an inference call.
+database transaction, scoped to explicit files; legacy errors are reported while Done
+stands. Task merge saves verification in In Review and finalizes Done only after integration. No Git operation makes an inference call.
 """
 import json
 import os
 import re
 import subprocess
+import sqlite3
 import time
 import unicodedata
 import threading
@@ -20,6 +21,23 @@ GIT_DEFAULTS = {'git_pause_blocked':False, 'git_cleanup':False, 'git_merge':'Off
 _jobs = threading.local()
 PUSH_TIMEOUT = 60   # network; a first push of a large branch is slow, and GIT_TERMINAL_PROMPT=0 keeps it from hanging
 MERGE_TREE_MIN = (2, 38)  # `git merge-tree --write-tree`
+FINALIZE_TOKEN = object()  # Private in-process capability, never exposed over MCP/HTTP.
+
+def completion_basis(row):
+    import hashlib
+    # Publication notes/evidence prose do not change the verified implementation.
+    # Bind acceptance, scope and checklist; receipts additionally bind file blobs.
+    fields=('title','description','checklist','acceptance_criteria','context_group','dependencies','owner_id')
+    data={k:row.get(k) for k in fields}
+    planned=row.get('files') or []
+    if isinstance(planned,str):planned=json.loads(planned)
+    names={Path(name).as_posix().rstrip('/') for name in planned}
+    data['files']=sorted(name for name in names if not any(other.startswith(name+'/') for other in names if other!=name))
+    return hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()
+
+
+def integrated_completion(settings):
+    return enabled(settings) and settings.get('git_merge') == 'Task'
 
 def git_version(root='.'):
     try:
@@ -59,7 +77,7 @@ def checkout_lock(root):
 def validate(changed):
     if 'git_pause_blocked' in changed and (type(changed['git_pause_blocked']) not in (bool,int) or changed['git_pause_blocked'] not in (0,1)):raise ValueError('git_pause_blocked must be boolean')
     if 'git_cleanup' in changed and (type(changed['git_cleanup']) not in (bool,int) or changed['git_cleanup'] not in (0,1)):raise ValueError('git_cleanup must be boolean')
-    if 'git_merge' in changed and changed['git_merge'] not in ('Off','Group'):raise ValueError('git_merge must be Off or Group')
+    if 'git_merge' in changed and changed['git_merge'] not in ('Off','Group','Task'):raise ValueError('git_merge must be Off, Group or Task')
     if 'git_mode' in changed and changed['git_mode'] not in ('Off', 'Branches','Worktrees'):
         raise ValueError('git_mode must be Off, Branches or Worktrees')
     if 'git_commit' in changed and changed['git_commit'] not in ('Task', 'Group'):
@@ -101,8 +119,25 @@ def branch_for(settings, task):
     """scrum/<group> for a context group, scrum/<CODE>-<title> otherwise."""
     if task.get('git_branch'):return task['git_branch']
     prefix = settings.get('git_branch_prefix', 'scrum/')
-    group = (task.get('context_group') or '').strip()
+    if settings.get('git_merge')=='Task':return prefix+task['code'].lower()
+    group = '' if settings.get('git_merge')=='Task' else (task.get('context_group') or '').strip()
     return prefix + (slug(group) if group else task['code'].lower() + '-' + slug(task['title'], 40))
+
+def task_migration_preserved(root,settings,source,tasks):
+    """Accept an explicit, exact task-branch copy; never guess a WIP owner."""
+    source_tip=_git(root,'rev-parse','--verify','refs/heads/'+source)
+    if source_tip.returncode:return False
+    matches=[]
+    for task in tasks:
+        if branch_for(settings,task)!=source:continue
+        target=branch_for(dict(settings,git_merge='Task'),task)
+        if target==source:continue
+        origin=_git(root,'config','--local','--get','branch.'+target+'.scrum-migrated-from')
+        if origin.returncode or origin.stdout.strip()!=source:continue
+        tip=_git(root,'rev-parse','--verify','refs/heads/'+target)
+        if not tip.returncode and tip.stdout.strip()==source_tip.stdout.strip() and parent_branch(root,target)==parent_branch(root,source):matches.append(target)
+    return len(matches)==1
+
 
 def enabled(settings):
     return settings.get('git_mode', 'Off') in ('Branches','Worktrees')
@@ -134,7 +169,7 @@ def on_claim(root, settings, task):
 
 def refresh_parent(root,settings,task,target,missing,workspace=None):
     """Refresh an idle branch only to the exact tree already accepted by its parent."""
-    if not task.get('allow_parent_refresh') or settings.get('git_merge')!='Group':return None
+    if not task.get('allow_parent_refresh') or settings.get('git_merge') not in ('Group','Task'):return None
     parent=parent_branch(root,target)
     if not parent or parent==target:return None
     before=_git(root,'rev-parse','--verify','refs/heads/'+target)
@@ -157,8 +192,12 @@ def refresh_parent(root,settings,task,target,missing,workspace=None):
         if (git_version(root) or (0,0))<MERGE_TREE_MIN:return None
         tree=_git(root,'merge-tree','--write-tree',old,tip,timeout=10)
         accepted=_git(root,'rev-parse',tip+'^{tree}')
-        if tree.returncode or accepted.returncode or tree.stdout.splitlines()[0]!=accepted.stdout.strip():return None
-        merged=_git(root,'commit-tree',accepted.stdout.strip(),'-p',old,'-p',tip,'-m','Synchronize '+target+' from recorded parent '+parent,timeout=10)
+        if tree.returncode or accepted.returncode:
+            if settings.get('git_merge')=='Task':raise ValueError('Task branch conflicts with its recorded parent; preserve checkpoint and resolve the scoped conflict')
+            return None
+        merged_tree=tree.stdout.splitlines()[0]
+        if settings.get('git_merge')!='Task' and merged_tree!=accepted.stdout.strip():return None
+        merged=_git(root,'commit-tree',merged_tree,'-p',old,'-p',tip,'-m','Synchronize '+target+' from recorded parent '+parent,timeout=10)
         if merged.returncode:raise ValueError('Could not record verified parent synchronization')
         tip=merged.stdout.strip()
     if checked:
@@ -196,13 +235,15 @@ def _on_claim(root, settings, task):
         if dependency==target:continue
         if _git(root,'rev-parse','--verify','--quiet','refs/heads/'+dependency).returncode==0 and not is_ancestor(root,dependency,destination):
             missing.append(dependency)
-    refreshed=refresh_parent(root,settings,task,target,missing) if missing else None
+    # Refresh a resumed task even when it has no explicit dependencies. Parked
+    # edits are restored afterwards; a genuine conflict remains recoverable.
+    refreshed=refresh_parent(root,settings,task,target,missing) if missing or settings.get('git_merge')=='Task' else None
     if missing and not refreshed:
         return {'branch':target,'error':'Dependency branch '+missing[0]+' is not integrated into '+destination+'; integrate it before claiming'}
     extra={'refreshed_from':refreshed} if refreshed else {}
     if branch == target:
         import git_paused
-        restored=git_paused.restore(root,target,task.get('code'),task.get('allow_checkpoint_restore',True))
+        restored=git_paused.restore(root,target,task.get('code'),task.get('allow_checkpoint_restore',True),context_group=task.get('context_group','').strip())
         return {'branch': target,**extra,**({'restored_checkpoint':restored} if restored else {})}
     if dirty:
         return {'busy': {'current_branch': branch, 'wanted': target, 'dirty': dirty[:20], 'dirty_total': len(dirty)}}
@@ -227,25 +268,37 @@ def _on_claim(root, settings, task):
         if result.returncode:
             return {'branch': target, 'error': (result.stderr or result.stdout).strip()[:300] or 'checkout failed'}
         import git_paused
-        restored=git_paused.restore(root,target,task.get('code'),task.get('allow_checkpoint_restore',True))
+        restored=git_paused.restore(root,target,task.get('code'),task.get('allow_checkpoint_restore',True),context_group=task.get('context_group','').strip())
         return {'branch': target, outcome: True, 'previous': branch,**extra,**({'restored_checkpoint':restored} if restored else {})}
     except (OSError, subprocess.SubprocessError) as error:
         return {'branch': target, 'error': str(error)[:300]}
 
-def _commit(root, settings, task, message):
+def planned_paths(root,planned):
+    """Exact paths only; ignore redundant folder markers, never expand folders."""
     import git_worktrees
-    files = git_worktrees.files(root,task.get('files') or [])
-    if not files:return {'committed':False,'reason':'no explicit planned files; automatic commit skipped'}
-    root=Path(root).resolve();pathspec=[]
-    for name in files:
-        path=Path(name)
-        path=path if path.is_absolute() else root/path
+    root=Path(root).resolve();paths=[]
+    for name in git_worktrees.files(root,planned):
+        path=Path(name);path=path if path.is_absolute() else root/path
         resolved=path.resolve()
-        if not resolved.is_relative_to(root) or resolved==root or resolved.is_dir():
-            return {'error':'Automatic commits require explicit files inside the checkout'}
+        if not resolved.is_relative_to(root) or resolved==root:
+            raise ValueError('Automatic commits require explicit files inside the checkout')
         relative=resolved.relative_to(root).as_posix()
-        if any(part in ('.scrum','.git') for part in Path(relative).parts):return {'error':'Local coordination or Git metadata cannot be committed'}
-        if path.exists() or _git(root,'ls-files','--error-unmatch','--',relative).returncode==0:pathspec.append(relative)
+        if any(part in ('.scrum','.git') for part in Path(relative).parts):raise ValueError('Local coordination or Git metadata cannot be committed')
+        paths.append((resolved,relative))
+    result=[]
+    for path,relative in paths:
+        if path.is_dir():
+            if not any(other!=path and not other.is_dir() and other.is_relative_to(path) for other,_ in paths):
+                raise ValueError('Automatic commits require explicit files inside the checkout')
+            continue
+        if path.exists() or _git(root,'ls-files','--error-unmatch','--',relative).returncode==0:result.append(relative)
+    return sorted(set(result))
+
+
+def _commit(root, settings, task, message):
+    if not task.get('files'):return {'committed':False,'reason':'no explicit planned files; automatic commit skipped'}
+    try:pathspec=planned_paths(root,task['files'])
+    except ValueError as error:return {'error':str(error)}
     if not pathspec:return {'committed':False,'reason':'no planned file exists in the checkout'}
     # Refuse pre-staged work on owned paths too: do not overwrite a human's index.
     staged=_git(root,'diff','--cached','--quiet','--',*pathspec)
@@ -382,43 +435,74 @@ def merge_dependency_checkpoint(root,settings,source):
 
 
 def _finish(item):
+    with checkout_lock(item['root']):
+        report=_finish_locked(item)
+    return finish_cleanup(item,report)
+
+
+def _finish_locked(item):
     root=item['root'];settings=item['settings'];task=item['task']
     report={'branch':branch_for(settings,task)}
-    with checkout_lock(root):
-        current=state(root)
-        if current is None:return dict(report,error='git unavailable or not a repository')
-        if current[0]!=report['branch']:return dict(report,error='Checkout branch changed; automatic commit and push refused')
-        group=(task.get('context_group') or '').strip();unit_done=item['group_done'] if group else True
-        if item.get('dependency_checkpoint'):
-            unit_done=True
-            report['note']='Published a completed dependency checkpoint; remaining tasks retain their own status'
-        if settings.get('git_commit','Task')=='Task' or not group:
-            report['commit']=_commit(root,settings,task,f"{task['code']}: {task['title']}")
-        elif unit_done:
-            files=sorted({p for m in item['members'] if m['status']=='Done' for p in m.get('files',[])})
-            if any(not m.get('files') for m in item['members'] if m['status']=='Done'):
-                report['commit']={'error':'Every completed group member needs explicit planned files'}
-            else:
-                report['commit']=_commit(root,settings,dict(task,files=files),group+': '+', '.join(m['code'] for m in item['members'])[:200])
-        else:report['commit']={'committed':False,'reason':'group commit deferred until the context group is complete'}
-        commit=report['commit'];policy=settings.get('git_push','Group')
-        if commit.get('error') or (not commit.get('committed') and commit.get('reason') not in ('nothing to commit','group commit deferred until the context group is complete')):
-            report['push']={'pushed':False,'reason':'Commit not verified; automatic push skipped'}
-        elif policy=='Never':report['push']={'pushed':False,'reason':'push disabled'}
-        elif policy=='Task' or unit_done:
-            remote=settings.get('git_remote','origin')
+    current=state(root)
+    if current is None:return dict(report,error='git unavailable or not a repository')
+    strict=integrated_completion(settings)
+    if strict:
+        import git_completion
+        existing=git_completion.already_integrated(root,settings,task,report['branch'])
+        if existing:
+            report.update(existing)
+            return report
+    if current[0]!=report['branch']:return dict(report,error='Checkout branch changed; automatic commit and push refused')
+    if strict:
+        # Persist verification intent before a commit hook/publication can fail.
+        git_completion.save_receipt(root,task,report['branch'],pending=True)
+    group=(task.get('context_group') or '').strip();unit_done=True if strict else item['group_done'] if group else True
+    if item.get('dependency_checkpoint'):
+        unit_done=True
+        report['note']='Published a completed dependency checkpoint; remaining tasks retain their own status'
+    if strict or settings.get('git_commit','Task')=='Task' or not group:
+        report['commit']=_commit(root,settings,task,f"{task['code']}: {task['title']}")
+    elif unit_done:
+        files=sorted({p for m in item['members'] if m['status']=='Done' for p in m.get('files',[])})
+        if any(not m.get('files') for m in item['members'] if m['status']=='Done'):
+            report['commit']={'error':'Every completed group member needs explicit planned files'}
+        else:
+            report['commit']=_commit(root,settings,dict(task,files=files),group+': '+', '.join(m['code'] for m in item['members'])[:200])
+    else:report['commit']={'committed':False,'reason':'group commit deferred until the context group is complete'}
+    if strict and not task.get('files') and report['commit'].get('reason')=='no explicit planned files; automatic commit skipped':
+        parent=parent_branch(root,report['branch'])
+        if parent and state(root)==(report['branch'],[]) and is_ancestor(root,report['branch'],'refs/heads/'+parent):
+            report['commit']={'committed':False,'reason':'nothing to commit'}
+    commit=report['commit'];policy=settings.get('git_push','Group')
+    if strict and not commit.get('error') and (commit.get('committed') or commit.get('reason')=='nothing to commit'):
+        import git_completion
+        receipt=git_completion.save_receipt(root,task,report['branch'])
+        report['verified_source_sha']=receipt['sha']
+    if commit.get('error') or (not commit.get('committed') and commit.get('reason') not in ('nothing to commit','group commit deferred until the context group is complete')):
+        report['push']={'pushed':False,'reason':'Commit not verified; automatic push skipped'}
+    elif policy=='Never':report['push']={'pushed':False,'reason':'push disabled'}
+    elif policy=='Task' or unit_done:
+        remote=settings.get('git_remote','origin')
+        try:
+            push_source=report['verified_source_sha']+':refs/heads/'+report['branch'] if strict else report['branch']
+            result=_git(root,'push','--quiet','-u',remote,push_source,timeout=PUSH_TIMEOUT)
+            report['push']={'pushed':True,'remote':remote,'branch':report['branch']} if not result.returncode else {'pushed':False,'error':(result.stderr or result.stdout).strip()[-300:] or 'push failed'}
+        except (OSError,subprocess.SubprocessError) as error:
+            report['push']={'pushed':False,'error':str(error)[:300]}
+    else:report['push']={'pushed':False,'reason':'waiting for the rest of the context group'}
+    if settings.get('git_merge') in ('Group','Task') and unit_done:
+        if (not commit.get('committed') and commit.get('reason')!='nothing to commit') or (settings.get('git_push')!='Never' and not report.get('push',{}).get('pushed')):
+            report['merge']={'merged':False,'error':'Commit or source publication failed; agent review required'}
+        elif commit.get('committed') or commit.get('reason')=='nothing to commit':
             try:
-                result=_git(root,'push','--quiet','-u',remote,report['branch'],timeout=PUSH_TIMEOUT)
-                report['push']={'pushed':True,'remote':remote,'branch':report['branch']} if not result.returncode else {'pushed':False,'error':(result.stderr or result.stdout).strip()[-300:] or 'push failed'}
-            except (OSError,subprocess.SubprocessError) as error:
-                report['push']={'pushed':False,'error':str(error)[:300]}
-        else:report['push']={'pushed':False,'reason':'waiting for the rest of the context group'}
-        if settings.get('git_merge')=='Group' and unit_done:
-            if (not commit.get('committed') and commit.get('reason')!='nothing to commit') or (settings.get('git_push')!='Never' and not report.get('push',{}).get('pushed')):
-                report['merge']={'merged':False,'error':'Commit or source publication failed; agent review required'}
-            elif commit.get('committed') or commit.get('reason')=='nothing to commit':
-                try:report['merge']=(merge_dependency_checkpoint if item.get('dependency_checkpoint') else merge_completed)(root,settings,report['branch'])
-                except (OSError,ValueError,subprocess.SubprocessError) as error:report['merge']={'merged':False,'error':str(error)[:300]}
+                if strict:report['merge']=merge_completed(root,settings,report['branch'],expected_source=receipt['sha'],expected_parent=receipt['target'])
+                else:report['merge']=(merge_dependency_checkpoint if item.get('dependency_checkpoint') else merge_completed)(root,settings,report['branch'])
+            except (OSError,ValueError,subprocess.SubprocessError) as error:report['merge']={'merged':False,'error':str(error)[:300]}
+    return report
+
+
+def finish_cleanup(item,report):
+    root=item['root'];settings=item['settings']
     if settings.get('git_cleanup') and report.get('merge',{}).get('merged') and not report['merge'].get('error'):
         import git_worktrees
         try:report['cleanup']=git_worktrees.queue_cleanup(settings.get('workspace_root') or root,report['merge'],item['actor'])
@@ -460,15 +544,21 @@ def flush(call,jobs,result,external_project=None):
         try:outcome=_finish(item)
         except (OSError,ValueError,subprocess.SubprocessError) as error:
             outcome={'branch':branch_for(item['settings'],item['task']),'error':str(error)[:300]}
-        if outcome.get('error') and item['settings'].get('git_merge')=='Group' and (item['group_done'] or item.get('dependency_checkpoint')):
+        strict=integrated_completion(item['settings'])
+        if outcome.get('error') and item['settings'].get('git_merge') in ('Group','Task') and (strict or item['group_done'] or item.get('dependency_checkpoint')):
             outcome['merge']={'merged':False,'error':outcome['error']}
         item['report'].clear();item['report'].update(outcome)
         if result.get('id')==item['task']['id']:result['git']=outcome
         project=external_project if external_project is not None else item['project']
-        destination=(outcome.get('merge',{}).get('pending_target') or parent_branch(item['root'],outcome['branch'])) if item['settings'].get('git_merge')=='Group' else ''
+        destination=(outcome.get('merge',{}).get('pending_target') or parent_branch(item['root'],outcome['branch'])) if item['settings'].get('git_merge') in ('Group','Task') else ''
+        if strict:
+            try:
+                finalized=call('git_finalize',dict(project=project,id=item['task']['id'],actor=item['actor'],capability=FINALIZE_TOKEN,expected=item['task'].get('completion_basis'),outcome=outcome,root=item['root']))
+                if result.get('id')==item['task']['id']:result.update(finalized)
+            except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
         if outcome.get('merge',{}).get('error'):
             try:
-                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description='Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+outcome['merge']['error'],acceptance_criteria=['Target contains the source outcome, conflicts are resolved and verification is recorded.','Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
+                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description='Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+outcome['merge']['error'],acceptance_criteria=['Target contains the source outcome, conflicts are resolved and verification is recorded.','Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
                 outcome['recovery_task']=recovery
                 import idle_signals
                 idle_signals.notify('git_recovery',{'project':project})

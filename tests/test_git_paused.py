@@ -44,6 +44,16 @@ class PausedGitTest(unittest.TestCase):
         self.assertEqual(self.git('diff','--cached','--name-only'),'')
         self.assertIsNone(git_paused.restore(self.root,'partial'))
 
+    def test_same_context_prerequisite_can_resume_but_other_groups_cannot(self):
+        (self.root/'one.txt').write_text('saved baseline')
+        git_paused.pause(self.root,'partial',['one.txt'],['TEST-1'],context_group='ui')
+        with self.assertRaises(ValueError):
+            git_paused.restore(self.root,'partial','TEST-2',context_group='other')
+        with self.assertRaises(ValueError):
+            git_paused.restore(self.root,'partial','TEST-2')
+        git_paused.restore(self.root,'partial','TEST-2',context_group='ui')
+        self.assertEqual((self.root/'one.txt').read_text(),'saved baseline')
+
     def test_staged_or_unrelated_work_is_never_removed(self):
         (self.root/'one.txt').write_text('human');self.git('add','one.txt')
         (self.root/'one.txt').write_text('later')

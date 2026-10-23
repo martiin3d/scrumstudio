@@ -200,11 +200,40 @@ def operation(db, action, a, project_row, actor_user, activity, now):
             import git_paused
             if git_paused.any_pending(current['workspace_root']):
                 raise ValueError('Restore or reconcile preserved blocked work before changing Git mode or workspace_root')
-        if changed.get('git_merge')=='Group':
+        if changed.get('git_merge') in ('Group','Task'):
             import git_sync
             version=git_sync.git_version(current['workspace_root'] or '.')
             if version and version<git_sync.MERGE_TREE_MIN:
                 raise ValueError(f'git_merge=Group needs git {git_sync.MERGE_TREE_MIN[0]}.{git_sync.MERGE_TREE_MIN[1]}+ on this machine (found {version[0]}.{version[1]})')
+        if 'git_merge' in changed and changed['git_merge']!=current['git_merge'] and 'Task' in (changed['git_merge'],current['git_merge']):
+            import git_sync,git_paused
+            root=current['workspace_root']
+            active=db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchone()
+            checkout=git_sync.state(root) if root else None
+            if active or git_paused.any_pending(root) or (checkout and checkout[1]):
+                raise ValueError('Preserve and reconcile active or parked work before changing task branch policy')
+            if root:
+                saved=git_worktrees.entries(root)
+                rows=db.execute('SELECT * FROM tasks WHERE project=?',(project,)).fetchall()
+                if any(r['status'] not in ('Done','Cancelled') and git_worktrees.identity(r) in saved for r in rows):
+                    raise ValueError('Reconcile unfinished managed workspaces before changing task branch policy')
+                old_policy=settings(current);seen=set()
+                from store import project_prefix
+                prefix=project_prefix(current['name'])
+                for r in rows:
+                    if r['status']=='Cancelled':continue
+                    task={'code':f"{prefix}-{r['number']}",'title':r['title'],'context_group':r['context_group']}
+                    source=git_worktrees.branch(root,git_worktrees.identity(r)) or git_sync.branch_for(old_policy,task)
+                    if source in seen:continue
+                    seen.add(source)
+                    exists=git_sync._git(root,'rev-parse','--verify','--quiet','refs/heads/'+source)
+                    if exists.returncode:continue
+                    parent=git_sync.parent_branch(root,source)
+                    if not parent or not git_sync.is_ancestor(root,source,'refs/heads/'+parent):
+                        tasks=[{'code':f"{prefix}-{item['number']}",'title':item['title'],'context_group':item['context_group']} for item in rows if item['status']!='Cancelled']
+                        preserved=changed['git_merge']=='Task' and git_sync.task_migration_preserved(root,old_policy,source,tasks)
+                        if not preserved:raise ValueError('Integrate or preserve existing branch '+source+' before changing task branch policy')
+
         if 'max_active_per_agent' in changed:
             limit=changed['max_active_per_agent']
             if type(limit) is not int or not 1<=limit<=20:

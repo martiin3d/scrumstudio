@@ -99,7 +99,7 @@ def operation(action, a, call):
                 if a.get('review_items'):
                     result['review']=call('note_add',{'project':project,'task':a['id'],'kind':'Review','title':'Session handoff','items':a['review_items']})
                 result['session']=call('agent_checkpoint',base | {'client':a['client'],'action':'offline','summary':'Verified task completed.'})
-            elif a.get('use_batch'):
+            elif a.get('use_batch') and completed.get('status')=='Done':
                 result['next']=call('batch_next',base|{'id':a['id']})
                 if result['next'].get('batch_done'):
                     result['session']=call('agent_checkpoint',base|{'client':a['client'],'action':'offline'})

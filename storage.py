@@ -525,8 +525,9 @@ def validate_snapshot(data, meta):
         required(row.get('category'),'category',80)
         for field in ['description','blocked_reason']:
             description(row.get(field))
-        if row.get('blocked_reason_kind','external') not in ('dependency','external'):
+        if row.get('blocked_reason_kind','external') not in ('dependency','external','checkout'):
             raise ValueError('Invalid blocked_reason_kind')
+        if row.get('blocked_reason_kind')=='checkout' and row.get('category')!='Git recovery':raise ValueError('Checkout blocker requires Git recovery category')
         for field,limit in [('evidence',4000),('cancel_reason',2000)]:
             if not isinstance(row.get(field),str) or len(row[field])>limit:
                 raise ValueError('Invalid task evidence/reason')

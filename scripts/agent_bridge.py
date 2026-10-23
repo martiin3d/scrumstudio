@@ -47,6 +47,17 @@ def recover_incomplete(task,actor,attempts,report,exit_code):
             and not report.get('control',{}).get('paused') and report.get('profile_enabled',True))
 
 
+def capacity_retry(error, attempts, report):
+    """Only explicit provider overload is retryable; no model fallback."""
+    if (report.get('should_stop') or report.get('control',{}).get('paused')
+            or not report.get('profile_enabled',True)):
+        return None
+    message=str(error).lower()
+    if not ('serveroverloaded' in message or 'selected model is at capacity' in message):
+        return None
+    return (30,90,180)[attempts] if attempts<3 else None
+
+
 def queue_checkout_recovery(rpc,project,actor,offer,attempted):
     issue=offer.get('checkout_recovery')
     if not issue:return False
@@ -56,7 +67,7 @@ def queue_checkout_recovery(rpc,project,actor,offer,attempted):
     branch=str(issue['branch'])
     result=rpc.call('task_plan',{'project':project,'actor':actor,'items':[{
         'key':'checkout-recovery','title':('Recover checkout for available work: '+branch)[:185]+' '+hashlib.sha256(fingerprint.encode()).hexdigest()[:8],
-        'description':'The human enabled autonomous recovery tasks. Ready authorized work cannot start because of checkout/preparation state on '+branch+'. Inspect saved task continuity and current Git state, reserve discovered files, and recover branch availability without losing work. Preserve unrelated edits/staging; no blanket commit, discard, stash or force push. Commit/publish only verified related outcomes under the recorded Git policy. If a completed prerequisite is not integrated, reconcile its recorded parent chain and publish the verified commits needed by the waiting task; unfinished context-group work must stay unfinished. If recovery needs an external action, record a precise blocker and exit; never repeat an unchanged attempt. Concrete error: '+str(issue.get('error','Uncommitted work prevents switching to another ready task.'))[:700]+'. Diagnostic paths: '+json.dumps(issue.get('files',[])[:20]),
+        'description':'The human enabled autonomous recovery tasks. Ready authorized work cannot start because of checkout/preparation state on '+branch+'. Inspect saved task continuity and current Git state, reserve discovered files, and recover branch availability without losing work. Preserve unrelated edits/staging; no blanket commit, discard, stash or force push. Commit/publish only verified related outcomes under the recorded Git policy. If a completed prerequisite is not integrated, reconcile its recorded parent chain and publish the verified commits needed by the waiting task; unfinished context-group work must stay unfinished. If recovery needs an external action, record a precise blocker and exit; never repeat an unchanged attempt. For a remaining obstruction caused ONLY by dirty checkout files/staging, set blocked_reason_kind=checkout when blocking this Git recovery task; it will reopen for verification after the checkout is clean. Keep external for permissions, credentials, unknown provenance requiring a separate decision, or other independent constraints. Concrete error: '+str(issue.get('error','Uncommitted work prevents switching to another ready task.'))[:700]+'. Diagnostic paths: '+json.dumps(issue.get('files',[])[:20]),
         'acceptance_criteria':['Ready work can proceed without losing partial/unrelated work, or a concrete external blocker is recorded with resumable continuity.'],
         'category':'Git recovery','priority':1,'scope_size':'Small','scope_reason':'One concrete checkout recovery; no new feature.',
         'model_tier':'standard','model_reason':'Scoped Git state recovery.'}]})
@@ -337,6 +348,8 @@ def main():
         recovery_attempts=set()
         checkout_attempts=set()
         incomplete_attempts={};pending_recovery=None
+        capacity_attempts={};capacity_pending=None
+        checkout_watch=None;checkout_seen=None
         profile_generation=managed['generation'] if managed else 0
         last_usage=float('-inf');last_policy=0;policy={};observed={}
         last_checkpoint=None;previous_running=False;control_stamp=idle_signals.stamp(folder)
@@ -347,8 +360,14 @@ def main():
             signal_changed=signal_stamp!=control_stamp
             control_stamp=signal_stamp
             running=child is not None and child.poll() is None
+            if checkout_watch is not None and child is None:
+                checkout_now=idle_signals.checkout_stamp(folder,checkout_watch)
+                if checkout_now!=checkout_seen:
+                    checkout_seen=checkout_now
+                    pending_start=True;signal_changed=True
             usage_ready=usage_future is not None and usage_future.done()
-            pending_ready=(pending_start or pending_auto) and usage_future is None
+            capacity_due=capacity_pending is not None and at>=capacity_pending[0]
+            pending_ready=(pending_start or pending_auto or capacity_due) and usage_future is None
             if not idle_signals.checkpoint_due(at,last_checkpoint,running,previous_running,signal_changed) and not (child is not None and not running) and not pending_ready and not usage_ready:
                 time.sleep(2)
                 continue
@@ -361,7 +380,7 @@ def main():
                 except Exception:
                     observed={}
                 usage_future=None
-            wants_usage=running or pending_start or pending_auto or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
+            wants_usage=running or pending_start or pending_auto or capacity_due or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
             if wants_usage and at-last_usage>=policy.get('usage_check_seconds',60) and usage_future is None:
                 # A slow provider request must never block the local Stop loop.
                 usage_future=usage_pool.submit(usage_file,args.usage_file) if args.usage_file else usage_pool.submit(codex_usage) if args.client=='codex' else None
@@ -407,6 +426,14 @@ def main():
                         chat_event(rpc,args.project,actor,'Incomplete task closure detected. One recovery run will resume the same task from saved results; no tests or completion are assumed.')
                     elif continue_after_task(finished,batch_run,released):pending_start=True;reroutes=0;incomplete_attempts.pop(finished.get('id'),None)
                     elif changed and reroutes<2:pending_start=True;reroutes+=1
+                capacity_key=(offered_task,selected_model)
+                delay=capacity_retry(error,capacity_attempts.get(capacity_key,0),report) if error and offered_task is not None else None
+                if delay is not None:
+                    capacity_attempts[capacity_key]=capacity_attempts.get(capacity_key,0)+1
+                    capacity_pending=(time.monotonic()+delay,offered_task,selected_model)
+                    chat_event(rpc,args.project,actor,f'Provider capacity error. Same-model retry {capacity_attempts[capacity_key]}/3 in {delay}s; Stop/quota checks still apply.')
+                elif not error:
+                    capacity_attempts.pop(capacity_key,None)
                 child=None
             if running and report['should_stop']:
                 stop_child(child)
@@ -419,11 +446,13 @@ def main():
             pending_auto=pending_auto or report.get('auto_resume',{}).get('requested',False)
             if report['control']['paused'] or report['should_stop'] or report.get('auto_resume',{}).get('status','').startswith(('disabled','cancelled')):
                 pending_auto=False
+            if report['control']['paused'] or report['should_stop']:
+                pending_start=False;checkout_watch=None;checkout_seen=None;capacity_pending=None
             current=report['control']['generation']
             profile_request=report.get('profile_generation',profile_generation)>profile_generation
             recovery_id=report.get('git_recovery_id')
             recovery_pending=recovery_id is not None and recovery_id not in recovery_attempts and not report['should_stop']
-            immediate=(pending_start or profile_request or pending_auto or recovery_pending) and usage_future is None
+            immediate=(pending_start or profile_request or pending_auto or recovery_pending or capacity_due) and usage_future is None
             if not child and usage_future is None and (current>attempted or immediate) and not report['control']['paused']:
                 attempted=current
                 pending_start=False
@@ -435,16 +464,21 @@ def main():
                     chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: Wakeup held: '+report['reason'])
                 else:
                     try:
-                        wanted=pending_recovery or recovery_id
+                        wanted=capacity_pending[1] if capacity_pending else pending_recovery or recovery_id
                         pending_recovery=None
                         offer=rpc.call('worker_launch',dict(project=args.project,actor=actor,action='reserve',client=args.client,**({'id':wanted} if wanted else {})))
                         if recovery_id:recovery_attempts.add(recovery_id)
                     except RuntimeError as error:
+                        capacity_pending=None
                         print('Wakeup preflight unavailable; no model started.',flush=True)
                         chat_event(rpc,args.project,actor,'Wakeup preflight failed; no model started: '+str(error)[:500])
                         time.sleep(2)
                         continue
                     if not offer.get('eligible'):
+                        capacity_pending=None
+                        if offer.get('checkout_recovery'):
+                            checkout_watch=offer['checkout_recovery'].get('files',[])[:100]
+                            checkout_seen=idle_signals.checkout_stamp(folder,checkout_watch)
                         if policy.get('agent_followup_tasks') and offer.get('checkout_recovery'):
                             try:
                                 queued=queue_checkout_recovery(rpc,args.project,actor,offer,checkout_attempts)
@@ -457,9 +491,18 @@ def main():
                         chat_event(rpc,args.project,actor,'Wakeup skipped: '+reason)
                         time.sleep(2)
                         continue
+                    if capacity_pending:
+                        retry_model=offer.get('selection',{}).get('model',report.get('profile_model',managed.get('model','') if managed else ''))
+                        expected_model=capacity_pending[2]
+                        capacity_pending=None
+                        if retry_model!=expected_model:
+                            release_launch(rpc,args.project,actor)
+                            chat_event(rpc,args.project,actor,'Capacity retry cancelled: model selection changed; send Wakeup to authorize the new selection.')
+                            continue
+                    checkout_watch=None;checkout_seen=None
                     prompt=f'Use scrum-work and scrum-resume for project {args.project} in {folder}. Your persistent agent actor is {actor}; reuse it. This human Wakeup authorizes the existing backlog. Claim an eligible task/files (claimed=true) ONLY for '+str(offer.get('code'))+' (id '+str(offer.get('id'))+'). Complete all acceptance, verify, work_finish(close_session=true), exit; the supervisor will continue with the next eligible task. Partial implementation alone is no reason to hand off. Respect Stop/quota/WIP/dependencies/reservations; save unfinished facts only for a real interruption, retain valid checks, never poll models.'
                     if policy.get('agent_followup_tasks'):
-                        prompt+=' The human enabled scoped autonomous follow-up tasks. For a concrete blocker within the authorized outcome, search existing work and use task_plan to create/refine minimal recovery/prerequisite tasks with acceptance criteria and real dependencies. If recovery must reuse partial edits on this branch, keep the same context_group. Do this only when needed, not at every task. Save/release current work before switching; the supervisor selects and claims eligible work. Never invent speculative backlog.'
+                        prompt+=' The human enabled scoped autonomous follow-up tasks. For a concrete blocker within the authorized outcome, search existing work and use task_plan to create/refine minimal recovery/prerequisite tasks with acceptance criteria and real dependencies. If recovery must reuse partial edits on this branch, keep the same context_group. Do this only when needed, not at every task. Save/release current work before switching; the supervisor selects and claims eligible work. Never invent speculative backlog. An unidentified prior planning owner is not by itself an external blocker. For pre-existing documentation obstructing the checkout, inspect provenance and task records; within authorized scope reconcile and deliver only verified documentation under explicit file reservations, or ask a concrete unresolved authorship/content question. Never infer authorship from dirty paths or publish unknown work merely to clear the checkout.'
                     prompt+=' Failed verification is work to diagnose, not by itself an external blocker. Fix scoped code, missing references and render/capture setup in this task; use a changed hypothesis and targeted check, never an unchanged retry loop. Blocked requires a concrete unmet prerequisite or external constraint, with attempted repair and the action needed to resume; a retry count alone is not a blocker. If a session must end while repair remains possible, save continuity and release as TODO instead. Required verification still pending means not Done. Reserve supporting files and Unity .meta sidecars belonging to your outputs; acquired reservations also extend the Git file plan.'
                     if offer.get('batch'):
                         prompt+='\nSequential batch headers (max3; load each scope only as needed): '+json.dumps(offer['batch'],separators=(',',':'))+'. Reuse this context. Work only on the current task; others stay unclaimed/TODO. Complete each using work_finish(use_batch=true,client=\"'+args.client+'\") without close_session. Continue ONLY with the returned next task after a fresh claim; when batch_done/session offline, exit. The server rechecks model/dependencies/locks. Never mark the whole batch In Progress.'
@@ -487,6 +530,7 @@ def main():
                             import git_sync
                             state=git_sync.state(folder)
                             if state:
+                                checkout_watch=state[1][:100];checkout_seen=idle_signals.checkout_stamp(folder,checkout_watch)
                                 issue={'branch':state[0],'head':git_sync._git(folder,'rev-parse','HEAD').stdout.strip(),'files':state[1][:100],'error':started['git_recovery']}
                                 try:
                                     queued=queue_checkout_recovery(rpc,args.project,actor,{'id':offer['id'],'checkout_recovery':issue},checkout_attempts)

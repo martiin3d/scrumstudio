@@ -68,6 +68,34 @@ def discover(client,folder,home=None):
         merge(home/'.claude.json',_json,local)
     return servers,warnings
 
+def plugin_integrations(home=None):
+    """Names-only local inventory; cached packages do not prove installation/auth."""
+    base=Path(os.environ.get('CODEX_HOME',Path(home or Path.home())/'.codex'))
+    plugins={};items={}
+    try:
+        import tomllib
+        plugins=tomllib.loads((base/'config.toml').read_text(encoding='utf-8-sig')).get('plugins',{})
+    except (OSError,ValueError,ImportError):pass
+    for manifest in sorted((base/'plugins/cache').glob('*/*/*/.codex-plugin/plugin.json')):
+        try:
+            root=manifest.parent.parent.resolve();meta=_json(manifest)
+            source=meta.get('mcpServers','./.mcp.json')
+            if isinstance(source,str):
+                path=(root/source).resolve()
+                if not path.is_relative_to(root):continue
+                servers=_json(path).get('mcpServers',{})
+            elif isinstance(source,dict):servers=source
+            else:continue
+            if not isinstance(servers,dict):continue
+            plugin=root.parent.name;marketplace=root.parent.parent.name
+            setting=plugins.get(plugin+'@'+marketplace,{}) if isinstance(plugins,dict) else {}
+            status=('enabled' if setting['enabled'] else 'disabled') if isinstance(setting,dict) and isinstance(setting.get('enabled'),bool) else 'cached; installation unverified'
+            for name in valid_names(list(servers)):
+                items[(plugin,marketplace,name)]={'name':name,'plugin':plugin,'marketplace':marketplace,'status':status}
+        except (OSError,ValueError,TypeError):continue
+    return list(items.values())
+
+
 def listing(folder,home=None):
     saved=load(folder);result={}
     for client in CLIENTS:
@@ -75,6 +103,7 @@ def listing(folder,home=None):
         choice=saved.get(client,{'mode':'inherit','servers':[]})
         names=sorted(set(configured)|set(choice['servers'])|{REQUIRED})
         result[client]={**choice,'warnings':warnings,'servers_available':[{'name':n,'required':n==REQUIRED,'available':n==REQUIRED or n in configured,'enabled':configured.get(n,{}).get('enabled',True)} for n in names]}
+    result['codex']['plugin_integrations']=plugin_integrations(home)
     return result
 
 def save(folder,client,mode,servers):

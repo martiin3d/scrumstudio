@@ -15,6 +15,43 @@ import provider_usage
 import agent_bridge
 
 class BridgeTest(unittest.TestCase):
+    def test_capacity_retry_is_bounded_and_respects_policy(self):
+        allowed={'control':{'paused':False},'should_stop':False}
+        for attempt,expected in enumerate((30,90,180,None)):
+            self.assertEqual(agent_bridge.capacity_retry('serverOverloaded',attempt,allowed),expected)
+        for message in ('authentication failed','usage limit','timeout','permission denied'):
+            self.assertIsNone(agent_bridge.capacity_retry(message,0,allowed))
+        for gate in ({'should_stop':True},{'control':{'paused':True}},{'profile_enabled':False}):
+            self.assertIsNone(agent_bridge.capacity_retry('Selected model is at capacity.',0,gate))
+
+    def test_capacity_failure_retries_same_task_with_backoff_then_stops(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
+            clock=[0];offers=[];rpc=Mock()
+            def call(name,args):
+                if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                if name=='user_register':return {'id':9}
+                if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                if name=='project_settings':return {'usage_check_seconds':300}
+                if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','control':{'generation':0,'paused':False}}
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':52,'code':'MAN-52'}}
+                if name=='worker_launch' and args.get('action')=='reserve':
+                    offers.append((clock[0],args));return {'eligible':True,'id':52,'code':'MAN-52','selection':{'model':'gpt-6.1-sol'}}
+                return {}
+            def sleep(seconds):
+                clock[0]+=seconds
+                if clock[0]>=500:raise KeyboardInterrupt
+            rpc.call.side_effect=call
+            pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={};pool.submit.return_value=future
+            child=Mock();child.poll.return_value=1;child.returncode=1
+            with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge,'command',return_value=['fake']),patch.object(agent_bridge.subprocess,'Popen',return_value=child) as spawn,patch.object(agent_bridge,'run_failure',return_value='serverOverloaded'),patch.object(agent_bridge,'reported_model',return_value='gpt-6.1-sol'),patch.object(agent_bridge.time,'monotonic',side_effect=lambda:clock[0]),patch.object(agent_bridge.time,'sleep',side_effect=sleep):
+                agent_bridge.main()
+            self.assertEqual(spawn.call_count,4)
+            self.assertEqual(len(offers),4)
+            for item in offers[1:]:self.assertEqual(item[1]['id'],52)
+            for earlier,later,delay in zip(offers,offers[1:],(30,90,180)):
+                self.assertGreaterEqual(later[0]-earlier[0],delay)
+
     def test_idle_bridge_uses_few_checkpoints_and_notices_control_marker(self):
         import idle_signals
         for signal_at in (None,6):
@@ -485,3 +522,46 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertIn('leave work unfinished when acceptance is unverified',prompt)
             self.assertFalse(any(c.args[0]=='user_register' for c in rpc.call.call_args_list))
             self.assertTrue(any(c.args[0]=='agent_checkpoint' and c.args[1].get('profile_id')=='a'*32 for c in rpc.call.call_args_list))
+
+
+    def test_checkout_change_retries_preflight_once_without_idle_inference(self):
+        import idle_signals
+        for stopped in (False,True):
+            with self.subTest(stopped=stopped),tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
+                folder=Path(temporary);(folder/'.git').mkdir();(folder/'.git/HEAD').write_text('ref: refs/heads/main')
+                (folder/'.git/index').write_text('old index')
+                clock=[0];offers=[];checkpoints=[];rpc=Mock()
+                def call(name,args):
+                    if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                    if name=='user_register':return {'id':9}
+                    if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                    if name=='project_settings':return {'usage_check_seconds':300}
+                    if name=='agent_checkpoint' and args['action']=='observe':
+                        checkpoints.append(clock[0]);return {'should_stop':stopped and clock[0]>=6,'reason':'Stop' if stopped else '', 'control':{'generation':0,'paused':stopped and clock[0]>=6}}
+                    if name=='worker_launch' and args.get('action')=='reserve':
+                        offers.append(clock[0]);return {'eligible':False,'reason':'Checkout busy','checkout_recovery':{'branch':'main','files':[]}}
+                    return {}
+                def sleep(seconds):
+                    clock[0]+=seconds
+                    if clock[0]==6:(folder/'.git/index').write_text('changed index')
+                    if clock[0]==10:(folder/'unrelated.txt').write_text('not a watched obstruction')
+                    if clock[0]>=120:raise KeyboardInterrupt
+                rpc.call.side_effect=call
+                pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':1};pool.submit.return_value=future
+                with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge.time,'monotonic',side_effect=lambda:clock[0]),patch.object(agent_bridge.time,'sleep',side_effect=sleep),patch.object(agent_bridge.subprocess,'Popen') as spawn:
+                    agent_bridge.main()
+                self.assertEqual(offers,[2] if stopped else [2,6])
+                self.assertLessEqual(len(checkpoints),5)
+                spawn.assert_not_called();pool.submit.assert_called_once()
+
+    def test_checkout_stamp_is_local_bounded_and_understands_worktree_gitdir(self):
+        import idle_signals
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
+            root=Path(temporary);metadata=root/'metadata';metadata.mkdir()
+            (metadata/'HEAD').write_text('ref: refs/heads/main')
+            (root/'.git').write_text('gitdir: metadata')
+            before=idle_signals.checkout_stamp(root,['../outside'])
+            self.assertEqual(before,idle_signals.checkout_stamp(root,['../outside']))
+            (metadata/'index').write_text('updated')
+            self.assertNotEqual(before,idle_signals.checkout_stamp(root,['../outside']))
+            self.assertLessEqual(len(idle_signals.checkout_stamp(root,['file']*200)),104)

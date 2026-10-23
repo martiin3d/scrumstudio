@@ -46,7 +46,7 @@ def safe_path(root, name):
     return path
 
 
-def pause(root, branch, planned, tasks):
+def pause(root, branch, planned, tasks, context_group=''):
     """Caller holds the checkout lock and has excluded live claims/reservations.
 
     Unknown edits and staging are deliberately refused. They need actual ownership
@@ -68,7 +68,7 @@ def pause(root, branch, planned, tasks):
     if sum(path.stat().st_size for path in files.values() if path.exists())>32*1024*1024:return None
     directory=directory/uuid.uuid4().hex;directory.mkdir(parents=True)
     data={'branch':branch,'base':checked(root,'rev-parse','HEAD'),'tasks':tasks,
-          'state':'preparing','files':{},'ref':None}
+          'state':'preparing','files':{},'ref':None,'context_group':context_group}
     for index,(name,path) in enumerate(sorted(files.items())):
         raw=path.read_bytes() if path.exists() else None
         entry={'blob':str(index),'sha256':hashlib.sha256(raw).hexdigest() if raw is not None else None,
@@ -118,7 +118,7 @@ def any_pending(root):
     return any(json.loads(path.read_text())['state']!='restored' for path in directory.glob('*/manifest.json'))
 
 
-def restore(root, branch, task_code=None, allowed=True):
+def restore(root, branch, task_code=None, allowed=True, context_group=''):
     """Restore only once, on the saved branch, before handing work to the model."""
     manifest=folder(root,branch)/'manifest.json'
     if not manifest.exists():return None
@@ -129,7 +129,7 @@ def restore(root, branch, task_code=None, allowed=True):
     key=pointer['directory']
     if len(key)!=32 or any(c not in '0123456789abcdef' for c in key):raise ValueError('Invalid checkpoint location')
     directory=manifest.parent/key;data=json.loads((directory/'manifest.json').read_text())
-    if task_code and task_code not in data['tasks']:
+    if task_code and task_code not in data['tasks'] and not (context_group and context_group==data.get('context_group')):
         raise ValueError('Branch has saved edits for another task; resume its blocked task first')
     if git.state(root)!=(branch,[]):raise ValueError('Cannot restore blocked work into a dirty checkout')
     for name,entry in data['files'].items():

@@ -170,6 +170,8 @@ def git_done(db, project, t, prefix, actor):
         members=[{'id':r['id'],'code':f"{prefix}-{r['number']}",'status':r['status'],'files':json.loads(r['files'])} for r in db.execute('SELECT id,number,status,files FROM tasks WHERE project=? AND context_group=? ORDER BY id',(project,group))]
         group_done=all(m['status'] in ('Done','Cancelled') for m in members)
     task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
+    if git_sync.integrated_completion(settings):
+        task['completion_basis']=git_sync.completion_basis(dict(db.execute('SELECT * FROM tasks WHERE id=?',(t['id'],)).fetchone()))
     dependency_checkpoint=False
     if group and settings.get('git_merge')=='Group' and (settings.get('git_commit')=='Task' or group_done):
         members_done={m['id'] for m in members if m['status']=='Done'}
@@ -345,6 +347,24 @@ def resolve_dependents(db, project, completed, prefix, actor):
         changed.append({'id': row['id'], 'code': code, 'status': status, 'remaining': len(remaining)})
     return changed
 
+def reconcile_checkout_blocks(db, project_row, actor):
+    """Reopen explicitly transient checkout blockers, never certify completion."""
+    import git_sync
+    project=project_row['id'];root=project_row['workspace_root']
+    rows=db.execute("SELECT * FROM tasks WHERE project=? AND category='Git recovery' AND status='Blocked' AND blocked_reason_kind='checkout' AND lock_until<=? AND owner_id=?",(project,time.time(),actor)).fetchall()
+    if not rows or project_row['git_mode']!='Branches' or not root:return
+    if db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchone():return
+    if any(Path(r['path']).is_relative_to(Path(root).resolve()) for r in db.execute('SELECT path FROM file_locks WHERE lock_until>?',(time.time(),))):return
+    current=git_sync.state(root)
+    if not current or current[1]:return
+    done={r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status='Done'",(project,))}
+    for row in rows:
+        if any(dep not in done for dep in json.loads(row['dependencies'])):continue
+        db.execute("UPDATE tasks SET status='TODO',blocked_reason='',blocked_reason_kind='external',updated=? WHERE id=?",(now(),row['id']))
+        telemetry.transition(db,row['id'],'TODO',actor)
+        activity(db,row['id'],actor,'comment','Checkout obstruction no longer present: Git reports a clean working tree on '+current[0]+'. Reopened for verification using saved continuity; acceptance and publication have not been assumed.')
+
+
 def run(action, a):
     import git_sync
     with git_sync.transaction_jobs() as jobs:
@@ -357,6 +377,12 @@ def run(action, a):
     if jobs and isinstance(result,dict):
         pushes=git_sync.flush(run,jobs,result,a.get('project'))
         if pushes:result['git_push']=pushes
+    if action=='task_update' and isinstance(result,dict) and result.get('status')=='Done':
+        task=_run('task_get',{'project':a['project'],'id':result['id']})
+        if task.get('category')=='Git recovery' and task.get('title','').startswith('Resolve Git integration: '):
+            source=task['title'][len('Resolve Git integration: '):].split(' into ',1)[0]
+            try:result['integration_reconciled']=_run('git_reconcile',{'project':a['project'],'actor':a.get('actor'),'capability':git_sync.FINALIZE_TOKEN,'source':source})
+            except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:result['integration_reconciliation_error']=str(error)[:300]
     if action=='agent_checkpoint' and a.get('action')=='offline' and 'run_exit_code' in a and isinstance(result,dict):
         policy=_run('project_settings',{'project':a['project']})
         if policy.get('git_cleanup') and policy.get('workspace_root'):
@@ -520,6 +546,12 @@ def legacy_run(action, a, path=None, locks=None):
             done={r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status='Done'",(project,))}
             rows=db.execute("SELECT id,dependencies,blocked_reason FROM tasks WHERE project=? AND category='Git recovery' AND status='TODO' AND lock_until<=? AND NOT EXISTS (SELECT 1 FROM tasks active WHERE active.project=tasks.project AND active.status='In Progress' AND active.lock_until>?) ORDER BY id",(project,time.time(),time.time())).fetchall()
             return next(({'id':row['id']} for row in rows if not row['blocked_reason'].strip() and all(dep in done for dep in json.loads(row['dependencies']))),None)
+        if action=='git_reconcile':
+            import git_completion
+            return git_completion.reconcile(db,a,project_row,prefix,activity,now,resolve_dependents)
+        if action=='git_finalize':
+            import git_completion
+            return git_completion.finalize(db,a,project_row,prefix,activity,now,resolve_dependents)
         if action=='git_note':  # internal: record a post-transaction git outcome
             activity(db,a['id'],a.get('actor'),'comment',a['text'])
             return {'saved':True}
@@ -770,6 +802,14 @@ def legacy_run(action, a, path=None, locks=None):
             for key in ['title', 'description', 'acceptance_criteria', 'status', 'priority', 'blocked_reason', 'blocked_reason_kind', 'dependencies', 'checklist', 'category', 'files','evidence','cancel_reason']:
                 if key in a:
                     t[key] = a[key]
+            if old['status']=='Blocked' and a.get('status')=='TODO' and actor_user(db,a)['kind']=='human':
+                # Drag/drop omits the reason; the edit form echoes its old value.
+                # Both are an explicit human retry, not a new unresolved blocker.
+                if t['blocked_reason'].strip() and t['blocked_reason'].strip()!=old['blocked_reason'].strip():
+                    raise ValueError('Use Blocked to save a new blocker, or clear it to retry in TODO')
+                t['blocked_reason']=''
+                t['blocked_reason_kind']='external'
+                activity(db,t['id'],a['actor'],'comment','Human requested retry in TODO; previous blocker cleared: '+old['blocked_reason'][:1800])
             if claiming:
                 t['status'] = 'In Progress'
             required(t['title'], 'title', 240)
@@ -778,8 +818,10 @@ def legacy_run(action, a, path=None, locks=None):
                 t['description']=required(a['description'],'description',12000)
             t['acceptance_criteria']=acceptance_criteria(t['acceptance_criteria'],allow_empty='acceptance_criteria' not in a)
             description(t['blocked_reason'])
-            if t['blocked_reason_kind'] not in ('dependency','external'):
-                raise ValueError('blocked_reason_kind must be dependency or external')
+            if t['blocked_reason_kind'] not in ('dependency','external','checkout'):
+                raise ValueError('blocked_reason_kind must be dependency, external or checkout')
+            if t['blocked_reason_kind']=='checkout' and t['category']!='Git recovery':
+                raise ValueError('checkout blockers are limited to Git recovery tasks')
             if t['blocked_reason'].strip() and t['dependencies'] and a.get('blocked_reason')!=old['blocked_reason'] and 'blocked_reason' in a and 'blocked_reason_kind' not in a:
                 raise ValueError('With dependencies, specify blocked_reason_kind=dependency for dependency-only prose or external for a separate constraint; omit prose when task links suffice')
             priority(t['priority'])
@@ -836,6 +878,12 @@ def legacy_run(action, a, path=None, locks=None):
                 for dep in t['dependencies']:
                     if db.execute('SELECT status FROM tasks WHERE id=?', (dep,)).fetchone()['status'] != 'Done':
                         raise ValueError('Finish dependencies before progressing this task')
+            import git_sync
+            completion_requested=t['status']=='Done' and old['status']!='Done'
+            strict_completion=completion_requested and t['category']!='Git recovery' and git_sync.integrated_completion(coord.settings(project_row))
+            if strict_completion:
+                # Persist verification before Git, but do not unblock dependents yet.
+                t['status']='In Review'
             paths=[]
             if claiming:
                 coord.check_capacity(db,project,a['actor'],t['id'])
@@ -890,7 +938,7 @@ def legacy_run(action, a, path=None, locks=None):
                 activity(db, t['id'], a.get('actor'), 'updated', summary)
             if claiming and old['lock_until'] <= time.time():
                 activity(db, t['id'], a['actor'], 'claim', 'Claimed task; status In Progress.')
-            if t['status']=='Done' and old['status']!='Done' and t['evidence'].strip():
+            if completion_requested and t['evidence'].strip():
                 activity(db,t['id'],a['actor'],'verification',t['evidence'].strip())
             if t['status']=='Cancelled' and old['status']!='Cancelled':
                 activity(db,t['id'],a['actor'],'comment','Cancelled: '+t['cancel_reason'])
@@ -901,9 +949,10 @@ def legacy_run(action, a, path=None, locks=None):
             if claiming:
                 result.update(claimed=True,token=token, lock_until=until, owner_id=owner,files_reserved=len(paths))
                 if git:result['git']=git
-            if t['status']=='Done' and old['status']!='Done':
+            if completion_requested:
                 git=git_done(db,project,dict(t,context_group=a.get('context_group',old['context_group'])),prefix,a.get('actor') if a.get('actor') is not None else owner)
                 if git:result['git']=git
+                if strict_completion:result['integration_pending']=True
             return result
         if action=='cli_usage_summary':
             import execution_usage
@@ -976,6 +1025,8 @@ def legacy_run(action, a, path=None, locks=None):
             if a.get('actor') is not None and not coord.parallel_available(db,project,a['actor']):
                 if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
                 return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':project_row['max_parallel_agents']}}
+            if action=='worker_launch':
+                reconcile_checkout_blocks(db,project_row,a['actor'])
             tasks = [context_tools.reminder_hint(db,project,task_dict(r, prefix)) for r in db.execute('SELECT * FROM tasks WHERE project=? ORDER BY priority,id', (project,))]
             done = {t['id'] for t in tasks if t['status'] == 'Done'}
             tasks = [t for t in tasks if not t['locked'] or t['owner_id'] == a.get('actor')]
@@ -1046,9 +1097,9 @@ def legacy_run(action, a, path=None, locks=None):
                         checkout_recovery={'branch':current[0],'files':current[1][:100]}
                         # Mutate only at the supervisor's existing launch boundary,
                         # never during board reads or next_work navigation.
-                        if action=='worker_launch' and settings.get('git_pause_blocked') and any(task_branch(t)!=owned and t['category']!='Git recovery' for t in candidates):
-                            unfinished=[t for t in tasks if task_branch(t)==owned and t['status'] not in ('Done','Cancelled')]
-                            safe=unfinished and all(t['status']=='Blocked' and t['owner_id']==a.get('actor') for t in unfinished)
+                        if action=='worker_launch' and settings.get('git_pause_blocked') and not any(task_branch(t)==owned and t['category']!='Git recovery' for t in candidates) and any(task_branch(t)!=owned and t['category']!='Git recovery' for t in candidates):
+                            unfinished=[t for t in tasks if task_branch(t)==owned and t['status']=='Blocked' and t['owner_id']==a.get('actor')]
+                            safe=bool(unfinished)
                             reserved=any(Path(lock['path']).is_relative_to(Path(project_row['workspace_root']).resolve()) for lock in db.execute('SELECT path FROM file_locks WHERE lock_until>?',(time.time(),)))
                             if safe and not reserved:
                                 import git_paused
@@ -1056,7 +1107,9 @@ def legacy_run(action, a, path=None, locks=None):
                                 for t in unfinished:planned.extend(git_worktrees.files(project_row['workspace_root'],t['files']))
                                 try:
                                     with git_sync.checkout_lock(project_row['workspace_root']):
-                                        paused=git_paused.pause(project_row['workspace_root'],owned,planned,[t['code'] for t in unfinished])
+                                        groups={t.get('context_group','').strip() for t in unfinished}
+                                        group=next(iter(groups)) if len(groups)==1 else ''
+                                        paused=git_paused.pause(project_row['workspace_root'],owned,planned,[t['code'] for t in unfinished],context_group=group)
                                     if paused:
                                         for t in unfinished:activity(db,t['id'],a['actor'],'comment','git: unfinished edits preserved in a private local checkpoint; restored automatically on this branch before resuming. Not merged or pushed.')
                                         owned=None;checkout_recovery=None

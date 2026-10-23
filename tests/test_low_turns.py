@@ -227,7 +227,8 @@ class GitAutomationTest(unittest.TestCase):
     def test_blocked_work_yields_checkout_natively_and_restores_on_claim(self):
         project,folder=self.project();git=self.repo(folder)
         self.enable(project,git_pause_blocked=True,git_push='Never',usage_guard=False)
-        task=run('task_create',dict(project=project,title='Partial',files=['a.py'],**SPEC))['id']
+        task=run('task_create',dict(project=project,title='Partial',files=['a.py'],context_group='shared',**SPEC))['id']
+        run('task_create',dict(project=project,title='Future group member',files=['future.py'],context_group='shared',dependencies=[task],**SPEC))
         other=run('task_create',dict(project=project,title='Other',files=['b.py'],**SPEC))['id']
         claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
         (folder/'a.py').write_text('preserved partial')
@@ -246,6 +247,119 @@ class GitAutomationTest(unittest.TestCase):
         resumed=run('task_claim',dict(project=project,id=task,actor=self.agent))
         self.assertIn('restored_checkpoint',resumed['git'])
         self.assertEqual((folder/'a.py').read_text(),'preserved partial')
+
+    def test_task_merge_finishes_only_after_integration_and_isolates_group_members(self):
+        project,folder=self.project();git=self.repo(folder)
+        self.enable(project,git_merge='Task',git_commit='Group',git_push='Never',usage_guard=False)
+        first=run('task_create',dict(project=project,title='First',files=['a.py'],context_group='shared',**SPEC))['id']
+        second=run('task_create',dict(project=project,title='Second',files=['b.py'],context_group='shared',dependencies=[first],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        branch=claim['git']['branch']
+        self.assertNotEqual(branch,'scrum/shared')
+        (folder/'a.py').write_text('verified first')
+        done=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Verified first'))
+        self.assertEqual(done['completed']['status'],'Done')
+        self.assertEqual(git('show','main:a.py'),'verified first')
+        claim2=run('task_claim',dict(project=project,id=second,actor=self.agent))
+        self.assertNotEqual(claim2['git']['branch'],branch)
+        self.assertEqual((folder/'a.py').read_text(),'verified first')
+
+    def test_task_merge_failure_retains_verification_and_blocks_dependents(self):
+        project,folder=self.project();git=self.repo(folder)
+        self.enable(project,git_merge='Task',git_push='Task',git_remote='missing',usage_guard=False)
+        first=run('task_create',dict(project=project,title='First',files=['a.py'],**SPEC))['id']
+        second=run('task_create',dict(project=project,title='Second',files=['b.py'],dependencies=[first],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        (folder/'a.py').write_text('verified first')
+        done=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Checks passed'))
+        self.assertEqual(done['completed']['status'],'In Review')
+        self.assertTrue(done['completed']['integration_pending'])
+        self.assertEqual(run('task_get',dict(project=project,id=first))['evidence'],'Checks passed')
+        self.assertNotEqual(git('show','main:a.py'),'verified first')
+        with self.assertRaises(ValueError):run('task_claim',dict(project=project,id=second,actor=self.agent))
+        history=run('task_activity',dict(project=project,id=first))['items']
+        self.assertFalse(any('status: Done' in item['text'] for item in history))
+        self.assertIn('recovery_task',done['completed']['git'])
+
+    def test_completed_recovery_finalizes_verified_original_without_reimplementation(self):
+        project,folder=self.project();git=self.repo(folder)
+        self.enable(project,git_merge='Task',git_push='Task',git_remote='missing',usage_guard=False)
+        first=run('task_create',dict(project=project,title='First',files=['a.py'],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        branch=claim['git']['branch'];(folder/'a.py').write_text('verified first')
+        done=run('work_finish',dict(project=project,id=first,actor=self.agent,token=claim['token'],evidence='Checks passed'))
+        recovery=done['completed']['git']['recovery_task']['id']
+        original_commits=git('rev-list','--count',branch)
+        self.enable(project,git_remote='origin',git_push='Never')
+        recovered=run('task_claim',dict(project=project,id=recovery,actor=self.agent))
+        report=_git_sync.merge_completed(folder,run('project_settings',dict(project=project)),branch)
+        self.assertTrue(report['merged'])
+        run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=recovered['token'],evidence='Existing verified outcome integrated'))
+        task=run('task_get',dict(project=project,id=first))
+        self.assertEqual(task['status'],'Done');self.assertEqual(task['evidence'],'Checks passed')
+        self.assertEqual(git('rev-list','--count',branch),original_commits)
+
+    def test_task_resume_refreshes_parent_before_restoring_blocked_edits(self):
+        import git_paused
+        project,folder=self.project();git=self.repo(folder)
+        self.enable(project,git_merge='Task',git_pause_blocked=True,git_push='Never',usage_guard=False)
+        first=run('task_create',dict(project=project,title='Partial',files=['a.py'],context_group='shared',**SPEC))['id']
+        other=run('task_create',dict(project=project,title='Independent',files=['b.py'],context_group='shared',**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        branch=claim['git']['branch'];(folder/'a.py').write_text('saved partial')
+        run('task_update',dict(project=project,id=first,actor=self.agent,token=claim['token'],status='Blocked',blocked_reason='External input',continuity='Continue saved partial'))
+        offered=run('worker_launch',dict(project=project,actor=self.agent,client='codex'))
+        self.assertEqual(offered['id'],other);self.assertTrue(git_paused.pending(folder,branch))
+        claim2=run('task_claim',dict(project=project,id=other,actor=self.agent))
+        self.assertEqual((folder/'a.py').read_text(),'a\n')
+        (folder/'b.py').write_text('new independent outcome')
+        run('work_finish',dict(project=project,id=other,actor=self.agent,token=claim2['token'],evidence='Verified independent outcome'))
+        run('task_update',dict(project=project,id=first,actor=self.human,status='TODO',blocked_reason=''))
+        resumed=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        self.assertEqual(resumed['git']['refreshed_from'],'main')
+        self.assertEqual((folder/'a.py').read_text(),'saved partial')
+        self.assertEqual((folder/'b.py').read_text(),'new independent outcome')
+
+    def test_task_merge_can_complete_verified_work_without_file_changes(self):
+        project,folder=self.project();self.repo(folder)
+        self.enable(project,git_merge='Task',git_push='Never',usage_guard=False)
+        task=run('task_create',dict(project=project,title='Inspection only',**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        done=run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Inspected; no changes needed'))
+        self.assertEqual(done['completed']['status'],'Done')
+        self.assertTrue(done['completed']['git']['merge']['already_integrated'])
+
+    def test_task_branch_policy_change_refuses_dirty_old_work(self):
+        project,folder=self.project();self.repo(folder)
+        self.enable(project,git_merge='Group',usage_guard=False)
+        (folder/'a.py').write_text('preserve existing edits')
+        with self.assertRaisesRegex(ValueError,'reconcile'):
+            self.enable(project,git_merge='Task')
+        self.assertEqual((folder/'a.py').read_text(),'preserve existing edits')
+
+    def test_task_branch_name_survives_task_title_changes(self):
+        settings={'git_merge':'Task','git_branch_prefix':'scrum/'}
+        self.assertEqual(_git_sync.branch_for(settings,{'code':'PRO-7','title':'Old title','context_group':'UI'}),
+                         _git_sync.branch_for(settings,{'code':'PRO-7','title':'New title','context_group':'Different'}))
+
+    def test_migration_preserves_explicit_unverified_task_branch_without_merging(self):
+        project,folder=self.project();git=self.repo(folder)
+        self.enable(project,git_merge='Group',git_push='Never',usage_guard=False)
+        first=run('task_create',dict(project=project,title='Partial',files=['a.py'],context_group='shared',**SPEC))['id']
+        second=run('task_create',dict(project=project,title='Independent',files=['b.py'],context_group='shared',**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=first,actor=self.agent))
+        source=claim['git']['branch'];(folder/'a.py').write_text('unverified old work')
+        git('add','a.py');git('commit','-qm','PRO-1: partial work')
+        run('task_update',dict(project=project,id=first,actor=self.agent,token=claim['token'],status='Blocked',blocked_reason='Needs verification',continuity='Reuse existing commit'))
+        with self.assertRaisesRegex(ValueError,'Integrate or preserve'):self.enable(project,git_merge='Task')
+        git('branch','scrum/pro-1',source)
+        git('config','branch.scrum/pro-1.scrum-parent','main')
+        git('config','branch.scrum/pro-1.scrum-migrated-from',source)
+        self.enable(project,git_merge='Task')
+        claim2=run('task_claim',dict(project=project,id=second,actor=self.agent))
+        self.assertEqual((folder/'a.py').read_text(),'a\n')
+        self.assertEqual(git('show','scrum/pro-1:a.py'),'unverified old work')
+        self.assertEqual(run('task_get',dict(project=project,id=first))['status'],'Blocked')
 
     def test_blocked_checkpoint_setting_is_human_only_and_strict(self):
         project,_=self.project()

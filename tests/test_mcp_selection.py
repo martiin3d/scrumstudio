@@ -20,6 +20,29 @@ class SelectionTest(unittest.TestCase):
         self.home_patch=patch.object(Path,'home',return_value=self.home);self.home_patch.start()
     def tearDown(self):
         self.home_patch.stop();self.env.stop();self.temp.cleanup()
+    def test_plugin_inventory_refresh_is_read_only_and_names_only(self):
+        root=self.home/'.codex/plugins/cache/openai-curated-remote/figma/16.0.0'
+        (root/'.codex-plugin').mkdir(parents=True)
+        (root/'.codex-plugin/plugin.json').write_text(json.dumps({'mcpServers':'./.mcp.json'}))
+        (root/'.mcp.json').write_text(json.dumps({'mcpServers':{'figma':{'url':'secret-url','headers':{'key':'secret-token'}}}}))
+        with patch('subprocess.run',side_effect=AssertionError('No process discovery')):
+            data=selection.listing(self.folder)
+        self.assertEqual(data['codex']['plugin_integrations'][0]['name'],'figma')
+        self.assertIn('unverified',data['codex']['plugin_integrations'][0]['status'])
+        self.assertNotIn('figma',[x['name'] for x in data['codex']['servers_available']])
+        self.assertNotIn('secret',json.dumps(data))
+        config=self.home/'.codex/config.toml'
+        config.write_text(config.read_text()+'\n[plugins."figma@openai-curated-remote"]\nenabled=false\n')
+        self.assertEqual(selection.listing(self.folder)['codex']['plugin_integrations'][0]['status'],'disabled')
+        (root/'.mcp.json').unlink()
+        self.assertEqual(selection.listing(self.folder)['codex']['plugin_integrations'],[])
+
+    def test_plugin_manifest_cannot_read_outside_package(self):
+        root=self.home/'.codex/plugins/cache/market/plugin/1'
+        (root/'.codex-plugin').mkdir(parents=True)
+        (root/'.codex-plugin/plugin.json').write_text(json.dumps({'mcpServers':'../../../../../outside.json'}))
+        self.assertEqual(selection.plugin_integrations(),[])
+
     def test_listing_is_names_only_and_does_not_launch_servers(self):
         with patch('subprocess.run',side_effect=AssertionError('No process discovery')):
             data=selection.listing(self.folder)
