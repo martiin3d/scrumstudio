@@ -374,6 +374,9 @@ def run(action, a):
         if candidate:result['git_recovery_id']=candidate['id']
     import idle_signals
     idle_signals.notify(action,a)
+    if action in ('agent_checkpoint','project_control') and isinstance(result,dict):
+        import metrics_periods
+        metrics_periods.capture(a['project'],action,a,result)
     if jobs and isinstance(result,dict):
         pushes=git_sync.flush(run,jobs,result,a.get('project'))
         if pushes:result['git_push']=pushes

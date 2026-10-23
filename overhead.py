@@ -20,6 +20,9 @@ def connection(project):
     db.execute('CREATE TABLE IF NOT EXISTS calls(tool TEXT PRIMARY KEY,calls INTEGER,errors INTEGER,request_bytes INTEGER,response_bytes INTEGER,elapsed_ms REAL)')
     db.execute('CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,actor INTEGER,started REAL,start_mode TEXT)')
     db.execute('CREATE TABLE IF NOT EXISTS scoped(session TEXT,task INTEGER,tool TEXT,calls INTEGER,errors INTEGER,request_bytes INTEGER,response_bytes INTEGER,elapsed_ms REAL,PRIMARY KEY(session,task,tool))')
+    db.execute('CREATE TABLE IF NOT EXISTS timed_calls(at REAL,session TEXT,task INTEGER,tool TEXT,calls INTEGER,errors INTEGER,request_bytes INTEGER,response_bytes INTEGER,elapsed_ms REAL)')
+    db.execute('CREATE INDEX IF NOT EXISTS timed_calls_at ON timed_calls(at)')
+    db.execute('CREATE INDEX IF NOT EXISTS timed_calls_session ON timed_calls(session)')
     return db
 
 
@@ -50,6 +53,7 @@ def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, ses
                 session=session if row and (actor is None or row['actor']==actor) else ''
                 task=task if type(task) is int and task>0 else 0
                 db.execute('INSERT INTO scoped VALUES(?,?,?,1,?,?,?,?) ON CONFLICT(session,task,tool) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,request_bytes=request_bytes+excluded.request_bytes,response_bytes=response_bytes+excluded.response_bytes,elapsed_ms=elapsed_ms+excluded.elapsed_ms',(session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms))
+                db.execute('INSERT INTO timed_calls VALUES(?,?,?,?,1,?,?,?,?)',(time.time(),session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms))
         finally:
             db.close()
     except (OSError, ValueError, sqlite3.Error):
