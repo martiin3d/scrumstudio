@@ -24,6 +24,16 @@ class OverheadTest(unittest.TestCase):
         self.assertIsNone(result['tokens'])
         self.assertNotIn('arguments', json.dumps(result))
 
+    def test_session_filter_scopes_tasks_and_tools_together(self):
+        one=overhead.start_session(self.p,self.actor,'Light')
+        two=overhead.start_session(self.p,self.actor,'Light')
+        overhead.record(self.p,'task_get',10,20,2,False,session=one,task=101,actor=self.actor)
+        overhead.record(self.p,'task_get',30,40,4,False,session=two,task=202,actor=self.actor)
+        result=overhead.metrics(self.p,filter_session=one)
+        self.assertEqual([t['task'] for t in result['tasks']],[101])
+        self.assertEqual(result['totals']['calls'],1)
+        self.assertEqual(len(overhead.metrics(self.p)['tasks']),2)
+
     def test_explicit_usage_wins(self):
         a = {'project':self.p,'actor':self.actor,'client':'codex','session_used_percent':12,'weekly_used_percent':3}
         self.assertEqual(overhead.cached_usage(a), a)

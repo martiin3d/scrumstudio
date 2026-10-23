@@ -22,7 +22,8 @@ def revision(project,page):
 def refresh(args,call):
     project=args.get('project');page=args.get('page','Board')
     if type(project) is not int or page not in PAGES:raise ValueError('Invalid web project/page')
-    before=revision(project,page)
+    scope=json.dumps([args.get('days',30),args.get('filter_session')],sort_keys=True)
+    before=revision(project,page)+hashlib.sha256(scope.encode()).hexdigest()[:8]
     if args.get('version_seen')==before:return {'changed':False,'version':before}
     if page=='Agents':
         # Agent views need no task descriptions, evidence or note bodies.
@@ -35,7 +36,7 @@ def refresh(args,call):
         if page=='File locks':data['fileLocks']=call('file_locks',{'project':project})
         if page=='Metrics':
             data['metrics']=call('project_metrics',{'project':project,'days':args.get('days',30),'include_series':True})
-            data['coordination']=call('coordination_metrics',{'project':project})
+            data['coordination']=call('coordination_metrics',{'project':project,**({'filter_session':args['filter_session']} if args.get('filter_session') else {})})
     # Never mark a concurrent mutation as seen with older data.
-    after=revision(project,page)
+    after=revision(project,page)+hashlib.sha256(scope.encode()).hexdigest()[:8]
     return {'changed':True,'version':before if before==after else '', 'data':data}

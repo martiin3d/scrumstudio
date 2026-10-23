@@ -25,6 +25,20 @@ class TelemetryTest(unittest.TestCase):
         human=run('user_register',{'identity':'human:timing','name':'Human','kind':'human'})['id']
         run('project_settings',{'project':self.p,'actor':human,'workspace_root':str(Path(self.temp.name).resolve())})
 
+    def test_worked_tasks_exclude_idle_terminal_state(self):
+        from contextlib import closing
+        import store
+        active=self.task();idle=self.task()
+        with closing(store.connect()) as db:
+            db.execute('DELETE FROM task_states WHERE task IN (?,?)',(active,idle))
+            db.execute('DELETE FROM task_activity WHERE task IN (?,?)',(active,idle))
+            db.execute("INSERT INTO task_states(task,status,entered,exited,source) VALUES(?, 'In Progress', ?, ?, 'transition')",(active,BASE-100,BASE+100))
+            db.execute("INSERT INTO task_states(task,status,entered,exited,source) VALUES(?, 'Done', ?, NULL, 'transition')",(idle,BASE-1000000))
+            db.commit()
+            result=telemetry.metrics(db,self.p,days=1,at=BASE)
+        self.assertIn(active,result['worked_task_ids'])
+        self.assertNotIn(idle,result['worked_task_ids'])
+
     def tearDown(self):
         if self.previous is None:
             os.environ.pop('SCRUM_DB',None)

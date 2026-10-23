@@ -34,6 +34,16 @@ class IdleRefreshTest(unittest.TestCase):
         with patch('web_refresh.time.time',return_value=241):
             self.assertTrue(web_refresh.refresh({'project':p,'page':'Agents','version_seen':first['version']},run)['changed'])
 
+    def test_metrics_session_filter_is_forwarded_and_invalidates_view(self):
+        p,_=self.project()
+        with patch('web_refresh.time.time',return_value=1700000180):
+            first=web_refresh.refresh({'project':p,'page':'Metrics'},run)
+            spy=Mock(wraps=run)
+            selected=web_refresh.refresh({'project':p,'page':'Metrics','filter_session':'selected','version_seen':first['version']},spy)
+            self.assertTrue(selected['changed'])
+            spy.assert_any_call('coordination_metrics',{'project':p,'filter_session':'selected'})
+            self.assertEqual(selected['data']['coordination']['totals']['calls'],0)
+
     def test_control_signal_is_only_updated_by_control_mutations(self):
         p,folder=self.project();before=idle_signals.stamp(folder)
         run('project_settings',{'project':p})

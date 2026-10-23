@@ -109,6 +109,11 @@ def metrics(db, project, days=30, include_series=False, at=None):
             'state_samples':{s:len(state_tasks[s]) for s in STATUSES},
             'blocked_time_percent':round(100*state_seconds['Blocked']/nonterminal,2) if nonterminal else 0,
             'legacy_tasks':legacy,'basis':'Calendar time. Distribution is current; flow and observed state time use selected UTC dates. Legacy histories are partial and excluded from lead/cycle averages. Done transitions count re-completions.'}
+    # Work means recorded active-state overlap or an authored activity event,
+    # never merely a task waiting in TODO/Blocked/Done during the window.
+    worked={r['task'] for r in rows if r['status']=='In Progress' and r['entered']<=at and (r['exited'] is None or r['exited']>=start)}
+    worked.update(r[0] for r in db.execute('SELECT DISTINCT a.task FROM task_activity a JOIN tasks t ON t.id=a.task WHERE t.project=? AND julianday(a.created)>=julianday(?) AND julianday(a.created)<=julianday(?)',(project,result['from_utc'],result['as_of_utc'])))
+    result['worked_task_ids']=sorted(worked)
     if include_series:
         buckets={(today-timedelta(days=n)).date().isoformat():{'done':0,'cancelled':0} for n in reversed(range(days))}
         for status,events in [('done',done_events),('cancelled',cancelled_events)]:

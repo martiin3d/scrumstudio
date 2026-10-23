@@ -72,6 +72,7 @@ def metrics(project, filter_session=None, task=None):
                 if type(task) is not int or task<1:raise ValueError('Invalid task id')
                 where.append('c.task=?');values.append(task)
             rows=[dict(r) for r in db.execute('SELECT c.tool,'+sums+' FROM scoped c WHERE '+' AND '.join(where)+' GROUP BY c.tool ORDER BY calls DESC',values)]
+            tasks=[dict(r) for r in db.execute('SELECT c.task,'+sums+' FROM scoped c WHERE c.task>0 AND '+' AND '.join(where)+' GROUP BY c.task ORDER BY calls DESC,c.task LIMIT 50',values)]
     finally:
         db.close()
     totals = {key: sum(r[key] for r in rows) for key in ('calls','errors','request_bytes','response_bytes','elapsed_ms')}
