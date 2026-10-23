@@ -10,7 +10,7 @@ PAGES=('Board','Agents','Notes','Users','File locks','Metrics','AI workflow')
 def revision(project,page):
     _,folder=storage.entry(project)
     local=folder/'.scrum/local'
-    files=[local/name for name in ('scrum.db','scrum.db-wal','locks.db','locks.db-wal','agent-profiles.db','agent-profiles.db-wal')]
+    files=[local/name for name in ('scrum.db','scrum.db-wal','locks.db','locks.db-wal','agent-profiles.db','agent-profiles.db-wal','overhead.db','overhead.db-wal')]
     files.extend([storage.registry_path().parent/'identities.db',storage.registry_path().parent/'identities.db-wal'])
     # Expired leases/telemetry change the displayed truth even without writes.
     value=[project,page,int(time.time()//60)]
@@ -22,7 +22,7 @@ def revision(project,page):
 def refresh(args,call):
     project=args.get('project');page=args.get('page','Board')
     if type(project) is not int or page not in PAGES:raise ValueError('Invalid web project/page')
-    scope=json.dumps([args.get('days',30),args.get('filter_session')],sort_keys=True)
+    scope=json.dumps([args.get('days',30),args.get('filter_session'),args.get('filter_period')],sort_keys=True)
     before=revision(project,page)+hashlib.sha256(scope.encode()).hexdigest()[:8]
     if args.get('version_seen')==before:return {'changed':False,'version':before}
     if page=='Agents':
@@ -35,8 +35,9 @@ def refresh(args,call):
             data['taskGroups']=context_batches.browser_groups(project,[t['id'] for t in data['tasks']])
         if page=='File locks':data['fileLocks']=call('file_locks',{'project':project})
         if page=='Metrics':
-            data['metrics']=call('project_metrics',{'project':project,'days':args.get('days',30),'include_series':True})
-            data['coordination']=call('coordination_metrics',{'project':project,**({'filter_session':args['filter_session']} if args.get('filter_session') else {})})
+            selected={'filter_period':args['filter_period']} if args.get('filter_period') else {}
+            data['metrics']=call('project_metrics',{'project':project,'days':args.get('days',30),'include_series':True,**selected})
+            data['coordination']=call('coordination_metrics',{'project':project,'include_periods':True,**({'filter_session':args['filter_session']} if args.get('filter_session') else {}),**selected,'start_at':data['metrics']['start_at'],'end_at':data['metrics']['end_at']})
     # Never mark a concurrent mutation as seen with older data.
     after=revision(project,page)+hashlib.sha256(scope.encode()).hexdigest()[:8]
     return {'changed':True,'version':before if before==after else '', 'data':data}

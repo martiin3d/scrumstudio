@@ -22,6 +22,7 @@ class OverheadTest(unittest.TestCase):
         self.assertEqual(result['totals']['errors'], 1)
         self.assertGreater(result['totals']['response_bytes'], 0)
         self.assertIsNone(result['tokens'])
+        self.assertNotIn('periods',result)
         self.assertNotIn('arguments', json.dumps(result))
 
     def test_session_filter_scopes_tasks_and_tools_together(self):
@@ -33,6 +34,21 @@ class OverheadTest(unittest.TestCase):
         self.assertEqual([t['task'] for t in result['tasks']],[101])
         self.assertEqual(result['totals']['calls'],1)
         self.assertEqual(len(overhead.metrics(self.p)['tasks']),2)
+
+    def test_interval_filters_counts_and_tasks_without_guessing_old_totals(self):
+        one=overhead.start_session(self.p,self.actor,'Light')
+        with patch('overhead.time.time',return_value=1000):
+            overhead.record(self.p,'task_get',10,20,2,False,session=one,task=101)
+        with patch('overhead.time.time',return_value=2000):
+            overhead.record(self.p,'task_get',30,40,4,False,session=one,task=202)
+        first=overhead.metrics(self.p,start_at=900,end_at=1100)
+        second=overhead.metrics(self.p,start_at=1900,end_at=2100)
+        self.assertEqual(first['totals']['response_bytes'],20)
+        self.assertEqual(second['totals']['response_bytes'],40)
+        self.assertEqual([t['task'] for t in first['tasks']],[101])
+        self.assertEqual([t['task'] for t in second['tasks']],[202])
+        self.assertEqual(first['timed_from'],1000)
+        with self.assertRaises(ValueError):overhead.metrics(self.p,start_at=1100,end_at=900)
 
     def test_explicit_usage_wins(self):
         a = {'project':self.p,'actor':self.actor,'client':'codex','session_used_percent':12,'weekly_used_percent':3}

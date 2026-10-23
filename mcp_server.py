@@ -76,7 +76,8 @@ for _name,_description,_schema in TOOLS:
     if _name=='project_settings':_schema['properties'].update(agent_followup_tasks=B,max_parallel_agents=I,agent_approval_mode={'type':'string','enum':['Auto review','Ask in chat','Full access']})
     if _name=='note_add':_schema['properties'].update(task=I,audience={'type':'string','enum':['human','agent']})
     if _name=='task_get':_schema['properties'].update(full=B,include_notes=B,notes_content=B,notes_after=I,notes_limit=I,notes_audience={'type':'string','enum':['agent','human','all']})
-    if _name=='coordination_metrics':_schema['properties']['include_cli_usage']=B
+    if _name=='coordination_metrics':_schema['properties'].update(include_cli_usage=B,include_periods=B)
+    if _name in ('project_metrics','coordination_metrics'):_schema['properties'].update(filter_period=S,start_at=N,end_at=N)
     if _name=='agent_checkpoint':
         _schema['properties'].update(run_exit_code=I,run_error=S)
         _counts={key:{'type':['integer','null'],'minimum':0,'maximum':10**15} for key in ('input_tokens','output_tokens','cached_input_tokens','cache_write_input_tokens','reasoning_output_tokens')}

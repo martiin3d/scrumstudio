@@ -60,7 +60,7 @@ def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, ses
         pass # Measurement failure must never change a committed operation.
 
 
-def metrics(project, filter_session=None, task=None):
+def metrics(project, filter_session=None, task=None, start_at=None, end_at=None):
     db = connection(project)
     try:
         rows = [dict(r) for r in db.execute('SELECT * FROM calls ORDER BY calls DESC,tool')]
@@ -77,10 +77,20 @@ def metrics(project, filter_session=None, task=None):
                 where.append('c.task=?');values.append(task)
             rows=[dict(r) for r in db.execute('SELECT c.tool,'+sums+' FROM scoped c WHERE '+' AND '.join(where)+' GROUP BY c.tool ORDER BY calls DESC',values)]
             tasks=[dict(r) for r in db.execute('SELECT c.task,'+sums+' FROM scoped c WHERE c.task>0 AND '+' AND '.join(where)+' GROUP BY c.task ORDER BY calls DESC,c.task LIMIT 50',values)]
+        coverage=db.execute('SELECT MIN(at) FROM timed_calls').fetchone()[0]
+        if start_at is not None or end_at is not None:
+            import math
+            if any(type(v) not in (int,float) or not math.isfinite(v) for v in (start_at,end_at)) or not 0<=start_at<=end_at:
+                raise ValueError('Use valid start_at/end_at timestamps')
+            where=['c.at>=?','c.at<=?'];values=[start_at,end_at]
+            if filter_session is not None:where.append('c.session=?');values.append(filter_session)
+            if task is not None:where.append('c.task=?');values.append(task)
+            rows=[dict(r) for r in db.execute('SELECT c.tool,'+sums+' FROM timed_calls c WHERE '+' AND '.join(where)+' GROUP BY c.tool ORDER BY calls DESC',values)]
+            tasks=[dict(r) for r in db.execute('SELECT c.task,'+sums+' FROM timed_calls c WHERE c.task>0 AND '+' AND '.join(where)+' GROUP BY c.task ORDER BY calls DESC,c.task LIMIT 50',values)]
     finally:
         db.close()
     totals = {key: sum(r[key] for r in rows) for key in ('calls','errors','request_bytes','response_bytes','elapsed_ms')}
-    return {'scope': 'Local MCP calls since instrumentation; excludes web calls and model execution', 'totals': totals, 'tools': rows,'sessions':sessions,'tasks':tasks,'session_limit':20,'task_limit':50, 'tokens': None, 'note': 'Bytes are UTF-8 JSON, not tokens. Server time excludes model time. Sessions use explicit measurement_session; untagged calls remain unattributed. start_mode is initial eligibility, not a claim that the entire session used that mode. Compare equivalent work before claiming savings.'}
+    return {'scope': 'Local MCP calls since instrumentation; excludes web calls and model execution', 'totals': totals, 'tools': rows,'sessions':sessions,'tasks':tasks,'session_limit':20,'task_limit':50, 'tokens': None, 'timed_from':coverage, 'interval_filtered':start_at is not None, 'note': 'Bytes are UTF-8 JSON, not tokens. Server time excludes model time. Sessions use explicit measurement_session; untagged calls remain unattributed. start_mode is initial eligibility, not a claim that the entire session used that mode. Compare equivalent work before claiming savings.'}
 
 
 def usage_path(project, actor, client):

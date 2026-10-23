@@ -462,3 +462,7 @@ Per-task delivery (`git_merge=Task`) runs entirely in local code. Enable `git_pa
 Git completion persists scoped file fingerprints before commit, so successful recovery can finalize the verified original even if its initial commit failed. Publication-note edits do not invalidate unchanged acceptance/source. An explicit retry of an already integrated outcome verifies its recorded source and target without checking out or staging another task's files. Redundant folder markers are ignored only alongside concrete child paths; folders are never expanded into implicit commit scope.
 
 Managed workers retry explicit provider capacity errors with the same model up to three times (30/90/180 seconds). Local waiting invokes no model; retries recheck Stop, quota and task eligibility, preserve continuity, and stop if the selected model changes. Other CLI failures are not automatically retried by this policy.
+
+### Metrics work periods
+
+Metrics → By session distinguishes observed provider five-hour quota windows, Wakeup campaigns (including automatic continuations until the next human Wakeup), and internal MCP runs. The chosen interval applies to completion flow, observed state durations, task activity and timestamped coordination measurements. Current board counts remain in a separate explicitly unfiltered panel. Provider windows reuse existing reset telemetry; historical unrecorded windows and older aggregate MCP counts cannot be reconstructed. This is local bookkeeping and querying only: no additional model, agent or provider requests.

@@ -419,9 +419,18 @@ def _run(action, a):
     if action=='agent_checkpoint' and a.get('profile_id'):
         import managed_agents
         return managed_agents.checkpoint(a,run)
+    if action in ('project_metrics','coordination_metrics') and a.get('filter_period'):
+        import metrics_periods
+        period=metrics_periods.resolve(a['project'],a['filter_period'])
+        if period['kind']=='mcp' and period.get('ended') is None:
+            raise ValueError('Legacy MCP run has no recorded end; choose a quota window or Wakeup period')
+        a=dict(a,start_at=period['start_at'],end_at=period['end_at'])
+        if action=='coordination_metrics' and period['kind']=='mcp':a['filter_session']=period['id']
     if action == 'coordination_metrics':
         import overhead
-        result=overhead.metrics(a['project'],a.get('filter_session'),a.get('task'))
+        result=overhead.metrics(a['project'],a.get('filter_session'),a.get('task'),a.get('start_at'),a.get('end_at'))
+        import metrics_periods
+        if a.get('include_periods'):result['periods']=metrics_periods.catalog(a['project'])
         if a.get('include_cli_usage'):
             result['cli_usage']=run('cli_usage_summary',{'project':a['project']})
         return result
@@ -544,7 +553,7 @@ def legacy_run(action, a, path=None, locks=None):
         if action in ['project_settings','file_locks','session_resume']:
             return coord.operation(db,action,a,project_row,actor_user,activity,now)
         if action=='project_metrics':
-            return telemetry.metrics(db,project,a.get('days',30),a.get('include_series',False))
+            return telemetry.metrics(db,project,a.get('days',30),a.get('include_series',False),start_at=a.get('start_at'),end_at=a.get('end_at'))
         if action=='git_recovery_next':
             done={r['id'] for r in db.execute("SELECT id FROM tasks WHERE project=? AND status='Done'",(project,))}
             rows=db.execute("SELECT id,dependencies,blocked_reason FROM tasks WHERE project=? AND category='Git recovery' AND status='TODO' AND lock_until<=? AND NOT EXISTS (SELECT 1 FROM tasks active WHERE active.project=tasks.project AND active.status='In Progress' AND active.lock_until>?) ORDER BY id",(project,time.time(),time.time())).fetchall()

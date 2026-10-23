@@ -41,8 +41,20 @@ class IdleRefreshTest(unittest.TestCase):
             spy=Mock(wraps=run)
             selected=web_refresh.refresh({'project':p,'page':'Metrics','filter_session':'selected','version_seen':first['version']},spy)
             self.assertTrue(selected['changed'])
-            spy.assert_any_call('coordination_metrics',{'project':p,'filter_session':'selected'})
+            spy.assert_any_call('coordination_metrics',{'project':p,'include_periods':True,'filter_session':'selected','start_at':selected['data']['metrics']['start_at'],'end_at':selected['data']['metrics']['end_at']})
             self.assertEqual(selected['data']['coordination']['totals']['calls'],0)
+
+    def test_work_period_bounds_reach_both_metrics_calls(self):
+        import metrics_periods
+        p,_=self.project();now=1700000180
+        with patch('web_refresh.time.time',return_value=now):
+            metrics_periods.capture(p,'project_control',{}, {'control':{'generation':1,'changed':now-500,'paused':0}})
+            spy=Mock(wraps=run)
+            result=web_refresh.refresh({'project':p,'page':'Metrics','filter_period':'wakeup:1'},spy)
+            self.assertEqual(result['data']['metrics']['start_at'],now-500)
+            self.assertEqual(result['data']['metrics']['end_at'],now)
+            self.assertTrue(result['data']['coordination']['interval_filtered'])
+            spy.assert_any_call('project_metrics',{'project':p,'days':30,'include_series':True,'filter_period':'wakeup:1'})
 
     def test_control_signal_is_only_updated_by_control_mutations(self):
         p,folder=self.project();before=idle_signals.stamp(folder)

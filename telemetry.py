@@ -54,13 +54,20 @@ def timing(db, task, history=False, before=None, limit=20, at=None):
     return result
 
 
-def metrics(db, project, days=30, include_series=False, at=None):
+def metrics(db, project, days=30, include_series=False, at=None, start_at=None, end_at=None):
     if type(days) is not int or not 1<=days<=365 or type(include_series) is not bool:
         raise ValueError('days must be 1..365; include_series must be boolean')
     at=time.time() if at is None else at
     # Display complete UTC date buckets, including today.
     today=datetime.fromtimestamp(at,timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0)
     start=(today-timedelta(days=days-1)).timestamp()
+    if start_at is not None or end_at is not None:
+        import math
+        if any(type(v) not in (int,float) or not math.isfinite(v) for v in (start_at,end_at)) or not 0<=start_at<=end_at or end_at-start_at>366*86400:
+            raise ValueError('Use valid start_at/end_at timestamps spanning at most 366 days')
+        start=start_at;at=min(at,end_at)
+        today=datetime.fromtimestamp(at,timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0)
+        days=max(1,(today-datetime.fromtimestamp(start,timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0)).days+1)
     tasks=db.execute('SELECT id,status,owner_id,lock_until FROM tasks WHERE project=?',(project,)).fetchall()
     rows=db.execute('SELECT s.* FROM task_states s JOIN tasks t ON t.id=s.task WHERE t.project=? ORDER BY s.task,s.id',(project,)).fetchall()
     distribution={s:0 for s in STATUSES}
@@ -97,7 +104,7 @@ def metrics(db, project, days=30, include_series=False, at=None):
         if began is not None:
             cycle.append(max(0,last-began))
     nonterminal=sum(state_seconds[s] for s in STATUSES if s not in ['Done','Cancelled'])
-    result={'days':days,'from_utc':datetime.fromtimestamp(start,timezone.utc).isoformat(),'as_of_utc':datetime.fromtimestamp(at,timezone.utc).isoformat(),
+    result={'days':days,'start_at':start,'end_at':at,'from_utc':datetime.fromtimestamp(start,timezone.utc).isoformat(),'as_of_utc':datetime.fromtimestamp(at,timezone.utc).isoformat(),
             'total_tasks':len(tasks),'distribution':distribution,
             'open_tasks':sum(distribution[s] for s in STATUSES if s not in ['Done','Cancelled']),
             'done_transitions':len(done_events),'completed_tasks':len({r['task'] for r in done_events}),
@@ -114,6 +121,14 @@ def metrics(db, project, days=30, include_series=False, at=None):
     worked={r['task'] for r in rows if r['status']=='In Progress' and r['entered']<=at and (r['exited'] is None or r['exited']>=start)}
     worked.update(r[0] for r in db.execute('SELECT DISTINCT a.task FROM task_activity a JOIN tasks t ON t.id=a.task WHERE t.project=? AND julianday(a.created)>=julianday(?) AND julianday(a.created)<=julianday(?)',(project,result['from_utc'],result['as_of_utc'])))
     result['worked_task_ids']=sorted(worked)
+    period_distribution={s:0 for s in STATUSES}
+    for task in worked:
+        visits=[r for r in by_task.get(task,[]) if r['entered']<=at]
+        if visits:period_distribution[visits[-1]['status']]+=1
+    result['period_distribution']=period_distribution
+    result['worked_tasks']=len(worked)
+    result['interval_filtered']=start_at is not None
+
     if include_series:
         buckets={(today-timedelta(days=n)).date().isoformat():{'done':0,'cancelled':0} for n in reversed(range(days))}
         for status,events in [('done',done_events),('cancelled',cancelled_events)]:

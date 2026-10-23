@@ -39,6 +39,28 @@ class TelemetryTest(unittest.TestCase):
         self.assertIn(active,result['worked_task_ids'])
         self.assertNotIn(idle,result['worked_task_ids'])
 
+    def test_exact_work_interval_changes_flow_durations_tasks_and_period_status(self):
+        import store
+        first=self.task();second=self.task()
+        with closing(store.connect()) as db:
+            db.execute('DELETE FROM task_states WHERE task IN (?,?)',(first,second))
+            db.execute('DELETE FROM task_activity WHERE task IN (?,?)',(first,second))
+            for task,begin,done in [(first,BASE,BASE+10),(second,BASE+20,BASE+50)]:
+                db.execute("INSERT INTO task_states(task,status,entered,exited,source) VALUES(?,'In Progress',?,?,'transition')",(task,begin,done))
+                db.execute("INSERT INTO task_states(task,status,entered,exited,source) VALUES(?,'Done',?,NULL,'transition')",(task,done))
+            db.commit()
+            a=telemetry.metrics(db,self.p,include_series=True,at=BASE+100,start_at=BASE,end_at=BASE+15)
+            b=telemetry.metrics(db,self.p,include_series=True,at=BASE+100,start_at=BASE+20,end_at=BASE+40)
+        self.assertEqual(a['completed_tasks'],1);self.assertEqual(b['completed_tasks'],0)
+        self.assertEqual(a['average_cycle_seconds'],10)
+        self.assertEqual(a['state_seconds_in_window']['In Progress'],10)
+        self.assertEqual(b['state_seconds_in_window']['In Progress'],20)
+        self.assertEqual(a['worked_task_ids'],[first]);self.assertEqual(b['worked_task_ids'],[second])
+        self.assertEqual(a['period_distribution']['Done'],1)
+        self.assertEqual(b['period_distribution']['In Progress'],1)
+        self.assertEqual(sum(d['done'] for d in a['daily']),1)
+        self.assertEqual(sum(d['done'] for d in b['daily']),0)
+
     def tearDown(self):
         if self.previous is None:
             os.environ.pop('SCRUM_DB',None)
