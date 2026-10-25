@@ -11,6 +11,9 @@ class PolicyTest(unittest.TestCase):
     def test_defaults_permissions_and_validation(self):
         project,_=self.project()
         current=run('project_settings',{'project':project})
+        self.assertEqual(current['execution_instructions'],'')
+        with self.assertRaises(ValueError):run('project_settings',dict(project=project,actor=self.agent,execution_instructions='Override project policy'))
+        with self.assertRaises(ValueError):run('project_settings',dict(project=project,actor=self.human,execution_instructions='x'*4001))
         self.assertEqual((current['task_sizing'],current['session_stop_percent'],current['weekly_stop_percent']),('Small',92,94))
         self.assertEqual(current['agent_approval_mode'],'Auto review')
         self.assertFalse(current['agent_followup_tasks'])
@@ -32,15 +35,18 @@ class PolicyTest(unittest.TestCase):
 
     def test_snapshot_new_policy_and_old_defaults(self):
         project,path=self.project()
-        run('project_settings',{'project':project,'actor':self.human,'task_sizing':'Balanced','session_stop_percent':88,'agent_followup_tasks':True})
+        run('project_settings',{'project':project,'actor':self.human,'task_sizing':'Balanced','session_stop_percent':88,'agent_followup_tasks':True,'autonomy_mode':'Autonomous'})
         run('project_export',{'project':project})
         file=path/'.scrum/snapshot.json'
         data=json.loads(file.read_text())
         self.assertEqual(data['settings']['session_stop_percent'],88)
+        self.assertEqual(data['settings']['autonomy_mode'],'Autonomous')
         run('project_restore',{'project':project,'confirm':True})
         self.assertTrue(run('project_settings',{'project':project})['agent_followup_tasks'])
+        self.assertEqual(run('project_settings',{'project':project})['autonomy_mode'],'Autonomous')
         data['settings']={key:data['settings'][key] for key in ['max_active_per_agent','require_evidence']}
         file.write_text(json.dumps(data))
         run('project_restore',{'project':project,'confirm':True})
         self.assertEqual(run('project_settings',{'project':project})['task_sizing'],'Small')
         self.assertFalse(run('project_settings',{'project':project})['agent_followup_tasks'])
+        self.assertEqual(run('project_settings',{'project':project})['autonomy_mode'],'Standard')

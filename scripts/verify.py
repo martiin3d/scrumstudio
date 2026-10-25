@@ -1,5 +1,6 @@
 """Plan proportional checks; --run executes the selected checks once."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -12,10 +13,29 @@ import time
 
 ROOT=Path(__file__).resolve().parents[1]
 TARGETS={
+    'agent_interactions.py':['test_interactions.py','test_autonomy.py'],
+    'scripts/visual_compare.py':['test_visual_compare.py'],
+    'file_plan_repair.py':['test_file_plan_repair.py'],
+    'scrum_cli.py':['test_scrum_cli.py','test_scrum_cli_git.py'],
+    'coordination_api.py':['test_mcp_protocol.py','test_scrum_cli.py'],
+    'git_index.py':['test_git_fingerprints.py','test_git_native_recovery.py'],
+    'git_completion.py':['test_git_fingerprints.py','test_git_completion_recovery.py','test_git_ignored_evidence.py','test_file_plan_capacity.py'],
+    'git_sync.py':['test_git_fingerprints.py','test_git_native_recovery.py','test_git_completion_recovery.py','test_git_paused.py'],
     'workflow.py':['test_workflow.py','test_efficiency.py'],
-    'context_tools.py':['test_context_tools.py','test_efficiency.py'],
     'overhead.py':['test_overhead.py','test_efficiency.py'],
     'telemetry.py':['test_telemetry.py'],
+    'scheduling.py':['test_scheduling.py','test_batches.py'],
+    'usage_audit.py':['test_usage_audit.py','test_execution_usage.py'],
+    'execution_usage.py':['test_execution_usage.py','test_usage_audit.py'],
+    'usage_measurement.py':['test_usage_measurement.py','test_usage_audit.py'],
+    'worker_catalog.py':['test_bridge.py','test_usage_measurement.py'],
+    'context_batches.py':['test_batches.py','test_scheduling.py','test_workflow.py'],
+    'scripts/measure_usage.py':['test_usage_measurement.py'],
+    'run_cost.py':['test_run_cost.py','test_bridge.py','test_usage_audit.py'],
+    'scripts/work_checks.py':['test_work_checks.py'],
+    'context_tools.py':['test_context_tools.py','test_efficiency.py','test_workflow.py'],
+    'scripts/unity_verify.py':['test_unity_verify.py'],
+    'scripts/verification_receipts.py':['test_unity_verify.py'],
     'scripts/setup.py':['test_setup.py'],
     'scripts/agent_bridge.py':['test_bridge.py'],
     'scripts/provider_usage.py':['test_bridge.py','test_overhead.py'],
@@ -84,6 +104,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--files',nargs='+',required=True)
     parser.add_argument('--run',action='store_true')
+    parser.add_argument('--verbose',action='store_true',help='Stream unittest details instead of the default local report and compact result')
     parser.add_argument('--reuse',action='store_true',help='Reuse an actual prior pass only for identical sources, runtime and checks; report its original time')
     args=parser.parse_args();selected=plan(args.files)
     print(json.dumps(selected),flush=True)
@@ -93,20 +114,38 @@ def main():
     cache=ROOT/'data'/'verification-cache'/('check-'+hashlib.sha256(json.dumps([selected['tests'],selected['node_syntax']]).encode()).hexdigest()[:20]+'.json')
     cached=read_cached(cache,key) if args.reuse and source else None
     if cached:
-        print(json.dumps({'reused':True,'original_verified_at':cached['verified_at'],'source':source,'checks':selected['tests'],'node_syntax':selected['node_syntax']}),flush=True)
+        import verification_receipts as receipts
+        receipts.event(ROOT,key,{'passed':True,'kind':'passed','reused':True},0)
+        print(json.dumps({'reused':True,'original_verified_at':cached['verified_at'],'source':source,'checks':selected['tests'],'node_syntax':selected['node_syntax'],'evidence':'Reused prior passing checks for identical source tree, runtime and selected tests; original timestamp retained.'}),flush=True)
         return
     os.chdir(ROOT);sys.path.insert(0,str(ROOT/'tests'));sys.path.insert(0,str(ROOT))
     suite=unittest.TestSuite()
     for pattern in selected['tests']:
         suite.addTests(unittest.defaultTestLoader.discover(str(ROOT/'tests'),pattern=pattern))
-    passed=True
+    passed=True;executed=0;started=time.monotonic()
     if selected['tests']:
-        passed=unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()
+        report=ROOT/'data/verification-reports'/('checks-'+str(time.time_ns())+'.log')
+        report.parent.mkdir(parents=True,exist_ok=True)
+        with report.open('w',encoding='utf-8') as stream:
+            if args.verbose:
+                result=unittest.TextTestRunner(stream=sys.stderr,verbosity=1).run(suite)
+            else:
+                with contextlib.redirect_stdout(stream),contextlib.redirect_stderr(stream):
+                    result=unittest.TextTestRunner(stream=stream,verbosity=1).run(suite)
+        if not args.verbose:
+            detail=report.read_text(encoding='utf-8')
+            print(json.dumps({'report':str(report),'executed':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),**({'failure_excerpt':detail[-8000:]} if not result.wasSuccessful() else {})}),flush=True)
+        executed=result.testsRun
+        passed=result.wasSuccessful() and executed>0
     if selected['node_syntax']:
         passed=subprocess.run(['node','--check','public/app.js'],check=False).returncode==0 and passed
     if passed and source and (selected['tests'] or selected['node_syntax']) and fingerprint()==source:
         try:save_pass(cache,key,source)
         except OSError:print('Verification passed; cache unavailable.',file=sys.stderr)
+    if selected['tests'] or selected['node_syntax']:
+        import verification_receipts as receipts
+        receipts.event(ROOT,key if source else None,{'passed':passed,'kind':'passed' if passed else 'check_failure','reused':False,'executed':executed},time.monotonic()-started)
+    print(json.dumps({'passed':passed,'reused':False,'tests_selected':selected['tests'],'evidence':'Selected checks passed.' if passed else 'Selected checks failed; inspect the concrete failure above.'}),flush=True)
     raise SystemExit(0 if passed else 1)
 
 

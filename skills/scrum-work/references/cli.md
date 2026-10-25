@@ -1,0 +1,24 @@
+# Native CLI coordination
+
+Use the supervisor-supplied interpreter and absolute `scrum.py` path. In PowerShell prefix quoted executable paths with `&`. `SCRUM_CLI_CONTEXT` is inherited automatically; do not read, print or edit it. It privately retains claims and completion receipts. Do not pass tokens or switch to Scrum MCP.
+
+Commands (prefix each with the supplied interpreter and script):
+
+- `show`: current full task, only when missing scope or reconciling a result.
+- `lock --task CODE --paths relative/file relative/file.meta`: reserve extra output scope before editing.
+- `update --task CODE --continuity "Done: ...; Next: ..."`: relevant new continuity only.
+- `finish --task CODE --evidence "Targeted check and result"`: verified completion, native commit/integration under project policy. Explicit task code prevents completing a successor by accident. `--evidence-file FILE` accepts compact text or verification-helper JSON with an evidence string.
+- `search --query TEXT --limit 5`, `plan --input FILE`: existing tasks first; JSON array of bounded plan items. For a prerequisite discovered during current work, use an object: `{"items":[{"key":"engine","title":"Concrete missing capability","description":"Required implementation","acceptance_criteria":["Targeted checks pass"]}],"defer_task":CURRENT_ID,"prerequisites":["engine"],"continuity":"Done: preserved findings; Next: required capability"}`. The CLI supplies the private token. This atomically parks only the current task, preserves its acceptance/evidence and releases claims/batch; exit on deferred=true for supervisor selection. Do not refine a claimed task in items.
+- `pause --reason TEXT`: preserve work and return control to the supervisor.
+- `help OPERATION`: exact schema on demand. `call OPERATION --input FILE` for uncommon operations; JSON stdin via `--stdin` is also supported. Do not interpolate shell-built JSON.
+
+A reserved batch has one current claim. Each finish requests its successor; continue only from a successful `next.claim` and returned full `next.task`, using the same CLI context. Future reserved tasks stay TODO. Stop on batch_done, no successful next claim, Stop/quota or an actual impediment. No board scans or quota probes at startup.
+
+The CLI journals writes locally. A repeated already-recorded finish returns replayed=true and the actual current task pointer without repeating the backend write. Never infer ownership from an old response. An uncertain write without a durable result blocks further writes: inspect show/status and pause for supervisor reconciliation. Do not remove pending markers or context locks yourself. A failed command is not proof that a previous write was rolled back. Preserve relevant continuity, not full logs.
+
+CLI operations use the same store engine as MCP, not a new MCP process per command. Metrics count logical JSON bytes, native elapsed time and failures; these do not measure shell context, tokens or account quota. No extra model runs are used for coordination counters.
+
+
+In Autonomous mode `ask --input FILE` registers only an indispensable, specific question and parks this task. See autonomous-decisions.md for its typed payload. Exit after deferred=true; the supervisor continues other work without waiting for a model response.
+
+`PLAN_REJECTED` with `committed=false` is a confirmed rollback, not an uncertain write. Correct that plan in the current run; no pause or blind repeat. Transport/receipt failures remain uncertain and keep the journal guard.

@@ -3,7 +3,7 @@ name: scrum-resume
 description: Start or resume a Scrum Studio session and continue unfinished work from its saved continuity instead of repeating it.
 ---
 
-Follow steps 1–2 of [scrum-work](../scrum-work/SKILL.md): `work_start` once with real quota ([scrum-usage](../scrum-usage/SKILL.md)), then continue the tasks listed in `resume` before anything new.
+Follow steps 1–2 of [scrum-work](../scrum-work/SKILL.md): `work_start` once with real quota ([scrum-usage](../scrum-usage/SKILL.md)), then preserve any live claim and follow native `next_work` order. Existing TODO continuity does not outrank a ready prerequisite with greater inherited urgency; reuse its saved work when selected.
 
 - Review `own_file_locks`; release only obsolete own locks; paginate `session_resume` if `has_more`.
 - If you know the task to continue, `work_start(id, claim=true)` loads and claims it in the same call. Otherwise read its `continuity` and evidence with `task_get`, claim it again, inspect partial edits, then finish the unchecked work. Do not re-plan, re-create or re-verify what is already recorded.

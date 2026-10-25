@@ -6,6 +6,21 @@ import test_storage
 from store import run
 
 class ManagedAgentTest(unittest.TestCase):
+    def test_supervisor_can_reconnect_without_requesting_model_work(self):
+        p,_=self.project();profile=self.create(p,start_immediately=False)
+        with patch('managed_agents.subprocess.Popen') as spawn:
+            result=run('agent_manage',dict(project=p,actor=self.human,id=profile['id'],action='start',start_immediately=False))
+        self.assertTrue(result['enabled'])
+        self.assertNotIn('--start-now',spawn.call_args.args[0])
+        self.assertIn('--allow-run',spawn.call_args.args[0])
+        run('agent_checkpoint',dict(project=p,actor=profile['actor'],profile_id=profile['id'],client='codex',action='observe',running=False,session_used_percent=1,weekly_used_percent=1))
+        before=run('agent_manage',dict(project=p,id=profile['id'],action='get'))['generation']
+        with patch('managed_agents.subprocess.Popen') as spawn:
+            connected=run('agent_manage',dict(project=p,actor=self.human,id=profile['id'],action='start',start_immediately=False))
+        self.assertEqual(connected['request'],'already_connected')
+        self.assertEqual(connected['generation'],before)
+        spawn.assert_not_called()
+
     def test_model_persistence_and_next_run_update(self):
         p,_=self.project()
         for client in ('codex','claude'):

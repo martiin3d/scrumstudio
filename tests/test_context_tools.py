@@ -8,6 +8,18 @@ class ContextTest(unittest.TestCase):
     setUp=test_app.WorkflowTest.setUp
     tearDown=test_app.WorkflowTest.tearDown
 
+    def test_default_search_is_small_but_cursor_preserves_all_results(self):
+        ids=[self.task('Scoped outcome '+str(i)) for i in range(12)]
+        first=run('task_search',dict(project=self.p))
+        self.assertEqual(len(first['items']),5);self.assertTrue(first['has_more'])
+        found=[t['id'] for t in first['items']];cursor=first['next_cursor']
+        while True:
+            page=run('task_search',dict(project=self.p,after=cursor))
+            found.extend(t['id'] for t in page['items']);cursor=page['next_cursor']
+            if not page['has_more']:break
+        self.assertEqual(found,ids)
+        self.assertEqual(len(run('task_search',dict(project=self.p,limit=20))['items']),12)
+
     def task(self,title='Bounded fix'):
         return run('task_create',dict(project=self.p,title=title,description='A concrete fix',acceptance_criteria=['Regression passes.']))['id']
 
@@ -120,6 +132,28 @@ class ContextTest(unittest.TestCase):
 
 
 class ContextStorageTest(unittest.TestCase):
+
+    def test_task_get_surfaces_parked_input_location_without_changing_state(self):
+        import json,hashlib,git_paused
+        from pathlib import Path
+        project,root=self.project()
+        task=run('task_create',dict(project=project,title='Use preserved draft',description='Original input belongs to parked related work',acceptance_criteria=['Verified'],context_group='engine'))['id']
+        before=run('task_get',dict(project=project,id=task));directory=git_paused.folder(root,'parked');key='a'*32
+        saved=directory/key;saved.mkdir(parents=True)
+        raw=b'exact preserved draft';(saved/'0').write_bytes(raw)
+        (saved/'manifest.json').write_text(json.dumps({'branch':'parked','tasks':['OTHER-1'],'context_group':'engine','files':{'draft.md':{'blob':'0','sha256':hashlib.sha256(raw).hexdigest()}}}))
+        (directory/'manifest.json').write_text(json.dumps({'state':'paused','directory':key}))
+        after=run('task_get',dict(project=project,id=task,version_seen=before['version']))
+        self.assertIn('preserved_inputs',after)
+        self.assertEqual(after['status'],before['status'])
+        self.assertEqual(after['acceptance_criteria'],before['acceptance_criteria'])
+        self.assertFalse((root/'draft.md').exists())
+        self.assertEqual(Path(after['preserved_inputs']['items'][0]['read_path']).read_bytes(),raw)
+        self.assertFalse(run('task_get',dict(project=project,id=task,inputs_after=1))['preserved_inputs']['items'])
+        unchanged=run('task_get',dict(project=project,id=task,version_seen=after['version']))
+        self.assertFalse(unchanged['changed'])
+
+
     setUp=test_storage.StorageTest.setUp
     tearDown=test_storage.StorageTest.tearDown
     project=test_storage.StorageTest.project

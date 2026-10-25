@@ -38,6 +38,8 @@ class TelemetryTest(unittest.TestCase):
             result=telemetry.metrics(db,self.p,days=1,at=BASE)
         self.assertIn(active,result['worked_task_ids'])
         self.assertNotIn(idle,result['worked_task_ids'])
+        self.assertEqual(result['attempted_tasks'],1)
+        self.assertEqual(result['metadata_only_tasks'],0)
 
     def test_exact_work_interval_changes_flow_durations_tasks_and_period_status(self):
         import store

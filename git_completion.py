@@ -21,23 +21,33 @@ def write_receipt(path,data):
     return data
 
 
-def file_blobs(root,planned):
-    result={}
-    for name in git.planned_paths(root,planned):
+def file_blobs(root,planned,include_ignored=False):
+    result={};existing=[]
+    for name in git.planned_paths(root,planned,include_ignored=include_ignored):
         if not (Path(root)/name).exists():result[name]=None;continue
-        value=git._git(root,'hash-object','--path='+name,'--',name)
-        if value.returncode:raise ValueError('Could not fingerprint planned file '+name)
-        result[name]=value.stdout.strip()
+        existing.append(name)
+    if existing:
+        # stdin avoids Windows argv limits and hundreds of process launches.
+        # Git's C-quoted path input retains per-path attributes and clean filters.
+        paths=''.join(json.dumps(name,ensure_ascii=False)+'\n' for name in existing)
+        value=git._git(root,'hash-object','--stdin-paths',input_text=paths,timeout=30)
+        hashes=value.stdout.splitlines()
+        if value.returncode or len(hashes)!=len(existing) or any(not h or any(c not in '0123456789abcdef' for c in h) or len(h) not in (40,64) for h in hashes):
+            raise ValueError('Could not fingerprint planned files; verified completion remains pending')
+        result.update(zip(existing,hashes))
     return result
 
 
 def matches_commit(root,files,sha):
-    for name,expected in files.items():
-        result=git._git(root,'ls-tree','-z',sha,'--',name)
+    for names in git.path_chunks(list(files)):
+        result=git._git(root,'ls-tree','-z',sha,'--',*names,timeout=15)
         if result.returncode:return False
-        entry=result.stdout.split('\t',1)[0].split()
-        actual=entry[2] if len(entry)==3 else None
-        if actual!=expected:return False
+        entries={}
+        for item in filter(None,result.stdout.split('\0')):
+            metadata,separator,name=item.partition('\t');entry=metadata.split()
+            if not separator or len(entry)!=3:return False
+            entries[name]=entry[2]
+        if any(entries.get(name)!=files[name] for name in names):return False
     return True
 
 
@@ -123,12 +133,25 @@ def reconcile(db,a,project_row,prefix,activity,now,resolve_dependents):
         receipt=json.loads(path.read_text(encoding='utf-8'))
         if receipt['source']!=a.get('source') or receipt['basis']!=git.completion_basis(dict(row)):continue
         target='refs/heads/'+receipt['target']
+        if not receipt.get('sha') and receipt.get('files'):
+            excluded=git.ignored_paths(root,list(receipt['files']))
+            if excluded:
+                # Migrate only unchanged legacy local evidence. Missing/changed
+                # reports cannot be dropped to make an old verification pass.
+                local={name:receipt['files'][name] for name in excluded}
+                if file_blobs(root,list(excluded),include_ignored=True)!=local:continue
+                receipt={**receipt,'files':{name:blob for name,blob in receipt['files'].items() if name not in excluded},'local_evidence':{**receipt.get('local_evidence',{}),**local}}
         sha=receipt.get('sha') or recovered_tip(root,receipt)
         if not sha or not git.is_ancestor(root,sha,target):continue
         if not receipt.get('sha'):
             receipt['sha']=sha;write_receipt(path,receipt)
         merge={'merged':True,'source_sha':sha,'target':receipt['target']}
-        if project_row['git_push']!='Never':
+        if project_row['git_push']!='Never' and a.get('only_published'):
+            remote='refs/remotes/'+project_row['git_remote']+'/'+receipt['target']
+            known=git._git(root,'rev-parse','--verify',remote)
+            if known.returncode or not git.is_ancestor(root,sha,remote):continue
+            merge['pushed']=True
+        elif project_row['git_push']!='Never':
             # A scoped recovery may have published manually; normal push is
             # idempotent and verifies publication without any inference turn.
             published=git._git(root,'push','--quiet',project_row['git_remote'],target+':'+target,timeout=git.PUSH_TIMEOUT)
@@ -137,3 +160,15 @@ def reconcile(db,a,project_row,prefix,activity,now,resolve_dependents):
         result=finalize(db,dict(a,id=row['id'],root=root,expected=receipt['basis'],outcome={'merge':merge}),project_row,prefix,activity,now,resolve_dependents)
         if result['status']=='Done':completed.append(row['id'])
     return {'completed':completed}
+
+
+def reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,actor):
+    """Existing launch boundary only; no network, polling or model call."""
+    if not db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Review' AND category!='Git recovery' LIMIT 1",(project_row['id'],)).fetchone():return []
+    rows=db.execute("SELECT title FROM tasks WHERE project=? AND status='Done' AND category='Git recovery' AND title LIKE 'Resolve Git integration: %'",(project_row['id'],)).fetchall()
+    sources={r['title'][len('Resolve Git integration: '):].split(' into ',1)[0] for r in rows}
+    completed=[]
+    for source in sources:
+        result=reconcile(db,dict(project=project_row['id'],actor=actor,source=source,capability=git.FINALIZE_TOKEN,only_published=True),project_row,prefix,activity,now,resolve_dependents)
+        completed.extend(result['completed'])
+    return completed

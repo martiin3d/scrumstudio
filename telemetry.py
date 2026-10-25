@@ -119,7 +119,18 @@ def metrics(db, project, days=30, include_series=False, at=None, start_at=None, 
     # Work means recorded active-state overlap or an authored activity event,
     # never merely a task waiting in TODO/Blocked/Done during the window.
     worked={r['task'] for r in rows if r['status']=='In Progress' and r['entered']<=at and (r['exited'] is None or r['exited']>=start)}
+    attempted=set(worked)
     worked.update(r[0] for r in db.execute('SELECT DISTINCT a.task FROM task_activity a JOIN tasks t ON t.id=a.task WHERE t.project=? AND julianday(a.created)>=julianday(?) AND julianday(a.created)<=julianday(?)',(project,result['from_utc'],result['as_of_utc'])))
+    result['attempted_tasks']=len(attempted)
+    result['metadata_only_tasks']=len(worked-attempted)
+    returns=reopened=0
+    for visits in by_task.values():
+        for previous,current in zip(visits,visits[1:]):
+            if current['status']=='TODO' and start<=current['entered']<=at:
+                returns+=previous['status']=='In Progress'
+                reopened+=previous['status']=='Done'
+    result['todo_returns_after_work']=returns
+    result['reopened_done_tasks']=reopened
     result['worked_task_ids']=sorted(worked)
     period_distribution={s:0 for s in STATUSES}
     for task in worked:

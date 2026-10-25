@@ -155,7 +155,7 @@ class RuntimeTest(unittest.TestCase):
         self.checkpoint(p,action='observe',running=True)
         result=run('agent_status',dict(project=p))['wakeup']
         self.assertEqual((result['status'],result['running_bridges']),('already_running',1))
-        for fields,reason in [(dict(session_used_percent=93,weekly_used_percent=2),'5h usage'),(dict(session_used_percent=1,weekly_used_percent=95),'weekly usage'),(dict(session_used_percent=1,weekly_used_percent=2,observed_at=0),'unknown or stale'),(dict(session_used_percent=1,weekly_used_percent=2,session_resets_at=time.time()-1),'unknown or reset')]:
+        for fields,reason in [(dict(session_used_percent=93,weekly_used_percent=2),'5h usage'),(dict(session_used_percent=1,weekly_used_percent=95),'weekly usage'),(dict(session_used_percent=1,weekly_used_percent=2,session_resets_at=time.time()-1),'unknown or reset')]:
             with self.subTest(reason=reason):
                 self.checkpoint(p,action='observe',running=False,**fields)
                 result=run('project_control',dict(project=p,actor=self.human,action='wakeup',start_agents=False))['wakeup']
@@ -228,3 +228,81 @@ class TaskHandoffTest(RuntimeTest):
         self.assertEqual(t['files'],['file.py'])
         self.assertNotIn('Prior continuity',t['continuity'])
         self.assertEqual(run('file_locks',dict(project=p))['items'],[])
+
+    def test_older_observation_cannot_replace_fresh_quota_and_expiry_still_holds(self):
+        p,_=self.project();at=time.time()
+        self.checkpoint(p,action='observe',running=False,session_used_percent=23,weekly_used_percent=4,observed_at=at)
+        self.checkpoint(p,action='observe',running=False,session_used_percent=98,weekly_used_percent=51,observed_at=0)
+        current=next(a for a in run('agent_status',dict(project=p))['agents'] if a['actor']==self.agent)
+        self.assertEqual((current['session_used_percent'],current['weekly_used_percent'],current['usage_at']),(23,4,at))
+        with patch('runtime.time.time',return_value=at+10000):
+            result=self.checkpoint(p,action='observe',running=False)
+            self.assertTrue(result['should_stop']);self.assertIn('unknown or stale',result['reason'])
+
+    def test_automatic_close_before_idle_quota_hold_resumes_once(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,auto_resume_session_quota=True))
+        at=time.time();reset=at+10
+        usage=dict(session_used_percent=80,weekly_used_percent=20,session_resets_at=reset,weekly_resets_at=at+10000,observed_at=at)
+        self.checkpoint(p,**usage)
+        closed=self.checkpoint(p,action='offline',automatic=True,reason='CLI session ended')
+        self.assertEqual(closed['auto_resume']['status'],'eligible continuation after automatic session close')
+        held=self.checkpoint(p,action='observe',running=False,**dict(usage,session_used_percent=93))
+        self.assertIn('waiting for fresh session reset',held['auto_resume']['status'])
+        with patch('runtime.time.time',return_value=at+11):
+            fresh=dict(usage,session_used_percent=1,session_resets_at=at+18000,observed_at=at+11)
+            self.assertTrue(self.checkpoint(p,action='observe',running=False,**fresh)['auto_resume']['requested'])
+            self.assertFalse(self.checkpoint(p,action='observe',running=False,**fresh)['auto_resume']['requested'])
+
+    def test_automatic_close_at_first_quota_hold_uses_actual_guard_and_preserves_reset(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,auto_resume_session_quota=True))
+        at=time.time();reset=at+10
+        usage=dict(session_used_percent=80,weekly_used_percent=20,session_resets_at=reset,weekly_resets_at=at+10000,observed_at=at)
+        self.checkpoint(p,**usage)
+        held=self.checkpoint(p,action='offline',automatic=True,reason='CLI session ended',**dict(usage,session_used_percent=93))
+        self.assertIn('waiting for fresh session reset',held['auto_resume']['status'])
+        self.checkpoint(p,action='offline',automatic=True,reason='Native cleanup')
+        with patch('runtime.time.time',return_value=at+11):
+            fresh=dict(usage,session_used_percent=1,session_resets_at=at+18000,observed_at=at+11)
+            self.assertTrue(self.checkpoint(p,action='observe',running=False,**fresh)['auto_resume']['requested'])
+
+    def test_manual_pause_remains_cancelled_despite_automatic_cleanup(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,auto_resume_session_quota=True))
+        at=time.time();usage=dict(session_used_percent=93,weekly_used_percent=20,session_resets_at=at+10,weekly_resets_at=at+10000,observed_at=at)
+        self.checkpoint(p,**usage)
+        self.checkpoint(p,action='pause',reason='Human requested pause')
+        self.checkpoint(p,action='offline',automatic=True,reason='Native cleanup')
+        with patch('runtime.time.time',return_value=at+11):
+            self.assertFalse(self.checkpoint(p,action='observe',running=False,**dict(usage,session_used_percent=1,session_resets_at=at+18000,observed_at=at+11))['auto_resume']['requested'])
+
+    def test_automatic_close_does_not_restart_without_a_recorded_quota_hold(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,auto_resume_session_quota=True))
+        at=time.time();usage=dict(session_used_percent=10,weekly_used_percent=20,session_resets_at=at+10,weekly_resets_at=at+10000,observed_at=at)
+        self.checkpoint(p,**usage);self.checkpoint(p,action='offline',automatic=True)
+        with patch('runtime.time.time',return_value=at+11):
+            self.assertFalse(self.checkpoint(p,action='observe',running=False,**dict(usage,session_used_percent=1,session_resets_at=at+18000,observed_at=at+11))['auto_resume']['requested'])
+
+    def test_verified_finish_does_not_cancel_subsequent_native_quota_resume(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,auto_resume_session_quota=True))
+        at=time.time();usage=dict(session_used_percent=80,weekly_used_percent=20,session_resets_at=at+10,weekly_resets_at=at+10000,observed_at=at)
+        self.checkpoint(p,**usage)
+        task=run('task_create',dict(project=p,title='Verified outcome',description='Concrete lifecycle regression',acceptance_criteria=['Targeted behavior verified']))['id']
+        claim=run('task_claim',dict(project=p,id=task,actor=self.agent))
+        result=run('work_finish',dict(project=p,id=task,actor=self.agent,token=claim['token'],client='codex',close_session=True,evidence='Targeted behavior passed.'))
+        self.assertEqual(result['session']['auto_resume']['status'],'eligible continuation after automatic session close')
+        self.checkpoint(p,action='observe',running=False,**dict(usage,session_used_percent=93))
+        with patch('runtime.time.time',return_value=at+11):
+            self.assertTrue(self.checkpoint(p,action='observe',running=False,**dict(usage,session_used_percent=1,session_resets_at=at+18000,observed_at=at+11))['auto_resume']['requested'])
+
+    def test_automatic_closure_reason_cannot_fabricate_quota_hold(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,auto_resume_session_quota=True))
+        at=time.time();usage=dict(session_used_percent=1,weekly_used_percent=20,session_resets_at=at+10,weekly_resets_at=at+10000,observed_at=at)
+        self.checkpoint(p,**usage)
+        self.checkpoint(p,action='offline',automatic=True,reason='5h usage 93% reached stop threshold 92%')
+        with patch('runtime.time.time',return_value=at+11):
+            self.assertFalse(self.checkpoint(p,action='observe',running=False,**dict(usage,session_resets_at=at+18000,observed_at=at+11))['auto_resume']['requested'])

@@ -51,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             action = urlparse(self.path).path.removeprefix('/api/')
             length = int(self.headers.get('Content-Length', 0))
-            if length < 1 or length > (7_100_000 if action=='task_attachment' else 100000):
+            if length < 1 or length > (7_100_000 if action=='task_attachment' else 2_500_000 if action in ('task_create','task_update','task_plan','file_locks','work_start','task_claim') else 100000):
                 raise ValueError('Invalid request size')
             payload=json.loads(self.rfile.read(length))
             if action=='_shutdown':

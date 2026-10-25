@@ -45,3 +45,13 @@ Human-only `git_pause_blocked=true` (default false) enables private local checkp
 
 
 Recommended `git_merge="Task"`: one branch per task regardless of context_group; task-scoped commit and immediate merge into its recorded parent. Done requires successful integration and publication unless git_push=Never. In Review preserves verification on failure; a scoped recovery finalizes the original without reimplementation. git_commit=Group does not defer commits in this mode. Use git_pause_blocked=true to preserve blocked partial files privately and let unrelated tasks proceed; saved work restores after refreshing its branch from its recorded parent. This uses native Git, not extra model turns. Group mode remains available for legacy grouped delivery. Changing between Task and legacy policies refuses active/dirty/parked work and unfinished managed workspaces; reconcile existing work first. Do not recreate tasks or discard their evidence to migrate.
+
+Human-only run_advisory_minutes=20, run_advisory_tools=60 and run_advisory_output_tokens=30000 configure native run-cost advisories (0 disables a threshold; max1000000). Web Settings exposes the same fields. They apply at the next supervisor launch, deliver at most once at an existing worker MCP boundary, and never interrupt/relaunch work or override mandatory acceptance. Token counts may be unavailable until provider completion. Metrics audits show last local observations; no model or extra polling is used.
+
+
+Human project setting `coordination_channel` selects `mcp` (default) or `cli` for the next managed launch. Both enforce identical workflow rules; CLI disables only Scrum MCP. Do not change transport while a worker is active.
+
+
+Human-only `autonomy_mode`: `Standard` (default) or `Autonomous`. Autonomous delegates routine decisions and permits only specific typed human questions, parked natively so other work can continue. It never grants permissions, bypasses Stop/quota or certifies unverified work.
+
+Human-only `execution_instructions` (text, max4000) supplies standing project instructions once at each managed launch. Defaults empty; no added worker context when unused. Honor them without duplicating the same contract on every task; they do not grant permissions or override native workflow guards.

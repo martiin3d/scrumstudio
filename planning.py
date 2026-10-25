@@ -6,11 +6,39 @@ import runtime
 import telemetry
 
 
+class PlanRejected(ValueError):
+    """A planning transaction was explicitly rolled back, safe to correct."""
+
+
 def apply(db,a,project):
+    try:return _apply(db,a,project)
+    except ValueError as error:
+        db.rollback()
+        raise PlanRejected(str(error)) from error
+
+
+def _apply(db,a,project):
     from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix,duplicate_task
     actor=actor_user(db,a)
     db.execute('BEGIN IMMEDIATE')
     runtime.gate(db,project,actor['id'])
+    deferred=None
+    if 'defer_task' in a:
+        from store import lock_access
+        deferred=db.execute('SELECT * FROM tasks WHERE id=? AND project=?',(a['defer_task'],project)).fetchone()
+        if not deferred or deferred['status']!='In Progress' or deferred['owner_id']!=actor['id'] or deferred['lock_until']<=time.time():
+            raise ValueError('defer_task requires your current live In Progress claim')
+        lock_access(deferred,a)
+        policy=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
+        if actor['kind']=='agent' and not coord.settings(policy).get('agent_followup_tasks'):
+            raise ValueError('Autonomous prerequisite handoff requires human-enabled agent_followup_tasks')
+        refs=a.get('prerequisites')
+        if not isinstance(refs,list) or not 1<=len(refs)<=100 or any(type(d) not in (str,int) for d in refs):
+            raise ValueError('prerequisites must name 1..100 task IDs or plan keys')
+        continuity=a.get('continuity',deferred['continuity'])
+        if not isinstance(continuity,str) or len(continuity)>2000:raise ValueError('continuity must be text, max2000')
+    elif any(k in a for k in ('prerequisites','continuity','token')):
+        raise ValueError('prerequisites, continuity and token require defer_task')
     items=a.get('items')
     if not isinstance(items,list) or not 1<=len(items)<=10:
         raise ValueError('Plan needs 1..10 concrete outcomes')
@@ -24,12 +52,13 @@ def apply(db,a,project):
         keys[key]=None
         old=None
         if 'id' in item:
+            if deferred and item['id']==deferred['id']:raise ValueError('Do not refine defer_task in items; its acceptance and scope are preserved')
             if type(item['id']) is not int or item['id'] in existing:raise ValueError('Existing task IDs must be unique integers')
             existing.add(item['id'])
             old=db.execute('SELECT * FROM tasks WHERE id=? AND project=?',(item['id'],project)).fetchone()
             if not old:raise ValueError('Existing task must belong to this project')
             if old['status'] in ('Done','Cancelled') or old['lock_until']>time.time():
-                raise ValueError('Plan only unfinished tasks without an active claim; preserve current work')
+                raise ValueError('Plan only unlocked unfinished tasks. For a discovered prerequisite of your current claim use defer_task, prerequisites and its token; do not refine the claimed task in items')
         title=required(item.get('title'),'title',240)
         same,differs=(None,[]) if old else duplicate_task(db,project,title,{**a,**item})
         if same:
@@ -108,4 +137,26 @@ def apply(db,a,project):
         db.execute('UPDATE tasks SET dependencies=? WHERE id=?',(json.dumps(resolved),task))
     for task,resolved in resolved_items:
         dependencies(db,project,task,resolved) # Validate the final graph, not intermediate edits.
-    return {'items':result}
+    response={'items':result}
+    if deferred:
+        resolved=[]
+        for dep in refs:
+            if isinstance(dep,str):
+                if dep not in keys:raise ValueError('Unknown prerequisite plan key')
+                dep=keys[dep]
+            resolved.append(dep)
+        linked=dependencies(db,project,deferred['id'],json.loads(deferred['dependencies'])+resolved)
+        if not any(db.execute('SELECT status FROM tasks WHERE id=?',(dep,)).fetchone()['status'] not in ('Done','Cancelled') for dep in linked):
+            raise ValueError('Prerequisites are already finished; continue the current task instead of deferring it')
+        import context_batches,context_tools
+        from store import task_dict
+        context_batches.release(db,project,actor['id'])
+        db.execute('DELETE FROM file_locks WHERE task=? AND owner_id=?',(deferred['id'],actor['id']))
+        reason='Waiting for planned prerequisites'
+        db.execute("UPDATE tasks SET status='Blocked',dependencies=?,blocked_reason=?,blocked_reason_kind='dependency',continuity=?,lock_token=NULL,lock_until=0,updated=? WHERE id=?",(json.dumps(linked),reason,continuity.strip(),now(),deferred['id']))
+        updated=task_dict(db.execute('SELECT * FROM tasks WHERE id=?',(deferred['id'],)).fetchone(),prefix)
+        db.execute('UPDATE tasks SET continuity_basis=? WHERE id=?',(context_tools.basis(updated),deferred['id']))
+        telemetry.transition(db,deferred['id'],'Blocked',actor['id'])
+        activity(db,deferred['id'],actor['id'],'updated','Deferred for prerequisites: '+', '.join(map(str,linked))+'. Acceptance and evidence preserved; own claims and batch released.')
+        response.update(deferred=True,task={'id':deferred['id'],'code':updated['code'],'status':'Blocked','dependencies':linked},instruction='Exit this run; the supervisor selects an eligible prerequisite or other ready work. Do not retry this blocked task until its dependencies finish.')
+    return response

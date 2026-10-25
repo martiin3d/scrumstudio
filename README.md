@@ -443,6 +443,8 @@ Git dependency checkpoints: with per-task commits and automatic Group integratio
 
 Native integration recognizes already merged commits and retries up to three proven concurrent target advances without invoking an agent. Git subprocesses isolate inherited repository/index paths and avoid optional index refresh locks. See [Git automation design](docs/investigations/git-automation-design.md) for the Paperclip comparison, boundaries and recovery behavior.
 
+Completion fingerprints use one filtered Git batch and bounded commit-tree queries, avoiding one process per planned file. Idle checkout preparation may repair false dirty index metadata through a private index copy only if the complete staged blob/mode/stage listing and file flags remain identical. Real edits, existing staging and foreign index locks are preserved. This adds no model execution or polling; missing verification receipts still require verified reconciliation.
+
 Dependency checkpoints follow nested recorded parents automatically, including at group completion, only when each intermediate branch adds no history beyond the verified incoming outcome or history already accepted by its parent. Unknown additions, conflicts, cycles and changed source/parent refs retain scoped recovery. No model invocation or periodic scan is added.
 
 Before claiming an existing branch with missing dependencies, SCRUM can synchronize it from its recorded parent when integration is enabled and all required tips are already accepted there. It requires an idle branch and a clean authorized checkout; divergent history is accepted only when the merged tree exactly equals the parent's verified tree. All history is retained. Real extra files, unpublished dependencies or conflicts require scoped recovery. Native bridge MCP clients refresh their server between completed requests after local code updates, without restarting workers or replaying uncertain writes.
@@ -466,3 +468,55 @@ Managed workers retry explicit provider capacity errors with the same model up t
 ### Metrics work periods
 
 Metrics → By session distinguishes observed provider five-hour quota windows, Wakeup campaigns (including automatic continuations until the next human Wakeup), and internal MCP runs. The chosen interval applies to completion flow, observed state durations, task activity and timestamped coordination measurements. Current board counts remain in a separate explicitly unfiltered panel. Provider windows reuse existing reset telemetry; historical unrecorded windows and older aggregate MCP counts cannot be reconstructed. This is local bookkeeping and querying only: no additional model, agent or provider requests.
+
+### Local usage audit and verification reuse
+
+Metrics → **Run local audit** reads recorded CLI counters and bounded retained Codex logs on demand; **Download audit JSON** exports counters/coverage without prompts, output text or secrets from logs. No provider or model call is made. Selected intervals use local completion-record times; historical log totals are lifetime, overlap those executions and must not be added. No token-to-quota conversion or inferred coding/testing split is presented. Future Unity helper runs record compact local verification events (executed, reused, failed and repeated failure signatures).
+
+`python scripts/unity_verify.py --editor INSTALLED_EDITOR --project UNITY_ROOT --filter TEST_FILTER --reuse` reuses an actual passing XML only when covered inputs, helper, Editor and graphics mode are unchanged. Receipts retain original verification time and XML hash; missing/changed reports or unknown inputs invalidate reuse. External mutable `file:` package references disable caching. The bounded fingerprint includes Assets, Packages, ProjectSettings and Library/PackageCache; oversized/unreadable/symlink inputs disable reuse. External-service tests and changed environments should run without `--reuse`. `--graphics auto` enables graphics for a full suite or visual/capture/render filters; select `--graphics on` for other visual tests. Compilation and visual acceptance remain distinct.
+
+Git publication retries one explicit transient connection failure using the same immutable commit/refspec, never permission or non-fast-forward rejections. Recovery worker prompts reuse existing evidence and avoid unrelated Unity instructions; only real conflicts or uncertain scope need model reasoning. Test helpers emit compact evidence for the existing completion call, rather than requiring an extra model-authored audit.
+
+### Dependency-aware native scheduling
+
+Ready prerequisites inherit the best priority of reachable dependent outcomes (without changing human priority fields); ties favor immediate unblock count, downstream reach and reopened work before paused TODO continuity. Existing live claims, Stop/quota, file and batch reservations remain authoritative. Dependency-only stale blocks are rechecked at completion/selection; external constraints are never cleared by inference. Context batches yield only for strictly greater urgency/impact. `Human review` tasks are not offered to or claimable by agents.
+
+Complete task plans/reservations support 500 explicit paths, including incremental acquisition. Git commits use NUL pathspec files and bounded diff/restore argument chunks so long plans do not overflow Windows command lines. Unrelated staging, external paths and file conflicts remain protected. Metrics distinguishes actual In Progress overlap from planning/metadata-only activity, TODO handoffs and Done work reopened for changed scope; these are not model failure or quota counts.
+
+Quota observations are monotonic by their original timestamp: replayed older bridge/cache readings never replace newer provider data or freshen its age. An idle human Wakeup/Start refreshes native telemetry before launch even within the normal interval; ordinary checkout-stat changes do not cause extra provider reads. Unknown/expired readings still pause work.
+
+Run-cost controls: Settings exposes native elapsed/tool/reported-output advisories. They deliver once during an existing MCP response, without an auditor model, new polling or forced restart. Large agent file plans are paged (20 paths); task_get files_after/files_limit or explicit full=true retrieves more. scripts/work_checks.py performs batch file/hash audits and representative visual planning with full local reports and compact stdout; required acceptance remains authoritative. See the bundled scrum-work and scrum-metrics skills.
+
+
+### Bounded context reuse for managed workers
+
+Keep independently verifiable outcomes as separate tasks; do not split one outcome into reading/editing/testing tickets or inflate task sizes to hit a Done-count target. Use a shared `context_group` for related outcomes that reuse implementation context. Native planning reserves up to six non-Large tasks in that group, with at most 40 explicit files per task, 120 distinct planned files and 24 KB of compact execution views for multi-task batches; a larger single task retains its full scope. File-overlap-only batches retain their three-task/5-file bounds. Unknown file plans can share an explicit context group, but files must still be reserved before edits. Large work and Git recovery stay separate; per-task Worktrees have separate working directories and do not batch.
+
+Only the current task is claimed/In Progress; future tasks remain TODO under expiring task reservations. Dependencies may be planned in execution order, including dependency-only Blocked work, but execution requires completed prerequisites. Each finish verifies/integrates its own outcome before the next claim. Higher dependency urgency, Stop/quota, model changes, external blockers and conflicting reservations still end or shorten a batch. No periodic model auditor or inference scheduler is added.
+
+Managed launches use the short `scrum-work` entrypoint and only that Scrum skill in the default Codex discovery catalog, preserving explicit human skill configuration. Full lifecycle/recovery details remain available on demand, without injecting the board, human notes, prior logs or all future task bodies. Startup instructions and current scope are supplied once; a returned next claim is reused directly. Output/prompt byte reductions are local measurements, not promises about provider quota or the number of tasks a session can finish.
+
+For an idle supervisor upgrade, human-only `agent_manage(action="start",start_immediately=false)` connects local control without requesting a model task or sending Wakeup. Default start behavior, existing autoresume authorization and quota/Stop policy are preserved. Never interrupt active work merely to reload guidance.
+
+
+Parked inputs remain discoverable through `task_get.preserved_inputs`: bounded checksum-verified read-only references for the task or its explicit context group, with `inputs_after`/`inputs_limit` pagination. These drafts are not acceptance evidence and are not automatically restored across branches. Restored inputs are not reinjected over newer available files. If a completed prerequisite committed an originally untracked checkpoint path on a descendant commit, restore retains that committed version and reports the saved draft for comparison instead of overwriting it.
+
+Legacy file plans may include redundant folder headings alongside explicit file paths. Reservations ignore only those redundant headings; directory-only plans, workspace-root paths and escaping paths are still refused. No directory contents are discovered or added implicitly.
+
+
+### Native CLI coordination
+
+Project Settings → Agent coordination channel selects MCP (default) or native CLI for the next managed worker. CLI uses the same validated operation engine, claims, Stop/quota, reservations and Git integration. It disables only the worker's Scrum MCP; selected specialist servers remain available. No additional service or model is needed.
+
+Run `python /path/to/SCRUM/scrum.py --help`; `help OPERATION` shows an operation schema. An interactive claim requires an explicit private context, for example `python scrum.py start --project /path/to/project --actor ACTOR_ID --client codex --task CODE --context /private/path/context.json`. Managed workers inherit their context automatically and use `show`, `lock`, `update` and `finish --task CODE --evidence TEXT`. JSON files/stdin support complex operations. Do not expose context files, tokens or receipts. Failed uncertain writes require state reconciliation, not blind retries.
+
+Metrics distinguish MCP, CLI and native supervisor operations, including bytes, time and failures. Byte counts are logical JSON measurements, not tokens or account quota; historic unattributed traffic remains labelled. Use equivalent completed work and provider telemetry to evaluate savings.
+
+
+### Autonomous decisions
+
+Settings → Agent autonomy offers Standard (default) and Autonomous. Autonomous delegates routine implementation and recovery. Only indispensable questions are sent to the human, with a category, concrete choices and an explanation of why human input is needed. The native engine parks just that task, releases reservations and lets other eligible work continue. A scoped human answer reopens it without bypassing Stop, quotas or acceptance. Real permission callbacks stay live and human-only. The setting and typed questions are available through web, MCP and native CLI (`ask --input FILE`).
+
+Optional native screenshot diagnostics (requires Pillow in the selected interpreter; not a dependency of the web/MCP/CLI core): `python scripts/visual_compare.py --reference reference.png --actual actual.png --output comparison`. It produces a cached overlay, raw pixel diff and report. These are agent verification aids, not a fidelity percentage or a mandatory human review. Existing valid work should not be re-audited without changes or a concrete concern.
+
+Standing project execution instructions (human-only, max4000 characters) can be configured beside autonomy. They apply on each managed launch and are empty by default, avoiding duplicated policy text across task descriptions.

@@ -27,6 +27,51 @@ class PausedGitTest(unittest.TestCase):
     def pause(self,files=('one.txt','new file.bin')):
         with git_sync.checkout_lock(self.root):return git_paused.pause(self.root,'partial',files,['TEST-1'])
 
+    def test_other_branch_prerequisite_can_read_verified_parked_inputs(self):
+        (self.root/'draft.md').write_bytes(b'original draft\r\n')
+        (self.root/'probe.cs').write_bytes(b'diagnostic source')
+        saved=git_paused.pause(self.root,'partial',['draft.md','probe.cs'],['TEST-1'],context_group='shared-engine')
+        self.assertEqual(saved['files'],2)
+        self.git('checkout','-q','main')
+        result=git_paused.preserved_inputs(self.root,'TEST-2','shared-engine',limit=1)
+        self.assertEqual(result['total'],2);self.assertTrue(result['has_more'])
+        first=result['items'][0]
+        self.assertEqual(first['path'],'draft.md')
+        self.assertEqual(Path(first['read_path']).read_bytes(),b'original draft\r\n')
+        self.assertFalse((self.root/'draft.md').exists())
+        self.assertEqual(self.git('branch','--show-current'),'main')
+        self.assertEqual(self.git('status','--porcelain'),'')
+        self.assertIsNone(git_paused.preserved_inputs(self.root,'TEST-2','unrelated'))
+        self.assertEqual(git_paused.preserved_inputs(self.root,'TEST-2','shared-engine',after=1)['items'][0]['path'],'probe.cs')
+        Path(first['read_path']).write_bytes(b'corrupted')
+        corrupted=git_paused.preserved_inputs(self.root,'TEST-2','shared-engine')
+        self.assertTrue(corrupted['limited'])
+        self.assertNotIn('draft.md',[x['path'] for x in corrupted['items']])
+
+    def test_restored_input_is_not_reintroduced_after_normal_progress(self):
+        (self.root/'draft.md').write_bytes(b'parked draft')
+        git_paused.pause(self.root,'partial',['draft.md'],['TEST-1'],context_group='shared')
+        git_paused.restore(self.root,'partial','TEST-1',context_group='shared')
+        (self.root/'draft.md').write_bytes(b'newer valid work')
+        self.assertIsNone(git_paused.preserved_inputs(self.root,'TEST-2','shared'))
+
+    def test_completed_prerequisite_input_is_not_overwritten_by_older_untracked_draft(self):
+        (self.root/'probe.cs').write_bytes(b'old diagnostic')
+        (self.root/'draft.md').write_bytes(b'parked construction ledger')
+        git_paused.pause(self.root,'partial',['probe.cs','draft.md'],['TEST-1'],context_group='engine')
+        self.git('checkout','-q','main')
+        (self.root/'probe.cs').write_bytes(b'new committed positive test')
+        self.git('add','probe.cs');self.git('commit','-qm','prerequisite delivers verified input')
+        self.git('checkout','-q','partial');self.git('merge','--ff-only','main')
+        result=git_paused.restore(self.root,'partial','TEST-1',context_group='engine')
+        self.assertEqual((self.root/'probe.cs').read_bytes(),b'new committed positive test')
+        self.assertEqual((self.root/'draft.md').read_bytes(),b'parked construction ledger')
+        saved=result['retained_upstream'][0]
+        self.assertEqual(saved['path'],'probe.cs')
+        self.assertEqual(Path(saved['saved_read_path']).read_bytes(),b'old diagnostic')
+        self.assertEqual(self.git('diff','--cached','--name-only'),'')
+        self.assertFalse(git_paused.pending(self.root,'partial'))
+
     def test_roundtrip_preserves_bytes_deletions_and_untracked_without_publication(self):
         raw=b'partial\r\n\x00binary\xff';(self.root/'one.txt').write_bytes(raw)
         (self.root/'new file.bin').write_bytes(b'\x00\xffnew')

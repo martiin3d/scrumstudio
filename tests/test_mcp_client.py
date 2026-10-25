@@ -19,12 +19,13 @@ spec.loader.exec_module(cli)
 class McpClientTest(unittest.TestCase):
     def test_updated_server_reloads_before_call_without_replaying_writes(self):
         client=cli.ScrumClient.__new__(cli.ScrumClient)
-        client._source_stamp=('old',);client._initialize_timeout=7
-        def initialize(timeout):client._source_stamp=('new',)
+        client._source_stamp=('old',);client._initialize_timeout=7;client._channel='supervisor'
+        def initialize(timeout,channel):
+            self.assertEqual(channel,'supervisor');client._source_stamp=('new',)
         with patch.object(cli,'server_stamp',return_value=('new',)),patch.object(client,'close') as close,patch.object(cli.ScrumClient,'__init__',side_effect=initialize) as init,patch.object(client,'rpc',return_value={'content':[{'text':'{}'}]}) as rpc:
             client.call('task_update',{'status':'Done'})
             client.call('projects',{})
-            close.assert_called_once();init.assert_called_once_with(timeout=7)
+            close.assert_called_once();init.assert_called_once_with(timeout=7,channel='supervisor')
             self.assertEqual(rpc.call_count,2)
         with patch.object(cli,'server_stamp',return_value=('new',)),patch.object(client,'rpc',side_effect=RuntimeError('uncertain write')) as rpc:
             with self.assertRaisesRegex(RuntimeError,'uncertain write'):client.call('task_update',{'status':'Done'})
@@ -45,7 +46,7 @@ class McpClientTest(unittest.TestCase):
 
     def test_uncertain_write_is_not_interrupted_by_automatic_reload(self):
         client=cli.ScrumClient.__new__(cli.ScrumClient)
-        client._source_stamp=('old',);client._initialize_timeout=7
+        client._source_stamp=('old',);client._initialize_timeout=7;client._channel='supervisor'
         client._request_uncertain=True
         with patch.object(cli,'server_stamp',return_value=('new',)),patch.object(client,'close') as close,patch.object(client,'rpc',return_value={'content':[{'text':'{}'}]}) as rpc:
             client.call('task_get',{'id':1})

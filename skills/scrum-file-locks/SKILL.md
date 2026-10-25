@@ -16,3 +16,5 @@ File reservations are cooperative exact-file locks; they do not prevent external
 Use [scrum-resume](../scrum-resume/SKILL.md) at every session start and [scrum-unlock-all](../scrum-unlock-all/SKILL.md) only for bulk release. Do not scan all locks when an atomic claim already checks your planned paths.
 
 Successful acquire atomically adds those paths to the task file plan for automatic Git publication (plan_added reports the count). Conflicts and failed acquisition do not change the plan; repeated acquisition is idempotent. Release removes reservations, not the saved file plan. Include supporting assemblies and Unity .meta sidecars belonging to your authored assets/new folders; do not label necessary task dependencies as unrelated or silently leave them uncommitted.
+
+Complete plans and incremental acquisitions support 500 explicit paths. Include required sidecars; do not split one cohesive outcome merely to fit the old 100-path ceiling. Conflicts, ownership and workspace boundaries remain enforced.

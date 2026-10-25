@@ -153,9 +153,11 @@ def review(root, planned=(), max_lines=200, budget=12000, include_diff=True, sco
         lines = []
         tracked = [p for p in scope if p in counts]
         if tracked:
-            diff = _git(root, 'diff', '--unified=2', '--no-color', 'HEAD', '--', *tracked)
-            if not diff.returncode:
-                lines.extend(diff.stdout.splitlines())
+            from git_sync import path_chunks
+            for paths in path_chunks(tracked):
+                diff = _git(root, 'diff', '--unified=2', '--no-color', 'HEAD', '--', *paths)
+                if not diff.returncode:
+                    lines.extend(diff.stdout.splitlines())
         for path in scope:
             if path in counts:
                 continue

@@ -1,6 +1,7 @@
 """Reported CLI counters only. Local run totals are never allocated to tasks."""
 import json
 import time
+from worker_catalog import MAX_CONTEXT_BATCH_TASKS
 
 COUNTERS=('input_tokens','output_tokens','cached_input_tokens','cache_write_input_tokens','reasoning_output_tokens')
 
@@ -48,7 +49,7 @@ def record(db,project,actor,client,value):
         if n is not None and (type(n) is not int or not 0<=n<=10**15):raise ValueError('Invalid reported CLI token count')
         if source=='unavailable' and n is not None:raise ValueError('Unavailable CLI usage must remain unknown')
     tasks=value['tasks']
-    if not isinstance(tasks,list) or len(tasks)>3 or any(type(task) is not int for task in tasks) or len(tasks)!=len(set(tasks)) or any(not db.execute('SELECT 1 FROM tasks WHERE project=? AND id=?',(project,task)).fetchone() for task in tasks):raise ValueError('CLI usage task scope must belong to this project')
+    if not isinstance(tasks,list) or len(tasks)>MAX_CONTEXT_BATCH_TASKS or any(type(task) is not int for task in tasks) or len(tasks)!=len(set(tasks)) or any(not db.execute('SELECT 1 FROM tasks WHERE project=? AND id=?',(project,task)).fetchone() for task in tasks):raise ValueError('CLI usage task scope must belong to this project')
     ensure(db)
     payload=json.dumps(value|{'client':client},sort_keys=True,separators=(',',':'))
     old=db.execute('SELECT payload FROM cli_execution_usage WHERE project=? AND actor=? AND run_id=?',(project,actor,value['run_id'])).fetchone()

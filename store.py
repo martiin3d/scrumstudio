@@ -345,6 +345,9 @@ def resolve_dependents(db, project, completed, prefix, actor):
         dependency_note='dependency completion retained for Git integration' if preserve_done and prerequisite['status']=='Done' else 'dependency removed'
         activity(db, row['id'], actor, 'comment', f"Blocker {prefix}-{prerequisite['number']} {resolution} by {author}; {dependency_note}; remaining task blockers: {len(remaining)}. Status: {status}." + (' Dependency-linked blocker reason cleared.' if cleared_reason else '') + (' Ready to claim.' if status == 'TODO' and not remaining and not reason.strip() else ''))
         changed.append({'id': row['id'], 'code': code, 'status': status, 'remaining': len(remaining)})
+    import scheduling
+    known={item['id'] for item in changed}
+    changed.extend(item for item in scheduling.reconcile(db,project,actor,activity,now,prefix) if item['id'] not in known)
     return changed
 
 def reconcile_checkout_blocks(db, project_row, actor):
@@ -433,6 +436,8 @@ def _run(action, a):
         if a.get('include_periods'):result['periods']=metrics_periods.catalog(a['project'])
         if a.get('include_cli_usage'):
             result['cli_usage']=run('cli_usage_summary',{'project':a['project']})
+        if a.get('include_audit'):
+            result['audit']=run('cli_usage_audit',{'project':a['project'],**{k:a[k] for k in ('start_at','end_at','include_logs') if k in a}})
         return result
     if action == 'agent_checkpoint':
         import overhead
@@ -521,7 +526,7 @@ def legacy_run(action, a, path=None, locks=None):
             return runtime.operation(db,action,a,project,actor_user,required,now,activity)
         if action == 'agent_interaction':
             import agent_interactions
-            return agent_interactions.operation(db,a,actor_user,now)
+            return agent_interactions.operation(db,a,actor_user,now,activity)
         if action == 'project_chat':
             if 'text' in a:
                 author = actor_user(db, a)
@@ -607,11 +612,17 @@ def legacy_run(action, a, path=None, locks=None):
             if action == 'task_get':
                 import context_tools
                 task=context_tools.reminder_hint(db,project,task_dict(row,prefix,a.get('include_cost',False)))
+                if task['status'] not in ('Done','Cancelled'):
+                    import git_paused
+                    inputs=git_paused.preserved_inputs(project_row['workspace_root'],task['code'],task.get('context_group',''),a.get('inputs_after',0),a.get('inputs_limit',8))
+                    if inputs:
+                        task['preserved_inputs']=inputs
+                        task['version']=context_tools.digest(task)
                 if a.get('full'):
                     import context_batches
                     group=context_batches.detail(db,project,row['id'],prefix)
                     if group:task['context_batch']=group;task['version']=context_tools.digest(task)
-                if not a.get('full'):task=context_tools.agent_task(task)
+                if not a.get('full'):task=context_tools.agent_task(task,a.get('files_after',0),a.get('files_limit',20))
                 if a.get('notes_content') and not a.get('include_notes'):raise ValueError('notes_content requires include_notes')
                 if a.get('include_notes'):
                     task['notes']=context_tools.linked_notes(db,project,row['id'],a)
@@ -662,6 +673,9 @@ def legacy_run(action, a, path=None, locks=None):
             row = db.execute('SELECT * FROM tasks WHERE id=? AND project=?', (a['id'], project)).fetchone()
             if not row:
                 raise ValueError('Task not found')
+            if action=='task_claim' and actor['kind']=='agent':
+                import scheduling
+                if scheduling.human_only(dict(row)):raise ValueError('Human review requires a human; no agent claim or model run is allowed')
             if action == 'task_release':
                 import context_batches
                 batch=context_batches.reservation(db,project,row['id'])
@@ -830,8 +844,14 @@ def legacy_run(action, a, path=None, locks=None):
                 t['description']=required(a['description'],'description',12000)
             t['acceptance_criteria']=acceptance_criteria(t['acceptance_criteria'],allow_empty='acceptance_criteria' not in a)
             description(t['blocked_reason'])
-            if t['blocked_reason_kind'] not in ('dependency','external','checkout'):
-                raise ValueError('blocked_reason_kind must be dependency, external or checkout')
+            if t['blocked_reason_kind'] not in ('dependency','external','checkout','human'):
+                raise ValueError('blocked_reason_kind must be dependency, external, checkout or human')
+            if t['status']=='Blocked' and t['blocked_reason_kind']=='human' and coord.settings(project_row).get('autonomy_mode')=='Autonomous' and actor_user(db,a)['kind']=='agent':
+                import agent_interactions
+                agent_interactions.ensure(db)
+                waiting=db.execute("SELECT * FROM agent_interactions WHERE project=? AND task=? AND actor=? AND kind='question' AND state='pending'",(project,t['id'],a['actor'])).fetchall()
+                if not any(agent_interactions.metadata(q).get('deferred') and agent_interactions.live(db,q) and ('['+q['id']+']') in t['blocked_reason'] for q in waiting):
+                    raise ValueError('Human blocker requires an actual specific deferred question; use ask, not an invented pending approval')
             if t['blocked_reason_kind']=='checkout' and t['category']!='Git recovery':
                 raise ValueError('checkout blockers are limited to Git recovery tasks')
             if t['blocked_reason'].strip() and t['dependencies'] and a.get('blocked_reason')!=old['blocked_reason'] and 'blocked_reason' in a and 'blocked_reason_kind' not in a:
@@ -875,6 +895,9 @@ def legacy_run(action, a, path=None, locks=None):
                     raise ValueError('Done requires fresh verification evidence and a completed checklist')
             if t['status'] == 'Blocked' and not t['blocked_reason'].strip() and not t['dependencies']:
                 raise ValueError('Blocked tasks need a reason or dependency')
+            if claiming and actor_user(db,a)['kind']=='agent':
+                import scheduling
+                if scheduling.human_only(t):raise ValueError('Human review requires a human; no agent claim or model run is allowed')
             if claiming and t['blocked_reason'].strip():
                 raise ValueError('Resolve the blocker before claiming')
             t['dependencies'] = dependencies(db, project, t['id'], t['dependencies'])
@@ -966,6 +989,13 @@ def legacy_run(action, a, path=None, locks=None):
                 if git:result['git']=git
                 if strict_completion:result['integration_pending']=True
             return result
+        if action=='cli_usage_audit':
+            import usage_audit
+            start=a.get('start_at');end=a.get('end_at')
+            import math
+            if start is not None or end is not None:
+                if any(type(v) not in (int,float) or not math.isfinite(v) for v in (start,end)) or not 0<=start<=end:raise ValueError('Invalid audit interval')
+            return usage_audit.audit(db,project,project_row['workspace_root'],start,end,a.get('include_logs',False))
         if action=='cli_usage_summary':
             import execution_usage
             return execution_usage.summary(db,project)
@@ -1038,9 +1068,16 @@ def legacy_run(action, a, path=None, locks=None):
                 if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
                 return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':project_row['max_parallel_agents']}}
             if action=='worker_launch':
+                import git_completion
+                git_completion.reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
                 reconcile_checkout_blocks(db,project_row,a['actor'])
+                import file_plan_repair
+                file_plan_repair.at_launch(db,project_row,a['actor'],activity,now)
+            import scheduling
+            scheduling.reconcile(db,project,a.get('actor'),activity,now,prefix)
             tasks = [context_tools.reminder_hint(db,project,task_dict(r, prefix)) for r in db.execute('SELECT * FROM tasks WHERE project=? ORDER BY priority,id', (project,))]
             done = {t['id'] for t in tasks if t['status'] == 'Done'}
+            ranking=scheduling.keys(tasks,a.get('actor'),scheduling.blocked_history(db,project))
             tasks = [t for t in tasks if not t['locked'] or t['owner_id'] == a.get('actor')]
             ready = lambda t: not t['blocked_reason'].strip() and all(i in done for i in t['dependencies'])
             blocked=[{'id':t['id'],'code':t['code'],'title':t['title'],'status':t['status'],'dependencies':t['dependencies'],'availability':'blocked_by_reason' if t['blocked_reason'].strip() else 'waiting_for_dependencies'} for t in tasks if t['status']=='Blocked']
@@ -1051,6 +1088,8 @@ def legacy_run(action, a, path=None, locks=None):
             mine=lambda t: a.get('actor') is not None and t['owner_id']==a.get('actor') and bool(t.get('continuity'))
             candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and mine(t)]
             candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and not mine(t)]
+            candidates.sort(key=lambda t:ranking[t['id']])
+            if a.get('actor') is not None and actor_user(db,a)['kind']=='agent':candidates=[t for t in candidates if not scheduling.human_only(t)]
             excluded=a.get('exclude_ids',[])
             if not isinstance(excluded,list) or len(excluded)>100 or any(type(i) is not int for i in excluded):
                 raise ValueError('exclude_ids must be a list of at most 100 task IDs')
@@ -1162,5 +1201,5 @@ def legacy_run(action, a, path=None, locks=None):
                 import context_tools
                 candidates[0]=context_tools.conditional(candidates[0],a['task_seen'])
             import context_tools
-            return {'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'capacity':{'active':active,'limit':limit},'file_conflicts_skipped':conflicts_skipped,'missing_workspace_skipped':missing_root,'invalid_files_skipped':invalid_files,**({'branch_skipped':branch_skipped} if branch_skipped else {}),'task': candidates[0] if candidates else None, 'blocked': blocked[:20], 'blocked_total': len(blocked), 'instruction': 'Resume In Progress, then actionable Blocked, then TODO. Claim task and planned files before edits; on conflict choose other work. No candidate can mean locked work or capacity/configuration limits, not an empty backlog. Never invent busywork.'}
+            return {'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'capacity':{'active':active,'limit':limit},'file_conflicts_skipped':conflicts_skipped,'missing_workspace_skipped':missing_root,'invalid_files_skipped':invalid_files,**({'branch_skipped':branch_skipped} if branch_skipped else {}),'task': candidates[0] if candidates else None, 'blocked': blocked[:20], 'blocked_total': len(blocked), 'instruction': 'Keep live claims first; native ordering inherits dependent urgency and favors ready work that unlocks others, with saved continuity reused when selected. Claim task and planned files before edits; on conflict choose other work. No candidate can mean locked work or capacity/configuration limits, not an empty backlog. Never invent busywork.'}
         raise ValueError('Unknown action')

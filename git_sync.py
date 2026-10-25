@@ -93,14 +93,19 @@ def validate(changed):
     if changed.get('git_remote') == '':
         raise ValueError('git_remote cannot be empty')
 
-def _git(root, *args, timeout=3):
+def _git(root, *args, timeout=3, input_text=None, index_file=None, literal_paths=True):
     flags = 0x08000000 if os.name == 'nt' else 0
     # A caller launched inside another worktree can export a foreign index or
     # object store. Keep normal identity/credential config, but scope paths to -C.
     locations={'GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_PREFIX','GIT_CEILING_DIRECTORIES','GIT_NAMESPACE','GIT_SHALLOW_FILE','GIT_QUARANTINE_PATH'}
     env={k:v for k,v in os.environ.items() if k.upper() not in locations}
     env.update(GIT_TERMINAL_PROMPT='0',GCM_INTERACTIVE='never',GIT_OPTIONAL_LOCKS='0')
-    return subprocess.run(['git', '--literal-pathspecs', '-C', str(root), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=flags,env=env)
+    # Only native callers may opt into a private index; inherited indexes remain ignored.
+    if index_file is not None:env['GIT_INDEX_FILE']=str(Path(index_file).resolve())
+    if not literal_paths:
+        for key in ('GIT_LITERAL_PATHSPECS','GIT_GLOB_PATHSPECS','GIT_NOGLOB_PATHSPECS','GIT_ICASE_PATHSPECS'):env.pop(key,None)
+    extra={'input':input_text} if input_text is not None else {}
+    return subprocess.run(['git', *(['--literal-pathspecs'] if literal_paths else []), '-C', str(root), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=flags,env=env,**extra)
 
 
 def is_ancestor(root,source,target):
@@ -209,13 +214,18 @@ def refresh_parent(root,settings,task,target,missing,workspace=None):
 
 
 def refresh_index_state(root):
-    """Refresh stat metadata once; never stage content or alter an existing index delta."""
+    """Refresh metadata only; never publish a different index blob or mode."""
     current=state(root)
     if current and current[1] and _git(root,'diff','--cached','--quiet').returncode==0:
         with checkout_lock(root):
             if _git(root,'diff','--cached','--quiet').returncode==0:
                 result=_git(root,'update-index','--refresh',timeout=5)
-                if result.returncode in (0,1):return state(root)
+                if result.returncode in (0,1):
+                    current=state(root)
+                    if current and current[1]:
+                        import git_index
+                        git_index.refresh_identical(root)
+                    return state(root)
     return current
 
 
@@ -273,7 +283,7 @@ def _on_claim(root, settings, task):
     except (OSError, subprocess.SubprocessError) as error:
         return {'branch': target, 'error': str(error)[:300]}
 
-def planned_paths(root,planned):
+def planned_paths(root,planned,include_ignored=False):
     """Exact paths only; ignore redundant folder markers, never expand folders."""
     import git_worktrees
     root=Path(root).resolve();paths=[]
@@ -292,7 +302,29 @@ def planned_paths(root,planned):
                 raise ValueError('Automatic commits require explicit files inside the checkout')
             continue
         if path.exists() or _git(root,'ls-files','--error-unmatch','--',relative).returncode==0:result.append(relative)
-    return sorted(set(result))
+    result=sorted(set(result))
+    if not include_ignored:
+        excluded=ignored_paths(root,result)
+        result=[p for p in result if p not in excluded]
+    return result
+
+
+def ignored_paths(root, paths):
+    """Ignored untracked outputs are local evidence, never forced into Git."""
+    if not paths:return set()
+    result=_git(root,'check-ignore','--stdin','-z',input_text='\0'.join(paths)+'\0',timeout=15,literal_paths=False)
+    if result.returncode not in (0,1):raise ValueError('Could not inspect ignored publication paths')
+    return set(filter(None,result.stdout.split('\0')))
+
+
+def path_chunks(paths,budget=12000):
+    """Bound UTF-16 argv size on Windows while retaining every explicit path."""
+    chunk=[];used=0
+    for path in paths:
+        size=len(path.encode('utf-16-le'))+8
+        if chunk and used+size>budget:yield chunk;chunk=[];used=0
+        chunk.append(path);used+=size
+    if chunk:yield chunk
 
 
 def _commit(root, settings, task, message):
@@ -301,16 +333,25 @@ def _commit(root, settings, task, message):
     except ValueError as error:return {'error':str(error)}
     if not pathspec:return {'committed':False,'reason':'no planned file exists in the checkout'}
     # Refuse pre-staged work on owned paths too: do not overwrite a human's index.
-    staged=_git(root,'diff','--cached','--quiet','--',*pathspec)
-    if staged.returncode==1:return {'error':'Planned files already contain staged changes; review them before automatic commit'}
-    if staged.returncode!=0:return {'error':'Could not inspect the staging area'}
-    changed=_git(root,'diff','--quiet','HEAD','--',*pathspec)
-    untracked=_git(root,'ls-files','--others','--exclude-standard','--',*pathspec)
-    if changed.returncode==0 and not untracked.stdout.strip():return {'committed':False,'reason':'nothing to commit'}
-    # --only commits these paths and preserves unrelated staged changes.
-    add = _git(root, 'add', '-A', '--', *pathspec, timeout=10)
-    if add.returncode:return {'error':'git add: '+(add.stderr or add.stdout).strip()[:300]}
-    commit = _git(root, 'commit', '--quiet', '--only', '-m', message, '--', *pathspec, timeout=10)
+    changed_any=False
+    for paths in path_chunks(pathspec):
+        staged=_git(root,'diff','--cached','--quiet','--',*paths)
+        if staged.returncode==1:return {'error':'Planned files already contain staged changes; review them before automatic commit'}
+        if staged.returncode!=0:return {'error':'Could not inspect the staging area'}
+        changed=_git(root,'diff','--quiet','HEAD','--',*paths)
+        untracked=_git(root,'ls-files','--others','--exclude-standard','--',*paths)
+        if changed.returncode not in (0,1) or untracked.returncode:return {'error':'Could not inspect planned changes'}
+        changed_any=changed_any or changed.returncode==1 or bool(untracked.stdout.strip())
+    if not changed_any:return {'committed':False,'reason':'nothing to commit'}
+    # NUL pathspec files avoid argv limits and preserve unrelated staged changes.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='scrum-pathspec-') as temporary:
+        manifest=Path(temporary)/'paths'
+        manifest.write_bytes(b'\0'.join(path.encode('utf-8') for path in pathspec)+b'\0')
+        options=['--pathspec-from-file='+str(manifest),'--pathspec-file-nul']
+        add=_git(root,'add','-A',*options,timeout=10)
+        if add.returncode:return {'error':'git add: '+(add.stderr or add.stdout).strip()[:300]}
+        commit=_git(root,'commit','--quiet','--only','-m',message,*options,timeout=10)
     if commit.returncode:return {'error':'git commit: '+(commit.stderr or commit.stdout).strip()[:300]}
     sha = _git(root, 'rev-parse', '--short', 'HEAD').stdout.strip()
     stat = _git(root, 'diff', '--shortstat', 'HEAD~1', 'HEAD').stdout.strip()
@@ -335,6 +376,16 @@ def parent_branch(root,source):
         result=_git(root,'config','--local','--get','branch.'+source+'.scrum-parent')
         return result.stdout.strip() if not result.returncode else ''
     except (OSError,subprocess.SubprocessError):return ''
+
+
+def publish_verified(root,remote,refspec):
+    """Retry one explicit transport failure with the same immutable refspec."""
+    attempts=0
+    while True:
+        result=_git(root,'push','--quiet',remote,refspec,timeout=PUSH_TIMEOUT)
+        attempts+=1
+        transient=re.search(r'Could not resolve host|Failed to connect|Connection (?:reset|timed out)|HTTP (?:500|502|503|504)',result.stderr or '',re.I)
+        if not result.returncode or attempts>=2 or not transient:return result,attempts
 
 
 def merge_completed(root,settings,source,*,capture_before=False,expected_source=None,expected_parent=None):
@@ -401,7 +452,8 @@ def _merge_completed_once(root,settings,source,base,tip):
     if already:report['already_integrated']=True
     if settings.get('git_push')!='Never':
         try:
-            pushed=_git(root,'push','--quiet',settings.get('git_remote','origin'),merged+':'+target,timeout=PUSH_TIMEOUT)
+            pushed,attempts=publish_verified(root,settings.get('git_remote','origin'),merged+':'+target)
+            report['publication_attempts']=attempts
             if pushed.returncode:report.update(error='Merge exists locally, but target push failed: '+pushed.stderr[-300:],pushed=False)
             else:report['pushed']=True
         except (OSError,subprocess.SubprocessError) as error:report.update(error=str(error)[:300],pushed=False)

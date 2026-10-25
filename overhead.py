@@ -21,6 +21,10 @@ def connection(project):
     db.execute('CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,actor INTEGER,started REAL,start_mode TEXT)')
     db.execute('CREATE TABLE IF NOT EXISTS scoped(session TEXT,task INTEGER,tool TEXT,calls INTEGER,errors INTEGER,request_bytes INTEGER,response_bytes INTEGER,elapsed_ms REAL,PRIMARY KEY(session,task,tool))')
     db.execute('CREATE TABLE IF NOT EXISTS timed_calls(at REAL,session TEXT,task INTEGER,tool TEXT,calls INTEGER,errors INTEGER,request_bytes INTEGER,response_bytes INTEGER,elapsed_ms REAL)')
+    if 'channel' not in {r[1] for r in db.execute('PRAGMA table_info(timed_calls)')}:
+        try:db.execute("ALTER TABLE timed_calls ADD COLUMN channel TEXT NOT NULL DEFAULT 'mcp'")
+        except sqlite3.OperationalError:
+            if 'channel' not in {r[1] for r in db.execute('PRAGMA table_info(timed_calls)')}:raise
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_at ON timed_calls(at)')
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_session ON timed_calls(session)')
     return db
@@ -41,9 +45,10 @@ def start_session(project,actor,mode,existing=None):
         db.close()
 
 
-def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, session=None, task=None, actor=None):
+def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, session=None, task=None, actor=None, channel='mcp'):
     if project is None:
         return
+    if channel not in ('mcp','cli','supervisor'):return
     try:
         db = connection(project)
         try:
@@ -53,7 +58,7 @@ def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, ses
                 session=session if row and (actor is None or row['actor']==actor) else ''
                 task=task if type(task) is int and task>0 else 0
                 db.execute('INSERT INTO scoped VALUES(?,?,?,1,?,?,?,?) ON CONFLICT(session,task,tool) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,request_bytes=request_bytes+excluded.request_bytes,response_bytes=response_bytes+excluded.response_bytes,elapsed_ms=elapsed_ms+excluded.elapsed_ms',(session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms))
-                db.execute('INSERT INTO timed_calls VALUES(?,?,?,?,1,?,?,?,?)',(time.time(),session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms))
+                db.execute('INSERT INTO timed_calls(at,session,task,tool,calls,errors,request_bytes,response_bytes,elapsed_ms,channel) VALUES(?,?,?,?,1,?,?,?,?,?)',(time.time(),session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms,channel))
         finally:
             db.close()
     except (OSError, ValueError, sqlite3.Error):
@@ -87,10 +92,20 @@ def metrics(project, filter_session=None, task=None, start_at=None, end_at=None)
             if task is not None:where.append('c.task=?');values.append(task)
             rows=[dict(r) for r in db.execute('SELECT c.tool,'+sums+' FROM timed_calls c WHERE '+' AND '.join(where)+' GROUP BY c.tool ORDER BY calls DESC',values)]
             tasks=[dict(r) for r in db.execute('SELECT c.task,'+sums+' FROM timed_calls c WHERE c.task>0 AND '+' AND '.join(where)+' GROUP BY c.task ORDER BY calls DESC,c.task LIMIT 50',values)]
+        dimensions=[];dimension_values=[]
+        if filter_session is not None:dimensions.append('c.session=?');dimension_values.append(filter_session)
+        if task is not None:dimensions.append('c.task=?');dimension_values.append(task)
+        if start_at is not None:dimensions.extend(['c.at>=?','c.at<=?']);dimension_values.extend([start_at,end_at])
+        suffix=(' WHERE '+' AND '.join(dimensions)) if dimensions else ''
+        channels=[dict(r) for r in db.execute('SELECT c.channel,'+sums+' FROM timed_calls c'+suffix+' GROUP BY c.channel ORDER BY c.channel',dimension_values)]
+        channel_tools=[dict(r) for r in db.execute('SELECT c.channel,c.tool,'+sums+' FROM timed_calls c'+suffix+' GROUP BY c.channel,c.tool ORDER BY calls DESC LIMIT 150',dimension_values)]
     finally:
         db.close()
     totals = {key: sum(r[key] for r in rows) for key in ('calls','errors','request_bytes','response_bytes','elapsed_ms')}
-    return {'scope': 'Local MCP calls since instrumentation; excludes web calls and model execution', 'totals': totals, 'tools': rows,'sessions':sessions,'tasks':tasks,'session_limit':20,'task_limit':50, 'tokens': None, 'timed_from':coverage, 'interval_filtered':start_at is not None, 'note': 'Bytes are UTF-8 JSON, not tokens. Server time excludes model time. Sessions use explicit measurement_session; untagged calls remain unattributed. start_mode is initial eligibility, not a claim that the entire session used that mode. Compare equivalent work before claiming savings.'}
+    measured={k:sum(r[k] for r in channels) for k in totals}
+    legacy={k:max(0,totals[k]-measured[k]) for k in totals}
+    if legacy['calls']:channels.append({'channel':'legacy_unknown',**legacy})
+    return {'channels':channels,'channel_tools':channel_tools,'scope': 'Local MCP, CLI and native supervisor operations; excludes web calls and model execution', 'totals': totals, 'tools': rows,'sessions':sessions,'tasks':tasks,'session_limit':20,'task_limit':50, 'tokens': None, 'timed_from':coverage, 'interval_filtered':start_at is not None, 'note': 'Bytes are UTF-8 logical/transport JSON, not tokens or shell context. CLI is measured once, without a nested MCP call. Supervisor is native coordination, not an AI execution. Untimestamped legacy aggregates have unknown channel. Server time excludes model time. Sessions use explicit measurement_session; untagged calls remain unattributed. start_mode is initial eligibility, not a claim that the entire session used that mode. Compare equivalent work before claiming savings.'}
 
 
 def usage_path(project, actor, client):

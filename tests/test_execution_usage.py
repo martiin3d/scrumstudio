@@ -11,6 +11,16 @@ class UsageTest(unittest.TestCase):
     tearDown=test_storage.StorageTest.tearDown
     project=test_storage.StorageTest.project
 
+    def test_six_task_batch_telemetry_matches_planner_and_mcp_schema(self):
+        from mcp_server import handle
+        from context_batches import CONTEXT_BATCH_SIZE
+        p,_=self.project();tasks=[run('task_create',dict(project=p,title='Batch outcome '+str(i),description='Telemetry fixture outcome',acceptance_criteria=['Valid telemetry is retained']))['id'] for i in range(CONTEXT_BATCH_SIZE)]
+        report=execution_usage.report(self.root/'missing',0,'codex','six-task-batch','',tasks)
+        response=handle(dict(jsonrpc='2.0',id=1,method='tools/call',params=dict(name='agent_checkpoint',arguments=dict(project=p,actor=self.agent,client='codex',action='offline',cli_usage_report=report))))
+        self.assertFalse(response['result'].get('isError',False),response)
+        result=run('coordination_metrics',dict(project=p,include_cli_usage=True))['cli_usage']
+        self.assertEqual(result['runs'],1)
+
     def test_supervisor_telemetry_does_not_expand_worker_schema(self):
         from unittest.mock import patch
         import sys

@@ -17,7 +17,7 @@ import time
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from mcp_client import ScrumClient
+from mcp_client import ScrumClient,ToolError
 from provider_usage import codex_usage, usage_file
 from cli_runtime import codex_executable,model_name,worker_python
 
@@ -25,6 +25,31 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 import execution_usage
 import idle_signals
+import run_cost
+import usage_measurement
+from worker_catalog import EXECUTION_TOOLS
+
+
+def usage_checkpoint(rpc,payload):
+    try:return rpc.call('agent_checkpoint',payload)
+    except ToolError as error:
+        # A returned schema rejection is known not to have committed. Never
+        # retry an uncertain transport write or lose Stop/handoff for metrics.
+        if 'cli_usage_report' not in payload or 'arguments.cli_usage_report' not in str(error):raise
+        print('CLI usage schema rejected; worker handoff continues without that report. Raw counters remain in the local worker log.',flush=True)
+        return rpc.call('agent_checkpoint',{k:v for k,v in payload.items() if k!='cli_usage_report'})
+
+
+def measured_report(folder,*args):
+    report=execution_usage.report(*args)
+    try:usage_measurement.record_run(folder,report)
+    except (OSError,ValueError,KeyError):pass
+    return report
+
+
+def finish_measurement(folder,reason,rpc,project,client='codex'):
+    try:return usage_measurement.finish(folder,reason,rpc,project,client=client)
+    except (OSError,ValueError,KeyError):return None
 
 
 def continue_after_task(task, batch_run, released):
@@ -32,7 +57,35 @@ def continue_after_task(task, batch_run, released):
     # Ordinary chaining never retries In Progress; closure recovery is bounded
     # separately and targets only the same unfinished task.
     if task.get('status') in ('Blocked','Cancelled'):return True
-    return bool(released.get('batch_complete')) if batch_run else task.get('status')=='Done'
+    # A verified Done result is progress even if an old worker closed its batch
+    # early. Release has already removed its reservations; native selection can
+    # safely choose remaining work. Stop/quota gates are checked by the caller.
+    return task.get('status')=='Done'
+
+
+def usage_retry_intent(report,requested,held,policy,usage_ready):
+    """Remember an authorized start through unknown telemetry, without polling AI."""
+    if report['control']['paused'] or not report.get('profile_enabled',True):return False,False
+    reason=str(report.get('reason',''))
+    if report.get('should_stop') and reason.startswith('Usage unknown'):
+        return held or requested,False
+    if report.get('should_stop') and reason.startswith(('5h usage ','weekly usage ')) and not policy.get('auto_resume_session_quota'):
+        return False,False
+    if held and usage_ready and not report.get('should_stop'):return False,True
+    return held,False
+
+
+def waiting_for_fresh_usage(report,usage_pending):
+    return (usage_pending and not report['control']['paused'] and report.get('profile_enabled',True)
+            and str(report.get('reason','')).startswith('Usage unknown or stale'))
+
+
+def preflight_transport_delay(error,attempt):
+    """Only reconcile/retry launch offers, never an uncertain task claim."""
+    message=str(error).lower()
+    if any(word in message for word in ('permission','access denied','quota','usage limit','unauthorized','git branch preparation')):return None
+    if not any(word in message for word in ('timed out','connection closed','connection reset','broken pipe','server exited','transport')):return None
+    return (2,5)[attempt] if 0<=attempt<2 else None
 
 
 def unfinished_owned(task,actor):
@@ -110,7 +163,98 @@ def worker_filesystem(folder):
 
 # Only the board workflow authorized by Start/Wakeup; never provider, human,
 # project administration, filesystem, network or arbitrary tool approvals.
-SCRUM_WORK_TOOLS=('work_start','next_work','task_get','task_search','task_plan','task_claim','task_release','task_update','task_changes','work_finish','agent_checkpoint','file_locks','note_check')
+SCRUM_WORK_TOOLS=EXECUTION_TOOLS
+
+
+def execution_prompt(project,folder,actor,client,offer,policy,role='',automatic=False,recovery=False):
+    """One compact execution contract; the claimed task is appended exactly once."""
+    authorization=('Human-enabled scoped Git recovery only.' if recovery else
+                   'Human-enabled quota autoresume continues the authorized backlog.' if automatic else
+                   'This human Wakeup authorizes the existing backlog.')
+    prompt=(f'Use scrum-work for project {project} in {folder}. Your persistent agent actor is {actor}; reuse it. '
+            +authorization+' Work ONLY on '+str(offer.get('code'))+' and successfully claimed batch successors, using the supervisor-supplied full scope. '
+            'Resume saved facts/checks; no startup board scan or replanning. Only current work is In Progress. '
+            'Headers are navigation only: load current full scope with task_get or work_start(id) only if no full claimed scope was supplied. '
+            'Retain acceptance criteria, blockers, checklist, evidence and continuity. '
+            'Use codebase-memory for structural queries with coverage/source fallback. Specialist skills only when needed. '
+            'Resolve skill references relative to each skill directory, never the target checkout. '
+            'Verify changed behavior proportionally; no routine full suite, duplicate diff review, evidence essay or successful log dump. '
+            'Reuse unchanged checks with original times; leave work unfinished when acceptance is unverified. '
+            'Fix scoped failures using a changed hypothesis; never repeat an unchanged failing launch. '
+            'Blocked needs a concrete unmet prerequisite/external constraint. Reserve all output/support files and Unity .meta sidecars. '
+            'Reuse human authorization already granted. Do not claim approval is pending without an actual request. '
+            'Never bypass a reviewer rejection. Request the real reviewed command retry for sandbox access errors; do not alter accounts/licenses. ')
+    if policy.get('agent_followup_tasks'):
+        prompt+=('Scoped follow-up planning is enabled: only for a concrete discovered prerequisite, search/reuse before task_plan, '
+                 'use defer_task=current ID, its token, prerequisites=[plan keys or IDs] and continuity to atomically park your task without rewriting acceptance. Exit on deferred=true for supervisor selection. Correct confirmed planning rejections in this run; uncertain writes still require reconciliation. No speculative backlog. ')
+    if offer.get('batch'):prompt=batch_prompt(prompt,offer['batch'],client,offer.get('code'))
+    else:prompt+='Finish verified work with work_finish(close_session=true,client="'+client+'"). '
+    prompt+='After exit the supervisor will continue with the next eligible task. '
+    prompt+='\nPython: '+json.dumps(worker_python())+' (PowerShell: &). Native MCP fallback: '+json.dumps(str(ROOT/'scripts/mcp_client.py'))+' --tool TOOL, JSON stdin; default timeouts cover Git completion; never print tokens. Quota is supervised outside the model; do not run --usage-once or probe usage at startup. '
+    prompt+='For human decisions use request_user_input or this Python + '+json.dumps(str(ROOT/'scripts/ask_human.py'))+' --project '+str(project)+' --actor '+str(actor)+' --question TEXT --options JSON_ARRAY; wait for the actual answer. '
+    if any(path.endswith('/Unity/Caches') and mode=='write' for path,mode in worker_filesystem(folder).items()):
+        prompt+='\nUnity checks: '+json.dumps(str(ROOT/'scripts/unity_verify.py'))+' --editor INSTALLED_EDITOR --project UNITY_ROOT --reuse [--filter TEST_NAME] [--graphics on]. For environment_access submit the reviewed retry in this turn. Inspect newest complete logs; require an executed/passing machine-readable report. Diagnose null references, blank captures and frame/layout timing before blaming the environment. '
+    prompt+='\nLarge generated/visual sets: native helper '+json.dumps(str(ROOT/'scripts/work_checks.py'))+' --help; read scrum-work references/efficient-checks.md only if needed. Read counts/exceptions; automated coverage plus representative variants and explicit visual cases. '
+    if policy.get('autonomy_mode')=='Autonomous':
+        prompt=prompt.replace('; wait for the actual answer.', '; if deferred=true, exit so other work continues.').replace('; wait for an actual answer.', '; if deferred=true, exit so other work continues.')
+        prompt=prompt.replace('For human decisions use request_user_input or this Python + ', 'For indispensable typed human decisions use this Python + ').replace('For real human decisions use request_user_input or ', 'For indispensable typed human decisions use ')
+    prompt+=autonomy_prompt(policy)
+    if role:prompt+='\nRole instructions:\n'+role+'\nStop, quota, ownership and verification rules apply; do not weaken them.'
+    return prompt
+
+
+def cli_prompt(project,folder,actor,client,offer,policy,started,role=''):
+    from scrum_cli import redact
+    import shlex
+    cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
+    prompt=(f'Use scrum-work for project {project}, actor {actor}, in {folder}. Human Wakeup authorizes this backlog. '
+        'SCRUM coordination channel is native CLI, not MCP. This overrides legacy transport wording in checkout instructions. '
+        'Use the supplied CLI only for Scrum; other configured MCP servers remain available for their own capabilities. '
+        'The supervisor already claimed the full task below. Do not start, claim, rediscover, scan the board or probe quota. '
+        'SCRUM_CLI_CONTEXT holds private ownership; never read/print it or supply tokens. Commands inherit it automatically. '
+        'Read scrum-work references/cli.md only for command details. '
+        'Execute the current acceptance, preserve existing work and reuse continuity and unchanged verification. '
+        'Use codebase-memory for structural queries with coverage/source fallback; stop graph retries after transport failure. '
+        'Reserve additional output files/Unity .meta sidecars before editing. Verify proportionally; no routine full suite, '
+        'duplicate review essay or successful log dump. Diagnose scoped errors with a changed hypothesis before blocking. '
+        'Respect Stop, quota, ownership, dependencies, physical review and actual permission review. Never bypass a rejection. '
+        'An explicit design decision does not by itself mean human approval: for routine missing UI states within authorized scope, record a minimal consistent choice unless the project explicitly reserves it for the human. Never claim unreferenced states match Figma. '
+        'Do not manually stash/reset/switch/publish in an ordinary task; Git integration is native at finish. '
+        'CLI command: '+cli+' show; '+cli+' lock --task CODE --paths relative/file; '
+        +cli+' update --task CODE --continuity "Done: ...; Next: ..."; '
+        +cli+' finish --task CODE --evidence "Verified ...". Finish only verified acceptance. '
+        'For complex arguments use call OPERATION --input JSON_FILE; help OPERATION shows its schema. '
+        'A failed/uncertain write must be reconciled, never blindly repeated; show/status are safe, pause hands control back. '
+        'Quota and idle checks are native, outside the model. ')
+    if policy.get('agent_followup_tasks'):
+        prompt+='Necessary scoped follow-ups are allowed: search/reuse before plan --input FILE. For a missing prerequisite of the current task, use a JSON object with items, defer_task=current ID, prerequisites=[plan keys or existing IDs], continuity; the CLI supplies the token, preserves acceptance and releases the claim/batch atomically. On deferred=true exit for supervisor selection. PLAN_REJECTED means rolled back: correct the plan in this run; only uncertain writes require pause. No speculative backlog. '
+    if offer.get('batch'):
+        prompt+='Reserved batch headers: '+json.dumps(offer['batch'],separators=(',',':'))+'. Other tasks remain TODO and reserved. Finish automatically requests the next fresh claim. Continue ONLY with successful next.claim and next.task, without restarting or rereading unchanged scope. Exit on batch_done, failed next claim, Stop/quota or real impediment. '
+    else:prompt+='Finish closes this session. Exit; the supervisor selects subsequent eligible work. '
+    if started['task'].get('category')=='Git recovery':
+        prompt+='Scoped Git recovery: preserve staging/unrelated work; honor recorded parents, never force push. Reuse retained verification; retest only conflict-resolution changes. If cleanup was rejected, do not repeat deletion. After inspecting and explicitly reserving every dirty file, native helper '+json.dumps(str(ROOT/'scripts/preserve_checkout.py'))+' --target EXISTING_INTEGRATED_BRANCH can retain exact bytes/hashes and unknown tracked edits in a private local branch, move exact untracked files without deletion, and switch only to a target already containing the source commits. It refuses foreign scope, staging, conflicts and unfinished integration. Do not publish retained unknown edits or infer provenance. Request normal reviewed execution; do not bypass a rejection. '
+    prompt+='Full claimed task and diagnostics: '+json.dumps(redact(started),ensure_ascii=False,separators=(',',':'))
+    prompt+='\nHelpers: '+json.dumps(str(ROOT/'scripts/unity_verify.py'))+' --reuse for Unity checks; '+json.dumps(str(ROOT/'scripts/work_checks.py'))+' --help for large file sets. Require actual executed machine-readable tests; compile is not visual proof. For real human decisions use request_user_input or '+json.dumps(str(ROOT/'scripts/ask_human.py'))+f' --project {project} --actor {actor} --question TEXT --options JSON_ARRAY; wait for an actual answer.'
+    if policy.get('autonomy_mode')=='Autonomous':
+        prompt=prompt.replace('; wait for the actual answer.', '; if deferred=true, exit so other work continues.').replace('; wait for an actual answer.', '; if deferred=true, exit so other work continues.')
+        prompt=prompt.replace('For human decisions use request_user_input or this Python + ', 'For indispensable typed human decisions use this Python + ').replace('For real human decisions use request_user_input or ', 'For indispensable typed human decisions use ')
+    prompt+=autonomy_prompt(policy)
+    if role:prompt+='\nRole instructions: '+role
+    return prompt
+
+
+def autonomy_prompt(policy):
+    standing=('\nHuman project execution instructions: '+policy['execution_instructions']) if policy.get('execution_instructions') else ''
+    if policy.get('autonomy_mode')!='Autonomous':return standing
+    return standing+('\nAutonomous decisions: resolve routine implementation, Git recovery, missing UI states and scoped technical errors yourself; reuse valid checks and existing authorization. Create/reuse a concrete prerequisite only when needed. Do not ask whether to continue, fix a failure or choose an ordinary implementation detail. Screenshots are internal verification, not routine human approval. Do not assume existing UI is wrong or redo verified work. Only for indispensable missing input, conflicting requirements, access, specific visual judgment or a human playtest, use ask --input FILE (or the supplied ask_human helper) with question_category, human_requirement explaining why only the human can resolve it, two or more concrete options and concise continuity. The native question parks only this task, releases its claims/batch and returns deferred=true: exit; the supervisor continues other ready work. Never poll the human or mark waiting work Done. Human answers reopen the task natively, subject to Stop/quota. Never auto-answer permission callbacks or fabricate physical reviews.')
+
+
+def batch_prompt(prompt,batch,client,code):
+    """One live claim, one CLI context, no contradictory single-task exit."""
+    prompt=prompt.replace('Complete all acceptance, verify, work_finish(close_session=true), exit; the supervisor will continue with the next eligible task.',
+                          'Complete and verify each task separately, preserving this CLI context until the batch finishes.')
+    prompt=prompt.replace('Claim an eligible task/files (claimed=true) ONLY for '+str(code),'Work sequentially starting with '+str(code))
+    return prompt+'\nSequential reserved batch headers (bounded; load only the current scope): '+json.dumps(batch,separators=(',',':'))+'. Others remain TODO and reserved, not In Progress. Finish each with work_finish(use_batch=true,claim_next=true,client="'+client+'"). Continue only with returned next.task and next.claim; a successful next.claim already grants its fresh token and full scope, so do not start/claim/read it again. A missing/failed next.claim requires task_get and task_update(claim=true) or the normal MCP fallback before edits. Exit when batch_done, session offline, Stop/quota or a real impediment; never select outside this batch yourself.'
 
 def skill_options():
     """Hide optional Scrum catalog entries for this run; files stay readable."""
@@ -122,7 +266,7 @@ def skill_options():
         if not isinstance(existing,list):return []
         entries=[dict(item) for item in existing]
         known={os.path.normcase(str(Path(item['path']).resolve())) for item in entries}
-        core={'scrum-work','scrum-resume','scrum-close','scrum-complete','scrum-usage','scrum-rules'}
+        core={'scrum-work'}
         for base in [home/'skills',Path.home()/'.agents/skills']:
             for path in sorted(base.glob('scrum-*')):
                 if path.name not in core and (path/'SKILL.md').is_file() and os.path.normcase(str(path.resolve())) not in known:
@@ -131,7 +275,7 @@ def skill_options():
         return ['-c','skills.config='+value] if entries else []
     except (OSError,ValueError,KeyError,TypeError):return []
 
-def command(client,folder,prompt,model='',policy_folder=None):
+def command(client,folder,prompt,model='',policy_folder=None,coordination_channel='mcp'):
     model=model_name(model)
     model_args=['--model',model] if model else []
     executable=codex_executable() if client=='codex' else shutil.which(client)
@@ -144,26 +288,32 @@ def command(client,folder,prompt,model='',policy_folder=None):
         options+=mcp_selection.codex_options(policy_folder or folder)
         options+=['-c','default_permissions="scrum-worker"','-c','permissions.scrum-worker.extends=":workspace"']
         rules=worker_filesystem(policy_folder or folder)
+        if coordination_channel=='cli':
+            import storage
+            rules={**rules,storage.registry_path().parent.as_posix():'write',(Path(policy_folder or folder)/'.scrum').as_posix():'write'}
         options+=['-c','permissions.scrum-worker.filesystem={'+','.join(json.dumps(path)+'='+json.dumps(mode) for path,mode in rules.items())+'}']
-        options+=['-c','mcp_servers.scrum-studio.tool_timeout_sec=180','-c','mcp_servers.scrum-studio.enabled=true','-c','mcp_servers.scrum-studio.command='+json.dumps(sys.executable),'-c','mcp_servers.scrum-studio.args='+json.dumps([str(ROOT/'mcp_server.py'),'--worker-schema']),'-c','mcp_servers.scrum-studio.enabled_tools='+json.dumps(SCRUM_WORK_TOOLS),'-c','mcp_servers.scrum-studio.default_tools_approval_mode="approve"']
+        if coordination_channel=='cli':
+            options+=['-c','mcp_servers.scrum-studio.enabled=false']
+        else:
+            options+=['-c','mcp_servers.scrum-studio.tool_timeout_sec=180','-c','mcp_servers.scrum-studio.enabled=true','-c','mcp_servers.scrum-studio.command='+json.dumps(sys.executable),'-c','mcp_servers.scrum-studio.args='+json.dumps([str(ROOT/'mcp_server.py'),'--worker-schema','--execution-schema']),'-c','mcp_servers.scrum-studio.enabled_tools='+json.dumps(SCRUM_WORK_TOOLS),'-c','mcp_servers.scrum-studio.default_tools_approval_mode="approve"']
         return [executable,*options,'exec','--ephemeral','--json','--skip-git-repo-check','--cd',str(folder),*model_args,'-']
     # Claude CLI: same worker catalog as Codex. A config file (not inline JSON)
     # survives Windows .cmd quoting. Preserve configured project MCP servers
     # (for example Unity or codebase-memory) instead of hiding required tools. Headless -p cannot
     # answer permission prompts, so the Scrum tools and workspace edits are
     # pre-approved explicitly; nothing bypasses permissions.
-    config,strict=claude_mcp_config(policy_folder or folder,with_mode=True)
+    config,strict=claude_mcp_config(policy_folder or folder,with_mode=True,include_scrum=coordination_channel!='cli')
     return [executable,'-p','Follow the Scrum task instructions supplied on stdin.','--output-format','stream-json','--verbose',*model_args,
             '--mcp-config='+str(config),*(['--strict-mcp-config'] if strict else []),'--permission-mode=acceptEdits',
-            '--allowedTools='+','.join(CLAUDE_WORK_TOOLS+tuple('mcp__scrum-studio__'+name for name in SCRUM_WORK_TOOLS))]
+            '--allowedTools='+','.join(CLAUDE_WORK_TOOLS+tuple('mcp__scrum-studio__'+name for name in SCRUM_WORK_TOOLS if coordination_channel!='cli'))]
 
 CLAUDE_WORK_TOOLS=('Read','Edit','Write','Glob','Grep','Bash(python:*)','Bash(python3:*)','Bash(py:*)','Bash(git status:*)','Bash(git diff:*)')
 
-def claude_mcp_config(folder=None,with_mode=False):
+def claude_mcp_config(folder=None,with_mode=False,include_scrum=True):
     import mcp_selection
     folder=Path(folder) if folder is not None else ROOT
-    servers,strict=mcp_selection.claude_config(folder,{'type':'stdio','command':sys.executable,'args':[str(ROOT/'mcp_server.py'),'--worker-schema']})
-    path=folder/'.scrum/local/claude-worker-mcp.json'
+    servers,strict=mcp_selection.claude_config(folder,{'type':'stdio','command':sys.executable,'args':[str(ROOT/'mcp_server.py'),'--worker-schema','--execution-schema']},include_scrum=include_scrum)
+    path=folder/('.scrum/local/claude-worker-mcp.json' if include_scrum else '.scrum/local/claude-cli-mcp.json')
     text=json.dumps({'mcpServers':servers},indent=2)
     path.parent.mkdir(parents=True,exist_ok=True)
     try:
@@ -192,7 +342,7 @@ def preclaim(rpc,project,actor,client,task,observed):
         branch_reason=('Checkout branch '+str(busy.get('current_branch','unknown'))+' cannot switch to '+str(busy.get('wanted','task branch'))+': '+str(busy.get('reason') or 'uncommitted work must be preserved')) if busy else ''
         reason=result.get('claim_deferred') or claim.get('reason') or branch_reason or 'Task ownership was not granted; inspect dependencies, file reservations and workflow policy'
         return {'should_stop':True,'reason':str(reason)[:500],**({'git_recovery':str(reason)[:1000]} if 'Git branch preparation failed:' in str(reason) else {})}
-    return {'task':result['task'],'token':claim['token'],**{k:claim[k] for k in ('dirty_planned','git') if k in claim}}
+    return {'task':result['task'],'token':claim['token'],'measurement_session':result.get('measurement_session'),**{k:claim[k] for k in ('dirty_planned','git') if k in claim}}
 
 def preclaimed_prompt(started):
     task=started['task']
@@ -325,7 +475,7 @@ def main():
         raise SystemExit('Start explicitly with --allow-run to authorize CLI execution from Wakeup. No worker was started.')
     if not re.fullmatch('[A-Za-z0-9_-]{1,40}',args.worker):
         raise SystemExit('Worker name must be 1..40 letters/digits/_/-')
-    rpc=ScrumClient()
+    rpc=ScrumClient(channel='supervisor')
     child=None;output=None;actor=None;log_path=None;log_offset=0;selected_model='';seen_model='';offered_task=None;launch_selection={};reroutes=0;batch_run=False;run_id='';run_tasks=[]
     usage_pool=ThreadPoolExecutor(max_workers=1)
     usage_future=None
@@ -344,20 +494,24 @@ def main():
         generation=status['control']['generation']
         attempted=generation # Ordinary bridge startup never consumes old Wakeup.
         pending_start=args.start_now
+        pending_usage_resume=False
         pending_auto=False
         recovery_attempts=set()
         checkout_attempts=set()
         incomplete_attempts={};pending_recovery=None
         capacity_attempts={};capacity_pending=None
+        preflight_attempts={}
         checkout_watch=None;checkout_seen=None
         profile_generation=managed['generation'] if managed else 0
         last_usage=float('-inf');last_policy=0;policy={};observed={}
         last_checkpoint=None;previous_running=False;control_stamp=idle_signals.stamp(folder)
+        cost_watch=None
         print('Bridge connected; press Wakeup in the project. Stop with Ctrl+C.',flush=True)
         while True:
             at=time.monotonic()
             signal_stamp=idle_signals.stamp(folder)
             signal_changed=signal_stamp!=control_stamp
+            control_signal_changed=signal_changed
             control_stamp=signal_stamp
             running=child is not None and child.poll() is None
             if checkout_watch is not None and child is None:
@@ -372,6 +526,9 @@ def main():
                 time.sleep(2)
                 continue
             last_checkpoint=at;previous_running=running
+            if cost_watch:
+                cost_watch.tick(active=running)
+                if not running:cost_watch=None
             if not policy or signal_changed or at-last_policy>=300:
                 policy=rpc.call('project_settings',{'project':args.project});last_policy=at
             if usage_future is not None and usage_future.done():
@@ -380,7 +537,9 @@ def main():
                 except Exception:
                     observed={}
                 usage_future=None
-            wants_usage=running or pending_start or pending_auto or capacity_due or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
+            try:usage_measurement.observe(folder,observed,args.client)
+            except (OSError,ValueError,KeyError):pass
+            wants_usage=running or pending_start or pending_usage_resume or pending_auto or capacity_due or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
             if wants_usage and at-last_usage>=policy.get('usage_check_seconds',60) and usage_future is None:
                 # A slow provider request must never block the local Stop loop.
                 usage_future=usage_pool.submit(usage_file,args.usage_file) if args.usage_file else usage_pool.submit(codex_usage) if args.client=='codex' else None
@@ -388,6 +547,11 @@ def main():
                     observed={}
                 last_usage=at
             report=rpc.call('agent_checkpoint',dict(project=args.project,actor=actor,client=args.client,action='observe',running=running,**({'profile_id':args.profile} if args.profile else {}),**observed))
+            if control_signal_changed and not running and usage_future is None and not report['control']['paused'] and report.get('profile_enabled',True):
+                # A human Wakeup/Start needs fresh native telemetry even within
+                # the ordinary polling interval. Checkout stat changes do not.
+                usage_future=usage_pool.submit(usage_file,args.usage_file) if args.usage_file else usage_pool.submit(codex_usage) if args.client=='codex' else None
+                last_usage=at
             actual=reported_model(log_path,log_offset) if log_path and selected_model else ''
             if actual and actual!=seen_model:
                 seen_model=actual
@@ -397,7 +561,7 @@ def main():
                 stop_child(child);output.close();output=None;child=None;running=False
                 error=f'Requested model {selected_model}, but CLI reported {actual}. Run stopped; select an available exact model or an intentional provider alias. No replacement was selected by Scrum Studio.'
                 chat_event(rpc,args.project,actor,error)
-                rpc.call('agent_checkpoint',{'project':args.project,'actor':actor,'client':args.client,'action':'offline','reason':'Provider model mismatch','run_exit_code':-1,'run_error':error,'cli_usage_report':execution_usage.report(log_path,log_offset,args.client,run_id,selected_model,run_tasks),'summary':'Worker stopped after model mismatch; validate any partial edits before resuming.'})
+                usage_checkpoint(rpc,{'project':args.project,'actor':actor,'client':args.client,'action':'offline','reason':'Provider model mismatch','run_exit_code':-1,'run_error':error,'cli_usage_report':measured_report(folder,log_path,log_offset,args.client,run_id,selected_model,run_tasks),'summary':'Worker stopped after model mismatch; validate any partial edits before resuming.'})
             if child and not running:
                 released=release_launch(rpc,args.project,actor) or {}
                 output.close();output=None
@@ -414,7 +578,7 @@ def main():
                 if unfinished:
                     summary=('Worker exited before closing this task. '+('One automatic closure recovery is queued. ' if retry else 'Automatic recovery limit/policy reached; do not loop. ')+
                              'Resume existing edits and remaining acceptance/Git closure. Retain verified checks when their inputs are unchanged; inspect the existing report before any rerun. Last worker response (verify claims against artifacts): '+answer)[:2000]
-                rpc.call('agent_checkpoint',{'project':args.project,'actor':actor,'client':args.client,'action':'offline','reason':report['reason'] if report['should_stop'] and report['reason'].startswith('5h usage ') else 'CLI failed' if child.returncode else 'Task closure incomplete' if unfinished else 'CLI session ended','run_exit_code':child.returncode,'run_error':error,'cli_usage_report':execution_usage.report(log_path,log_offset,args.client,run_id,selected_model,released.get('batch_tasks',run_tasks)),'summary':summary})
+                usage_checkpoint(rpc,{'project':args.project,'actor':actor,'client':args.client,'action':'offline','automatic':not bool(error) or str(report.get('reason','')).startswith('5h usage '),'reason':report['reason'] if report['should_stop'] and report['reason'].startswith('5h usage ') else 'CLI failed' if child.returncode else 'Task closure incomplete' if unfinished else 'CLI session ended','run_exit_code':child.returncode,'run_error':error,'cli_usage_report':measured_report(folder,log_path,log_offset,args.client,run_id,selected_model,released.get('batch_tasks',run_tasks)),'summary':summary})
                 if not error and offered_task is not None and not report['should_stop']:
                     from model_routing import request
                     previous_selection=released.get('batch_selection') or launch_selection
@@ -441,13 +605,23 @@ def main():
                 output.close();output=None;child=None
                 answer=final_message(log_path,log_offset)
                 chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: interrupted after Stop/quota signal. Task handoff and own lock release follow.'+('\nLast captured response (may predate interruption): '+answer if answer else ' No final response was captured; task handoff uses recorded progress.'))
-                rpc.call('agent_checkpoint',{'project':args.project,'actor':actor,'client':args.client,'action':'pause','reason':report['reason'],'summary':'','cli_usage_report':execution_usage.report(log_path,log_offset,args.client,run_id,selected_model,released.get('batch_tasks',run_tasks))})
+                usage_checkpoint(rpc,{'project':args.project,'actor':actor,'client':args.client,'action':'pause','automatic':True,'reason':report['reason'],'summary':'','cli_usage_report':measured_report(folder,log_path,log_offset,args.client,run_id,selected_model,released.get('batch_tasks',run_tasks))})
+            if report['should_stop'] and not running and str(report.get('reason','')).startswith(('5h usage ','weekly usage ')):
+                finish_measurement(folder,report['reason'],rpc,args.project,args.client)
+            if report['control']['paused'] and not running:
+                finish_measurement(folder,'Project Stop',rpc,args.project,args.client)
             if managed and not report.get('profile_enabled',True):break
+            requested=pending_start or report['control']['generation']>attempted or report.get('profile_generation',profile_generation)>profile_generation
+            pending_usage_resume,usage_restart=usage_retry_intent(report,requested,pending_usage_resume,policy,usage_ready)
+            if usage_restart:pending_start=True
             pending_auto=pending_auto or report.get('auto_resume',{}).get('requested',False)
             if report['control']['paused'] or report['should_stop'] or report.get('auto_resume',{}).get('status','').startswith(('disabled','cancelled')):
                 pending_auto=False
             if report['control']['paused'] or report['should_stop']:
-                pending_start=False;checkout_watch=None;checkout_seen=None;capacity_pending=None
+                # Keep the human's request while its one native quota read is
+                # still pending. Failure/high quota/Stop do not preserve it.
+                if not waiting_for_fresh_usage(report,usage_future is not None):pending_start=False
+                checkout_watch=None;checkout_seen=None;capacity_pending=None
             current=report['control']['generation']
             profile_request=report.get('profile_generation',profile_generation)>profile_generation
             recovery_id=report.get('git_recovery_id')
@@ -467,14 +641,28 @@ def main():
                         wanted=capacity_pending[1] if capacity_pending else pending_recovery or recovery_id
                         pending_recovery=None
                         offer=rpc.call('worker_launch',dict(project=args.project,actor=actor,action='reserve',client=args.client,**({'id':wanted} if wanted else {})))
+                        preflight_attempts.pop(current,None)
                         if recovery_id:recovery_attempts.add(recovery_id)
                     except RuntimeError as error:
                         capacity_pending=None
+                        attempt=preflight_attempts.get(current,0)
+                        delay=preflight_transport_delay(error,attempt)
+                        # The offer grants no editing token. Its acknowledged
+                        # release reconciles a lost response before any retry.
+                        released=release_launch(rpc,args.project,actor) if delay is not None else None
+                        if isinstance(released,dict) and 'released' in released:
+                            preflight_attempts[current]=attempt+1
+                            pending_start=True;pending_recovery=wanted
+                            print(f'Launch offer transport recovered; native retry {attempt+1}/2 in {delay}s. No model started.',flush=True)
+                            time.sleep(delay)
+                            continue
                         print('Wakeup preflight unavailable; no model started.',flush=True)
                         chat_event(rpc,args.project,actor,'Wakeup preflight failed; no model started: '+str(error)[:500])
                         time.sleep(2)
                         continue
                     if not offer.get('eligible'):
+                        if str(offer.get('reason','')).startswith('No eligible'):
+                            finish_measurement(folder,'No eligible work remains',rpc,args.project,args.client)
                         capacity_pending=None
                         if offer.get('checkout_recovery'):
                             checkout_watch=offer['checkout_recovery'].get('files',[])[:100]
@@ -500,26 +688,6 @@ def main():
                             chat_event(rpc,args.project,actor,'Capacity retry cancelled: model selection changed; send Wakeup to authorize the new selection.')
                             continue
                     checkout_watch=None;checkout_seen=None
-                    prompt=f'Use scrum-work and scrum-resume for project {args.project} in {folder}. Your persistent agent actor is {actor}; reuse it. This human Wakeup authorizes the existing backlog. Claim an eligible task/files (claimed=true) ONLY for '+str(offer.get('code'))+' (id '+str(offer.get('id'))+'). Complete all acceptance, verify, work_finish(close_session=true), exit; the supervisor will continue with the next eligible task. Partial implementation alone is no reason to hand off. Respect Stop/quota/WIP/dependencies/reservations; save unfinished facts only for a real interruption, retain valid checks, never poll models.'
-                    if policy.get('agent_followup_tasks'):
-                        prompt+=' The human enabled scoped autonomous follow-up tasks. For a concrete blocker within the authorized outcome, search existing work and use task_plan to create/refine minimal recovery/prerequisite tasks with acceptance criteria and real dependencies. If recovery must reuse partial edits on this branch, keep the same context_group. Do this only when needed, not at every task. Save/release current work before switching; the supervisor selects and claims eligible work. Never invent speculative backlog. An unidentified prior planning owner is not by itself an external blocker. For pre-existing documentation obstructing the checkout, inspect provenance and task records; within authorized scope reconcile and deliver only verified documentation under explicit file reservations, or ask a concrete unresolved authorship/content question. Never infer authorship from dirty paths or publish unknown work merely to clear the checkout.'
-                    prompt+=' Failed verification is work to diagnose, not by itself an external blocker. Fix scoped code, missing references and render/capture setup in this task; use a changed hypothesis and targeted check, never an unchanged retry loop. Blocked requires a concrete unmet prerequisite or external constraint, with attempted repair and the action needed to resume; a retry count alone is not a blocker. If a session must end while repair remains possible, save continuity and release as TODO instead. Required verification still pending means not Done. Reserve supporting files and Unity .meta sidecars belonging to your outputs; acquired reservations also extend the Git file plan.'
-                    if offer.get('batch'):
-                        prompt+='\nSequential batch headers (max3; load each scope only as needed): '+json.dumps(offer['batch'],separators=(',',':'))+'. Reuse this context. Work only on the current task; others stay unclaimed/TODO. Complete each using work_finish(use_batch=true,client=\"'+args.client+'\") without close_session. Continue ONLY with the returned next task after a fresh claim; when batch_done/session offline, exit. The server rechecks model/dependencies/locks. Never mark the whole batch In Progress.'
-                        prompt=prompt.replace('Verify, work_finish(close_session=true), exit;','Verify each task individually, then exit when the batch is finished;').replace('ONLY for '+str(offer.get('code')),'starting with '+str(offer.get('code')))
-                    prompt+='\nFollow the installed scrum-work skill; read its references/core-guidance.md only for batches or MCP recovery; resolve installed skill references relative to each skill directory, never the target checkout. Preflight, next_work, task_search and batch headers are navigation only: load current full scope with task_get or work_start(id) before editing, and preserve its acceptance criteria, blockers, checklist, evidence and continuity. If the task has continuity, resume from it and never redo recorded work or re-create tasks. Claim only the current task/files. Use codebase-memory when installed, otherwise direct source reads. Specialist skills/tools are loaded only on demand.'
-                    prompt+=' Reuse human authorization already granted for installed project tools. Do not claim approval is pending without an actual request; report real permission blockers through task continuity and Chat. Never bypass a reviewer rejection. On a recoverable tool error, inspect the concrete error and attempt a bounded authorized repair before exiting; never repeat an unchanged failing launch. If installed Unity cannot access its per-user configuration or licensing helper inside the sandbox, request normal reviewed execution of the specific test command; do not change licensing, broaden AppData access, or treat startup failure as test evidence. Required tests need a fresh machine-readable report with executed tests and a passing result, not just exit code 0; leave work unfinished when acceptance is unverified.'
-                    if any(path.endswith('/Unity/Caches') and mode=='write' for path,mode in worker_filesystem(folder).items()):
-                        prompt+='\nUnity tests: use '+json.dumps(str(ROOT/'scripts/unity_verify.py'))+' --editor INSTALLED_EDITOR --project UNITY_ROOT [--filter TEST_NAME]. Windows Unity licensing IPC/cache may be inaccessible inside the sandbox: when access is known to be blocked, request normal reviewed execution of this exact helper command upfront, using the supplied worker Python. If a sandbox attempt reports environment_access, actually submit the reviewed retry in this same turn; writing a future instruction is not recovery. Inspect the newest complete log: old licensing warnings may precede real compiler errors. Fix scoped compiler/test errors, then verify the changed inputs. A null font/reference or blank capture requires diagnosing asset binding, canvas/camera and render timing; it does not establish an external Unity failure. For a proven external constraint after actual reviewed recovery, record the concrete Blocked reason and required external action, close safely, and exit; the supervisor can take other eligible work. Never change license/account or bypass a reviewer rejection.'
-                    prompt+='\nHuman decision needed: use request_user_input if available, otherwise the supplied Python + '+json.dumps(str(ROOT/'scripts/ask_human.py'))+' --project '+str(args.project)+' --actor '+str(actor)+' --question TEXT --options JSON_ARRAY. The local helper shows Chat buttons and waits without model polling. Never send secrets or invent approval; wait for the actual answer.'
-                    if recovery_id:
-                        prompt=prompt.replace('This human Wakeup authorizes the existing backlog.','Human-enabled Git automation authorizes this scoped integration recovery only. Preserve existing work; do not repeat implementation. If blocked, record the blocker and exit without retry loops.')
-                    if automatic:
-                        prompt=prompt.replace('This human Wakeup authorizes the existing backlog.','Human-enabled session-quota autoresume continues the previously authorized backlog after a verified reset.')
-                    if role:
-                        prompt+='\nRole instructions:\n'+role+'\nScrum ownership, quota, Stop and verification rules apply; do not weaken them.'
-                    prompt+='\nPython: '+json.dumps(worker_python())+' (PowerShell: &). Quota is refreshed by this supervisor; do not run --usage-once or probe usage at startup. Planning/attachments/specialist tools or stalled MCP: this executable + '+json.dumps(str(ROOT/'scripts/mcp_client.py'))+' --tool TOOL, JSON stdin; default timeouts cover Git completion; never print tokens. If a helper is denied, request the minimum real tool escalation through auto_review rather than abandoning authorized work.'
-                    prompt+='\nValidated provider quota: '+json.dumps(observed)+'. Start AND claim in one call: work_start with actor/project/client, id=' + str(offer.get('id')) + ', claim=true (files only to change the planned set) and these fields while original observed_at is fresh; never replace the timestamp. claim.claimed=true gives the token; use task_claim only after claim_deferred or claimed=false. Supervisor refreshes quota; safe agent_checkpoint reuses it, no startup probe. Approval-required calls strictly sequentially; wait for results. On sandbox denial request the minimum required access normally (skills/Python included). Never bypass reviewer rejection or weaken sandbox/quota policy.'
                     # Supervisor pre-claim: start the session and claim the offered task
                     # in local code, so the model spends no turns on work_start/task_get.
                     started=preclaim(rpc,args.project,actor,args.client,offer['id'],observed)
@@ -541,7 +709,18 @@ def main():
                         time.sleep(2)
                         continue
                     if started.get('task'):
-                        prompt=prompt[:prompt.index('\nValidated provider quota: ')].replace('Claim an eligible task/files (claimed=true) ONLY for ','Work ONLY on ')+preclaimed_prompt(started)
+                        prompt=execution_prompt(args.project,folder,actor,args.client,offer,policy,role,automatic,bool(recovery_id))+preclaimed_prompt(started)
+                    if started.get('task',{}).get('category')=='Git recovery':
+                        prompt=(f'Use scrum-work for the existing scoped Git recovery in project {args.project}, actor {actor}. '
+                            'The supervisor already claimed it. Preserve unrelated work and staging, honor recorded branch parents, '
+                            'never force push or discard work. Read existing native Git reports and retained verification first; '
+                            'do not repeat implementation or unchanged Unity/tests. Test only code actually changed by conflict resolution. '
+                            'Complete the recorded recovery, publish normally, work_finish(close_session=true), and exit. '
+                            'For an unresolved concrete constraint save precise continuity; an unidentified owner alone is not a blocker. '
+                            'Respect Stop/quota/reservations and real permission review. '
+                            f'Python: {worker_python()}; MCP fallback: {ROOT / "scripts/mcp_client.py"}. '+preclaimed_prompt(started))
+                    channel=policy.get('coordination_channel','mcp')
+                    if channel=='cli':prompt=cli_prompt(args.project,folder,actor,args.client,offer,policy,started,role)
                     if args.client=='codex' and policy.get('agent_approval_mode')=='Full access':
                         prompt+='\nThis launch uses human-authorized Full access with approval policy never. Execute authorized project commands directly; previous sandbox-only failures do not establish a current access failure. The escalation advice above applies only to sandboxed launches. Do not request permission that this launch already has. Actual organization/OS restrictions still apply; diagnose real failures and attempt a bounded authorized repair, without weakening Stop, quota, ownership or verification.'
                     run_folder=Path(started.get('git',{}).get('worktree') or folder)
@@ -555,10 +734,18 @@ def main():
                         offered_task=offer['id'];launch_selection=offer.get('selection',{});batch_run=bool(offer.get('batch'));run_id=uuid.uuid4().hex;run_tasks=[item['id'] for item in offer.get('batch',[])] or [offered_task]
                         selected_model=launch_selection.get('model',report.get('profile_model',managed.get('model','') if managed else ''))
                         seen_model=''
+                        worker_env={**os.environ,'SCRUM_BRIDGE_WORKER':'1'}
+                        if channel=='cli':
+                            from scrum_cli import create_context
+                            context_path=folder/'.scrum/local/cli-context'/f'{run_id}.json'
+                            create_context(context_path,args.project,actor,args.client,started,batch_run)
+                            worker_env['SCRUM_CLI_CONTEXT']=str(context_path)
                         with tempfile.TemporaryFile(mode='w+b') as prompt_input:
                             prompt_input.write(prompt.encode('utf-8'));prompt_input.seek(0)
-                            launch=interactive_command(command(args.client,run_folder,prompt,selected_model,policy_folder=folder),args.client,args.project,actor,run_folder,selected_model,policy)
-                            child=subprocess.Popen(launch,cwd=run_folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**os.environ,'SCRUM_BRIDGE_WORKER':'1'},**options)
+                            launch=interactive_command(command(args.client,run_folder,prompt,selected_model,policy_folder=folder,coordination_channel=channel),args.client,args.project,actor,run_folder,selected_model,policy)
+                            cost_path=Path(folder)/'.scrum/local/run-cost'/f'{actor}.json'
+                            child=subprocess.Popen(launch,cwd=run_folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**worker_env,'SCRUM_RUN_COST_STATE':str(cost_path)},**options)
+                            cost_watch=run_cost.Watch(log_path,log_offset,cost_path,run_id,run_tasks,policy,args.client)
                     except (OSError,RuntimeError,ValueError) as error:
                         run_id=''
                         release_launch(rpc,args.project,actor)
@@ -573,13 +760,15 @@ def main():
     finally:
         if child and child.poll() is None:
             stop_child(child)
+        if 'cost_watch' in locals() and cost_watch:cost_watch.tick(active=False)
         if output:output.close()
         if actor:
             release_launch(rpc,args.project,actor)
             try:
-                rpc.call('agent_checkpoint',{'project':args.project,'actor':actor,'client':args.client,'action':'offline','summary':'Bridge disconnected. Resume from task history; validate partial edits.',**({'cli_usage_report':execution_usage.report(log_path,log_offset,args.client,run_id,selected_model,run_tasks)} if run_id and log_path else {})})
+                usage_checkpoint(rpc,{'project':args.project,'actor':actor,'client':args.client,'action':'offline','summary':'Bridge disconnected. Resume from task history; validate partial edits.',**({'cli_usage_report':measured_report(folder,log_path,log_offset,args.client,run_id,selected_model,run_tasks)} if run_id and log_path else {})})
             except RuntimeError:
                 pass
+        if 'folder' in locals():finish_measurement(folder,'Supervisor disconnected',rpc,args.project,args.client)
         rpc.close()
         usage_pool.shutdown(wait=False,cancel_futures=True)
 

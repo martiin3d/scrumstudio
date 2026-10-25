@@ -35,8 +35,8 @@ class ToolError(RuntimeError):
 
 
 class JsonClient:
-    def __init__(self,command):
-        self.process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',errors='replace')
+    def __init__(self,command,env=None):
+        self.process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',errors='replace',**({'env':env} if env is not None else {}))
         self.messages=queue.Queue()
         self.sequence=0
         threading.Thread(target=self._read,args=(self.process,self.messages),daemon=True).start()
@@ -96,9 +96,10 @@ class JsonClient:
                 except OSError:pass
 
 class ScrumClient(JsonClient):
-    def __init__(self,timeout=20):
-        self._initialize_timeout=timeout;self._source_stamp=server_stamp()
-        super().__init__([sys.executable,str(ROOT/'mcp_server.py')])
+    def __init__(self,timeout=20,channel='mcp'):
+        self._initialize_timeout=timeout;self._source_stamp=server_stamp();self._channel=channel
+        import os
+        super().__init__([sys.executable,str(ROOT/'mcp_server.py')],env={**os.environ,'SCRUM_COORDINATION_CHANNEL':channel})
         try:
             self.rpc('initialize',{'protocolVersion':'2024-11-05','capabilities':{},'clientInfo':{'name':'scrum-control-bridge','version':'1'}},timeout=timeout)
             self.send({'jsonrpc':'2.0','method':'notifications/initialized'})
@@ -108,7 +109,7 @@ class ScrumClient(JsonClient):
     def call(self,name,args,timeout=None):
         if not getattr(self,'_request_uncertain',False) and getattr(self,'_source_stamp',None) is not None and self._source_stamp!=server_stamp():
             # Between completed RPCs only. Never replay a write or stop a worker.
-            self.close();self.__init__(timeout=self._initialize_timeout)
+            self.close();self.__init__(timeout=self._initialize_timeout,channel=getattr(self,'_channel','mcp'))
         if timeout is None:timeout=tool_timeout(name,args)
         try:result=self.rpc('tools/call',{'name':name,'arguments':args},timeout=timeout)
         except RuntimeError:

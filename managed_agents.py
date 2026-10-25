@@ -54,19 +54,20 @@ def view(row,sessions,detail=False):
     if detail:result.update(instructions=row['instructions'],usage_file=row['usage_file'])
     return result
 
-def launch(db,row,project,folder,confirmed,sessions):
+def launch(db,row,project,folder,confirmed,sessions,start_now=True):
     if row['client']=='claude' and not confirmed:raise ValueError('Explicit authorization to use the configured Claude account is required')
     session=next((s for s in sessions if s['actor']==row['actor'] and s.get('bridge_connected')),None)
     if session:
         if not row['desired']:raise ValueError('Wait for the stopped bridge to disconnect before starting')
-        db.execute('UPDATE profiles SET generation=generation+1,error=? WHERE id=?',('',row['id']))
-        return 'start_requested'
+        if start_now:db.execute('UPDATE profiles SET generation=generation+1,error=? WHERE id=?',('',row['id']))
+        return 'start_requested' if start_now else 'already_connected'
     if row['desired'] and time.time()-row['started']<20:return 'starting'
     if row['client']=='claude' and not row['usage_file']:raise ValueError('Claude requires a configured absolute usage-file path')
     if not (codex_executable() if row['client']=='codex' else shutil.which(row['client'])):raise ValueError(row['client']+' CLI is not available; configure an installed runtime or PATH')
     db.execute('UPDATE profiles SET desired=1,generation=generation+1,started=?,error=? WHERE id=?',(time.time(),'',row['id']))
     db.commit() # The child must be able to read the profile immediately.
-    command=[sys.executable,str(ROOT/'scripts/agent_bridge.py'),'--project',str(project),'--client',row['client'],'--worker','profile-'+row['id'],'--profile',row['id'],'--allow-run','--start-now']
+    command=[sys.executable,str(ROOT/'scripts/agent_bridge.py'),'--project',str(project),'--client',row['client'],'--worker','profile-'+row['id'],'--profile',row['id'],'--allow-run']
+    if start_now:command.append('--start-now')
     if row['usage_file']:command+=['--usage-file',row['usage_file']]
     options={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {'start_new_session':True}
     log=Path(folder)/'.scrum/local'/('bridge-'+row['id']+'.log')
@@ -80,6 +81,7 @@ def launch(db,row,project,folder,confirmed,sessions):
 def operation(a,call):
     p=project_info(a['project'],call);mode=a.get('action','list')
     if mode not in ('list','get','create','update','start','stop'):raise ValueError('Invalid agent profile action')
+    if mode=='start' and type(a.get('start_immediately',True)) is not bool:raise ValueError('Invalid start setting')
     if mode in ('create','update','start','stop'):
         human=next((u for u in call('users',{}) if u['id']==a.get('actor') and u['kind']=='human' and u.get('active',1)),None)
         if not human:raise ValueError('Choose an active human to authorize agent control')
@@ -127,7 +129,7 @@ def operation(a,call):
             request='skipped_stopped' # Stop may have arrived after roster discovery.
         else:
             db.execute('UPDATE profiles SET resume_on_wakeup=1 WHERE id=?',(row['id'],))
-            request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions)
+            request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,start_now=a.get('start_immediately',True))
         result=view(profile(db,row['id']),sessions);result['request']=request
         return result
 

@@ -94,7 +94,7 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
                     if method=='item/fileChange/requestApproval':
                         params=dict(params,fileChanges=items.get(params.get('itemId'),{}).get('changes'))
                     for question in request_questions(method,params):
-                        if rpc is None:rpc=ScrumClient(timeout=10)
+                        if rpc is None:rpc=ScrumClient(timeout=10,channel='supervisor')
                         saved=rpc.call('agent_interaction',{'project':project,'actor':actor,'action':'request',**question})
                         keys.append(saved['id'])
                     pending[message['id']]={'method':method,'params':params,'keys':keys}

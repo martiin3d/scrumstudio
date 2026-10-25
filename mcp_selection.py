@@ -139,8 +139,12 @@ def codex_options(folder):
         raise ValueError('Codex MCP selection requires server IDs containing only letters, digits, underscores or hyphens')
     return [part for name in sorted(set(configured)|{REQUIRED}) for part in ('-c','mcp_servers.'+name+'.enabled='+('true' if name in names else 'false'))]
 
-def claude_config(folder,scrum):
+def claude_config(folder,scrum,include_scrum=True):
     configured,names=selected('claude',folder)
-    result={REQUIRED:scrum}
+    if not include_scrum and names is None:
+        configured,warnings=discover('claude',folder)
+        if warnings:raise ValueError('Cannot exclude Scrum: unreadable Claude MCP configuration')
+        names=set(configured)
+    result={REQUIRED:scrum} if include_scrum else {}
     if names is not None:result.update({name:configured[name] for name in names if name!=REQUIRED})
     return result,names is not None

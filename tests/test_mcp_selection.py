@@ -20,6 +20,13 @@ class SelectionTest(unittest.TestCase):
         self.home_patch=patch.object(Path,'home',return_value=self.home);self.home_patch.start()
     def tearDown(self):
         self.home_patch.stop();self.env.stop();self.temp.cleanup()
+    def test_cli_claude_inherits_specialists_but_excludes_global_scrum(self):
+        config=self.home/'.claude.json'
+        config.write_text(json.dumps({'mcpServers':{'scrum-studio':{'command':'old-scrum'},'graph':{'command':'graph'}}}))
+        result,strict=selection.claude_config(self.folder,{'command':'new-scrum'},include_scrum=False)
+        self.assertTrue(strict);self.assertNotIn('scrum-studio',result)
+        self.assertEqual(result['graph']['command'],'graph')
+
     def test_plugin_inventory_refresh_is_read_only_and_names_only(self):
         root=self.home/'.codex/plugins/cache/openai-curated-remote/figma/16.0.0'
         (root/'.codex-plugin').mkdir(parents=True)

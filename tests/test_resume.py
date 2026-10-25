@@ -62,7 +62,7 @@ class ResumeTest(unittest.TestCase):
             properties=next(t for t in tools if t['name']==name)['inputSchema']['properties']
             self.assertTrue({'context_group','model_tier','model_reason','verification_level','verification_reason'}<=properties.keys())
 
-    def test_paused_work_is_returned_first_and_listed_for_resume(self):
+    def test_paused_work_is_retained_without_overriding_higher_priority(self):
         other=run('task_create',dict(project=self.p,title='Other work',priority=1,**SPEC))['id']
         mine=run('task_create',dict(project=self.p,title='Half done',priority=3,**SPEC))['id']
         run('task_claim',dict(project=self.p,id=mine,actor=self.actor))
@@ -70,8 +70,8 @@ class ResumeTest(unittest.TestCase):
         started=self.start()
         self.assertEqual([t['id'] for t in started['resume']],[mine])
         self.assertIn('next: run tests',started['resume'][0]['continuity'])
-        self.assertEqual(started['next']['task']['id'],mine)
-        self.assertNotEqual(started['next']['task']['id'],other)
+        self.assertEqual(started['next']['task']['id'],other)
+        self.assertNotEqual(started['next']['task']['id'],mine)
 
     def test_retried_finish_reports_already_done(self):
         task=run('task_create',dict(project=self.p,title='Finish once',**SPEC))['id']

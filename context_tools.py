@@ -50,12 +50,18 @@ def conditional(task, seen=None):
     return task
 
 
-def agent_task(task):
+def agent_task(task, files_after=0, files_limit=20):
     """Human presentation metadata is available only via full=true/snapshot."""
     source_version=task.get('version')
     result={k:v for k,v in task.items() if k not in ('project','number','uid','updated','created')}
     if not result.get('blocked_reason'):result.pop('blocked_reason_kind',None)
     result['attachment_count']=len(result.pop('attachments',[]))
+    if type(files_after) is not int or files_after<0 or type(files_limit) is not int or not 1<=files_limit<=100:
+        raise ValueError('files_after must be nonnegative; files_limit must be 1..100')
+    files=result.get('files',[])
+    if files_after or len(files)>files_limit:
+        result['files']=files[files_after:files_after+files_limit]
+        result['files_page']={'total':len(files),'after':files_after,'next_after':min(len(files),files_after+files_limit),'has_more':files_after+files_limit<len(files)}
     for key in ('model_selection','scope_reason','model_reason','context_group'):
         if not result.get(key):result.pop(key,None)
     if result.get('verification_level','auto')=='auto' and not result.get('verification_reason'):
@@ -69,7 +75,7 @@ def agent_task(task):
 
 
 def search(db, project, prefix, args):
-    limit=args.get('limit',20);after=args.get('after',0)
+    limit=args.get('limit',5);after=args.get('after',0)
     if type(limit) is not int or not 1<=limit<=50 or type(after) is not int or after<0:
         raise ValueError('limit must be 1..50; after must be a nonnegative id')
     clauses=['project=?','id>?'];values=[project,after]

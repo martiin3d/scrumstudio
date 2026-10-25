@@ -14,3 +14,6 @@ Use the scrum-studio MCP with a known project and actor. Work in English.
 - Cancelled prerequisites are removed from dependent blocker lists, with an authored cancellation-resolution comment. A Blocked task returns to TODO when no task dependency or prose reason remains. Remaining blockers stay intact. Do not duplicate automatic cleanup or count cancellation as delivery. New cancelled prerequisites are rejected. Time spent Blocked is recorded automatically, including the server's return to TODO.
 
 Use [scrum-users](../scrum-users/SKILL.md) only when identity/lock handling is needed. Avoid snapshots unless planning requires the entire backlog.
+
+
+`blocked_reason_kind=human` identifies a real task-linked human question, not a technical failure or invented approval. In Autonomous mode create it through `agent_interaction` with typed context; the engine parks/releases that task and reopens it on a valid human answer, never marking it Done. Preserve separate external constraints. Do not auto-certify human/physical validation.

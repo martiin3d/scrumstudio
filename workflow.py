@@ -77,8 +77,9 @@ def operation(action, a, call):
             review=a.get('review_items',[])
             if not isinstance(review,list) or len(review)>100 or any(not isinstance(v,str) or not v.strip() or len(v)>4000 for v in review):
                 raise ValueError('Invalid review_items')
-            own=call('session_resume',base)
-            if own['active_tasks']>1 or own['own_file_locks']['has_more'] or any(lock['task']!=a['id'] for lock in own['own_file_locks'].get('items',[])):
+            own=call('session_resume',base|{'closing_task':a['id']})
+            other_files=own.get('other_own_file_locks',own['own_file_locks']['has_more'] or any(lock['task']!=a['id'] for lock in own['own_file_locks'].get('items',[])))
+            if own['active_tasks']>1 or other_files:
                 raise ValueError('Other own work/reservations require explicit handoff before closing')
         update = base | {k: a[k] for k in ('id', 'token', 'evidence', 'checklist', 'log','continuity','usage_report') if k in a}
         update['status'] = 'Done'
@@ -98,11 +99,11 @@ def operation(action, a, call):
                     result['retrospective']=call('note_add',{'project':project,'task':a['id'],'kind':'Retrospective','title':'Session retrospective','items':items})
                 if a.get('review_items'):
                     result['review']=call('note_add',{'project':project,'task':a['id'],'kind':'Review','title':'Session handoff','items':a['review_items']})
-                result['session']=call('agent_checkpoint',base | {'client':a['client'],'action':'offline','summary':'Verified task completed.'})
+                result['session']=call('agent_checkpoint',base | {'client':a['client'],'action':'offline','automatic':True,'summary':'Verified task completed.'})
             elif a.get('use_batch') and completed.get('status')=='Done':
                 result['next']=call('batch_next',base|{'id':a['id']})
                 if result['next'].get('batch_done'):
-                    result['session']=call('agent_checkpoint',base|{'client':a['client'],'action':'offline'})
+                    result['session']=call('agent_checkpoint',base|{'client':a['client'],'action':'offline','automatic':True})
             else:
                 result['next'] = call('next_work', base | seen)
             following=result.get('next') or {}
@@ -111,7 +112,7 @@ def operation(action, a, call):
                 try:
                     claim=call('task_claim', base | {'id':following['task']['id']})
                     if claim.get('claimed'):
-                        result['next']={**{k:v for k,v in following.items() if k!='task'},'task':call('task_get',{'project':project,'id':claim['id']}),'claim':claim}
+                        result['next']={**{k:v for k,v in following.items() if k!='task'},'task':call('task_get',{'project':project,'id':claim['id']}),'claim':claim,'ownership_granted':True}
                     else:
                         following['claim']=claim
                 except ValueError as error:

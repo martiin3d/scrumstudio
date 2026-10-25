@@ -69,7 +69,7 @@ class CachedUsageTest(unittest.TestCase):
         storage.atomic_json(target, {'session_used_percent':1,'weekly_used_percent':3,'observed_at':time.time()-1000})
         result = run('agent_checkpoint', {'project':project,'actor':self.agent,'client':'codex'})
         self.assertTrue(result['should_stop'])
-        self.assertIn('stale', result['reason'])
+        self.assertIn('5h usage', result['reason']) # Older cache cannot replace the newer high reading.
 
     def test_claude_reads_documented_status_line_feed(self):
         project, folder = self.project()

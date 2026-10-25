@@ -8,6 +8,6 @@ Use the `scrum-studio` MCP and follow the `scrum-work` skill (it covers start, r
 
 - Identity: Codex `agent:scrum:codex-primary`, Claude `agent:scrum:claude-primary`, or the distinct worker actor a CLI bridge supplies. Concurrent workers need distinct identities.
 - Resume your own unfinished tasks (`work_start` → `resume`) before planning or starting new work; never re-create or redo recorded work.
-- Coordinate only through MCP tools (or `scripts/mcp_client.py`), never direct database edits. If the MCP is unavailable, report it instead of bypassing reservations.
+- Coordinate through MCP tools (or `scripts/mcp_client.py`) or the first-party native `scrum.py` CLI when selected by the project/supervisor; never direct database edits. The CLI uses the same validation, ownership, Stop/quota and Git rules. If the MCP is unavailable, report it instead of bypassing reservations.
 - Never bypass Stop, quota policy (default 5h 92% / weekly 94%; unknown telemetry pauses), permissions or another agent's file reservations.
 - Never commit `.scrum/` or `data/`; use `project_export` for portable handoffs and `scrum-project-storage` for opening/importing/restoring (then re-resolve IDs and task codes).

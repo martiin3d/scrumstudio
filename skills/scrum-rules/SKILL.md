@@ -7,7 +7,7 @@ Before the first claim, map the whole known authorized scope to existing or new 
 
 ## Group or split
 
-The unit is **one result with its own acceptance check**, sized so a session finishes one to three tasks. Then decide with these criteria:
+The unit is **one independently verifiable result**. Do not size work to a fixed number of tasks per session or inflate Done counts by splitting phases. A session may finish many related small outcomes in one CLI; a difficult outcome may need more than one session. Then decide with these criteria:
 
 **Keep in one task** when any applies:
 - Same result with shared verification (API + storage + regression test of one fix).
@@ -16,7 +16,7 @@ The unit is **one result with its own acceptance check**, sized so a session fin
 - One piece cannot be verified without the other.
 
 **Split** when any applies:
-- The results ship or can be reverted independently.
+- The results ship or can be reverted independently and tracking them separately adds useful acceptance or ownership information. Independence alone does not require splitting a cohesive requested change.
 - They touch disjoint files or areas: another agent can take one in parallel.
 - They need different model tiers (mechanical low-risk edit = economy; implementation/debugging = standard; demonstrated difficult reasoning = advanced). Size alone does not select a model; auto defaults to standard.
 - Together they would likely exceed one session (a split task survives a Stop/resume with cleaner continuity).
@@ -26,7 +26,7 @@ The unit is **one result with its own acceptance check**, sized so a session fin
 
 ## Make split tasks cheap and parallel-safe
 
-- Always give each task an accurate minimal `files` plan. The server uses it to avoid conflicts between agents and to batch tasks that share files into one agent run (up to three, same priority and model), so related small tasks reuse context automatically while disjoint tasks go to other agents.
+- Always give each task an accurate minimal `files` plan. The server uses it to avoid conflicts between agents and to reuse context sequentially under native reservations. An explicit shared context_group permits up to six bounded non-Large tasks (bounded file/payload budgets); simple file-overlap groups remain capped at three. Only one task is In Progress and each closes separately. Model overrides, dependency urgency and fresh claims are rechecked, so independent work stays available to other agents.
 - Add `dependencies` only for real order constraints; a needless dependency serializes work and blocks other agents.
 - Same `context_group` for tasks that share reading context; it groups them on the board without claiming anything.
 - Check cached `max_parallel_agents`: with 1, lean toward fewer, cohesive tasks; with more, prefer splitting by disjoint files so agents do not wait on each other.

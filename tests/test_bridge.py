@@ -15,6 +15,138 @@ import provider_usage
 import agent_bridge
 
 class BridgeTest(unittest.TestCase):
+    def test_execution_prompt_is_bounded_and_preclaim_instructions_are_unambiguous(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp,patch.object(agent_bridge,'worker_filesystem',return_value={}):
+            offer={'id':1,'code':'FIX-1','batch':[{'id':i,'code':f'FIX-{i}','title':'Related outcome'} for i in range(1,7)]}
+            prompt=agent_bridge.execution_prompt(1,Path(temp),9,'codex',offer,{},role='Keep the actual review requirement.')
+            scope={'id':1,'code':'FIX-1','acceptance_criteria':['UNIQUE_SCOPE_MARKER'],'continuity':'Continue the preserved edit.'}
+            prompt+=agent_bridge.preclaimed_prompt({'task':scope,'token':'fixture-private-token'})
+            self.assertLess(len(prompt.encode()),5500)
+            self.assertEqual(prompt.count('UNIQUE_SCOPE_MARKER'),1)
+            self.assertNotIn('Validated provider quota:',prompt)
+            self.assertNotIn('Start AND claim in one call',prompt)
+            self.assertIn('Do NOT call work_start or task_claim again',prompt)
+            self.assertIn('claim_next=true',prompt)
+            self.assertIn('Others remain TODO and reserved, not In Progress',prompt)
+            self.assertIn('Never bypass a reviewer rejection',prompt)
+            self.assertIn('Keep the actual review requirement.',prompt)
+
+    def test_start_survives_missing_usage_until_fresh_data_without_busy_polling(self):
+        unknown={'should_stop':True,'reason':'Usage unknown or stale; report both provider windows before work','control':{'paused':False}}
+        held,start=agent_bridge.usage_retry_intent(unknown,True,False,{},True)
+        self.assertTrue(held);self.assertFalse(start)
+        ready={'should_stop':False,'reason':'','control':{'paused':False}}
+        held,start=agent_bridge.usage_retry_intent(ready,False,held,{},False)
+        self.assertTrue(held);self.assertFalse(start)
+        held,start=agent_bridge.usage_retry_intent(ready,False,held,{},True)
+        self.assertFalse(held);self.assertTrue(start)
+        self.assertEqual(agent_bridge.usage_retry_intent(unknown|{'control':{'paused':True}},True,True,{},True),(False,False))
+        high=unknown|{'reason':'5h usage 94% reached stop threshold 94%'}
+        self.assertEqual(agent_bridge.usage_retry_intent(high,False,True,{'auto_resume_session_quota':False},True),(False,False))
+
+    def test_bad_telemetry_schema_cannot_kill_pause_and_uncertain_writes_are_not_retried(self):
+        payload=dict(project=1,actor=9,client='codex',action='pause',cli_usage_report={'tasks':[1,2,3,4]})
+        error=agent_bridge.ToolError({'structuredContent':{'error':{'message':'Invalid item count for arguments.cli_usage_report.tasks'}}})
+        rpc=Mock();rpc.call.side_effect=[error,{'status':'paused'}]
+        self.assertEqual(agent_bridge.usage_checkpoint(rpc,payload)['status'],'paused')
+        self.assertEqual(rpc.call.call_count,2)
+        self.assertNotIn('cli_usage_report',rpc.call.call_args.args[1])
+        rpc=Mock();rpc.call.side_effect=RuntimeError('Connection closed; write is uncertain')
+        with self.assertRaises(RuntimeError):agent_bridge.usage_checkpoint(rpc,payload)
+        self.assertEqual(rpc.call.call_count,1)
+
+    def test_autonomy_contract_is_conditional_without_routine_approval_or_polling(self):
+        self.assertEqual(agent_bridge.autonomy_prompt({}),'')
+        text=agent_bridge.autonomy_prompt({'autonomy_mode':'Autonomous'})
+        self.assertIn('Screenshots are internal verification',text)
+        self.assertIn('deferred=true',text)
+        self.assertIn('Never poll the human',text)
+        self.assertIn('Never auto-answer permission',text)
+
+    def test_cli_prompt_is_single_scope_without_private_token_or_mcp_fallback(self):
+        started={'task':{'id':7,'code':'FIX-7','acceptance_criteria':['UNIQUE_ACCEPTANCE']},'token':'secret-claim','git':{}}
+        prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{'code':'FIX-7'}, {},started)
+        self.assertEqual(prompt.count('UNIQUE_ACCEPTANCE'),1)
+        self.assertNotIn('secret-claim',prompt)
+        self.assertNotIn('mcp_client.py',prompt)
+        self.assertIn('SCRUM_CLI_CONTEXT',prompt)
+        self.assertIn('finish --task CODE',prompt)
+
+    def test_cli_command_disables_only_scrum_and_keeps_specialist_selection(self):
+        with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=['-c','mcp_servers.unity.enabled=true']):
+            cmd=agent_bridge.command('codex',Path('.'),'scope',coordination_channel='cli')
+        self.assertIn('mcp_servers.scrum-studio.enabled=false',cmd)
+        self.assertNotIn('mcp_servers.scrum-studio.enabled=true',cmd)
+        self.assertIn('mcp_servers.unity.enabled=true',cmd)
+        self.assertNotIn('--execution-schema',str(cmd))
+
+    def test_managed_run_disables_redundant_scrum_skill_catalog_entries(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            home=Path(temp);skill_root=home/'.codex/skills'
+            for name in ('scrum-work','scrum-resume','scrum-rules','scrum-usage'):
+                p=skill_root/name;p.mkdir(parents=True);(p/'SKILL.md').write_text('fixture')
+            with patch.dict(os.environ,{'CODEX_HOME':str(home/'.codex')}),patch.object(agent_bridge.Path,'home',return_value=home):
+                options=agent_bridge.skill_options()
+            config=tomllib.loads(options[1])['skills']['config']
+            self.assertEqual({Path(x['path']).name for x in config},{'scrum-resume','scrum-rules','scrum-usage'})
+            self.assertTrue(all(not x['enabled'] for x in config))
+
+    def test_native_transport_retry_is_bounded_and_excludes_policy_failures(self):
+        for n,expected in enumerate((2,5,None)):
+            self.assertEqual(agent_bridge.preflight_transport_delay(RuntimeError('Connection closed'),n),expected)
+        for error in ('Permission denied during transport','Access denied','quota unavailable','Git branch preparation failed: timed out','Invalid task id'):
+            self.assertIsNone(agent_bridge.preflight_transport_delay(RuntimeError(error),0))
+
+    def test_pending_launch_survives_transport_only_after_offer_release_ack(self):
+        for acknowledged in (True,False):
+            with self.subTest(acknowledged=acknowledged),tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+                folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True);rpc=Mock();reserves=[]
+                def call(name,args):
+                    if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                    if name=='user_register':return {'id':9}
+                    if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                    if name=='project_settings':return {'usage_check_seconds':300}
+                    if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','control':{'generation':0,'paused':False}}
+                    if name=='worker_launch':
+                        if args.get('action')=='reserve':
+                            reserves.append(args)
+                            if len(reserves)==1:raise RuntimeError('Connection closed')
+                            return {'eligible':True,'id':1,'code':'FIX-1'}
+                        if not acknowledged:raise RuntimeError('Connection closed')
+                        return {'released':True}
+                    if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
+                    return {}
+                rpc.call.side_effect=call
+                pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':2};pool.submit.return_value=future
+                child=Mock();child.poll.return_value=None
+                with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge,'command',return_value=['fake']),patch.object(agent_bridge.subprocess,'Popen',return_value=child) as spawn,patch.object(agent_bridge,'stop_child'),patch.object(agent_bridge.time,'sleep',side_effect=[None,None,None,KeyboardInterrupt]):
+                    agent_bridge.main()
+                self.assertEqual(len(reserves),2 if acknowledged else 1)
+                self.assertEqual(spawn.call_count,1 if acknowledged else 0)
+    def test_cold_start_waits_for_fresh_quota_without_losing_the_request(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True);rpc=Mock()
+            def call(name,args):
+                if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                if name=='user_register':return {'id':9}
+                if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                if name=='project_settings':return {'usage_check_seconds':300}
+                if name=='agent_checkpoint' and args['action']=='observe':
+                    fresh='session_used_percent' in args
+                    return {'should_stop':not fresh,'reason':'' if fresh else 'Usage unknown or stale; report both provider windows before work','control':{'generation':0,'paused':False}}
+                if name=='worker_launch' and args.get('action')=='reserve':return {'eligible':True,'id':1,'code':'FIX-1'}
+                if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':1,'code':'FIX-1'}}
+                return {}
+            rpc.call.side_effect=call
+            pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':2};pool.submit.return_value=future
+            child=Mock();child.poll.return_value=None
+            with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge,'command',return_value=['fake']),patch.object(agent_bridge.subprocess,'Popen',return_value=child) as spawn,patch.object(agent_bridge,'stop_child'),patch.object(agent_bridge.time,'sleep',side_effect=[None,None,KeyboardInterrupt]):
+                agent_bridge.main()
+            spawn.assert_called_once();pool.submit.assert_called_once()
+            calls=[args for name,args in [c.args for c in rpc.call.call_args_list] if name=='agent_checkpoint' and args['action']=='observe']
+            self.assertNotIn('session_used_percent',calls[0]);self.assertEqual(calls[1]['session_used_percent'],1)
+        for report in ({'control':{'paused':True},'reason':'Usage unknown or stale'}, {'control':{'paused':False},'reason':'5h usage 94% reached limit'}, {'control':{'paused':False},'profile_enabled':False,'reason':'Usage unknown or stale'}):
+            self.assertFalse(agent_bridge.waiting_for_fresh_usage(report,True))
     def test_capacity_retry_is_bounded_and_respects_policy(self):
         allowed={'control':{'paused':False},'should_stop':False}
         for attempt,expected in enumerate((30,90,180,None)):
@@ -75,9 +207,9 @@ class BridgeTest(unittest.TestCase):
                 pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':1};pool.submit.return_value=future
                 with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge.time,'monotonic',side_effect=lambda:clock[0]),patch.object(agent_bridge.time,'sleep',side_effect=sleep),patch.object(agent_bridge.subprocess,'Popen') as spawn:
                     agent_bridge.main()
-                spawn.assert_not_called();pool.submit.assert_called_once()
-                self.assertLessEqual(len(observed),4)
-                if signal_at:self.assertEqual(offers,[6])
+                spawn.assert_not_called();self.assertEqual(pool.submit.call_count,2 if signal_at else 1)
+                self.assertLessEqual(len(observed),5)
+                if signal_at:self.assertEqual(offers,[8])
                 else:self.assertEqual(offers,[])
 
     def test_git_recovery_targets_one_offer_without_idle_model_retry(self):
@@ -219,7 +351,8 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('mcp_servers.scrum-studio.default_tools_approval_mode="approve"',codex)
         self.assertIn('mcp_servers.scrum-studio.tool_timeout_sec=180',codex)
         allowlist=json.loads(next(arg.split('=',1)[1] for arg in codex if arg.startswith('mcp_servers.scrum-studio.enabled_tools=')))
-        self.assertIn('task_claim',allowlist)
+        self.assertNotIn('task_claim',allowlist)
+        self.assertEqual(len(allowlist),9)
         self.assertIn('task_plan',allowlist)
         self.assertTrue({'user_manage','agent_manage','project_control','project_settings'}.isdisjoint(allowlist))
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox',codex)
@@ -247,7 +380,9 @@ class BridgeTest(unittest.TestCase):
         server=json.loads(config.read_text(encoding='utf-8'))['mcpServers']['scrum-studio']
         self.assertIn('--worker-schema',server['args'])
         allowed=next(arg.split('=',1)[1] for arg in claude if arg.startswith('--allowedTools=')).split(',')
-        self.assertIn('mcp__scrum-studio__work_start',allowed)
+        self.assertNotIn('mcp__scrum-studio__work_start',allowed)
+        self.assertIn('mcp__scrum-studio__work_finish',allowed)
+        self.assertIn('--execution-schema',server['args'])
         self.assertFalse(any('project_control' in name or name=='Bash' for name in allowed))
         self.assertIn('--permission-mode=acceptEdits',claude)
 
@@ -433,13 +568,14 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertEqual(len(saved),2)
             self.assertIn('existing.xml',saved[0]['summary'])
             self.assertIn('limit/policy reached',saved[1]['summary'])
+            self.assertTrue(all(payload.get('automatic') is True for payload in saved))
 
     def test_real_blocker_continues_other_work_without_retrying_unfinished_task(self):
         for batch in (False,True):
             self.assertTrue(agent_bridge.continue_after_task({'status':'Blocked'},batch,{}))
             self.assertTrue(agent_bridge.continue_after_task({'status':'Cancelled'},batch,{}))
             self.assertFalse(agent_bridge.continue_after_task({'status':'In Progress'},batch,{}))
-        self.assertFalse(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':False}))
+        self.assertTrue(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':False}))
         self.assertTrue(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':True}))
 
     def test_each_completed_task_gets_its_own_model_before_next_launch(self):
@@ -565,3 +701,11 @@ class ManagedBridgeTest(unittest.TestCase):
             (metadata/'index').write_text('updated')
             self.assertNotEqual(before,idle_signals.checkout_stamp(root,['../outside']))
             self.assertLessEqual(len(idle_signals.checkout_stamp(root,['file']*200)),104)
+
+    def test_followup_prompts_explain_atomic_handoff_and_confirmed_rejection(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp,patch.object(agent_bridge,'worker_filesystem',return_value={}):
+            policy={'agent_followup_tasks':True}
+            prompt=agent_bridge.cli_prompt(1,temp,9,'codex',{},policy,{'task':{'id':3,'code':'FIX-3'}})
+            self.assertIn('defer_task=current ID',prompt);self.assertIn('PLAN_REJECTED',prompt);self.assertIn('deferred=true',prompt)
+            mcp=agent_bridge.execution_prompt(1,Path(temp),9,'codex',{},policy)
+            self.assertIn('defer_task=current ID',mcp);self.assertIn('without rewriting acceptance',mcp)

@@ -44,36 +44,58 @@ def detail(db,project,task,prefix):
         if row:items.append({'id':row['id'],'code':f"{prefix}-{row['number']}",'title':row['title'],'status':row['status']})
     return {**held,'tasks':items}
 
+from worker_catalog import MAX_CONTEXT_BATCH_TASKS
+CONTEXT_BATCH_SIZE=MAX_CONTEXT_BATCH_TASKS
+CONTEXT_FILE_LIMIT=40
+CONTEXT_FILE_BUDGET=120
+
+
 def compatible(root,task):
-    return (task['scope_size']!='Large' and 0<len(task['files'])<=5 and
+    if root['scope_size']=='Large' or task['scope_size']=='Large':return False
+    grouped=bool(root.get('context_group') and root.get('context_group')==task.get('context_group'))
+    if grouped:
+        # .meta sidecars and discovered file plans do not imply unrelated context.
+        return len(root['files'])<=CONTEXT_FILE_LIMIT and len(task['files'])<=CONTEXT_FILE_LIMIT
+    return (0<len(root['files'])<=5 and 0<len(task['files'])<=5 and
             task['priority']==root['priority'] and bool(set(root['files']).intersection(task['files'])))
 
+
 def ready(db,project,task,allowed=()):
-    if task['blocked_reason'].strip():return False
+    if task['blocked_reason'].strip() and task.get('blocked_reason_kind')!='dependency':return False
     return all(dep in allowed or db.execute("SELECT 1 FROM tasks WHERE id=? AND project=? AND status='Done'",(dep,project)).fetchone() for dep in task['dependencies'])
 
-def plan(db,project,actor,root,tasks,selection,folder,size=3):
+def plan(db,project,actor,root,tasks,selection,folder,size=None):
     ensure(db)
     members=[root];used={root['id']};total=len(json.dumps(context_tools.agent_task(root)).encode())
-    isolated=db.execute('SELECT git_mode FROM projects WHERE id=?',(project,)).fetchone()[0]=='Worktrees'
+    grouped=bool(root.get('context_group'))
+    size=min(size or (CONTEXT_BATCH_SIZE if grouped else 3),CONTEXT_BATCH_SIZE)
+    planned_files=set(root['files'])
+    git_policy=db.execute('SELECT git_mode,git_merge FROM projects WHERE id=?',(project,)).fetchone()
+    isolated=git_policy['git_mode']=='Worktrees'
     profile=model_routing.profile_model(folder,actor)
     available=model_routing.catalog() if selection['client']=='codex' else None
-    if root['scope_size']!='Large' and 0<len(root['files'])<=5:
-        for task in tasks:
-            if len(members)>=size:break
-            if isolated and (not root.get('context_group') or task.get('context_group')!=root['context_group']):continue
-            if task['id'] in used or task['locked'] or task['status'] not in ('TODO','Blocked') or not compatible(root,task) or not ready(db,project,task,used):continue
-            held=reservation(db,project,task['id'])
-            if held and held['actor']!=actor:continue
-            if db.execute('SELECT 1 FROM worker_launch_offers WHERE project=? AND task=? AND actor!=? AND expires>?',(project,task['id'],actor,time.time())).fetchone():continue
-            try:
-                if coord.conflicts(db,coord.canonical_paths(folder,task['files']),task['id'],actor):continue
-                chosen=model_routing.select(task,selection['client'],profile,available)
-            except (OSError,ValueError):continue
-            if chosen['model']!=selection['model']:continue
-            cost=len(json.dumps(context_tools.agent_task(task)).encode())
-            if cost>4000 or total+cost>10000:continue
-            members.append(task);used.add(task['id']);total+=cost
+    if root['category'].strip().casefold()!='git recovery' and not (isolated and git_policy['git_merge']=='Task') and compatible(root,root):
+        # Revisit earlier dependent rows after reserving their prerequisites. The
+        # board is priority-ordered, not guaranteed to be topologically ordered.
+        changed=True
+        while changed and len(members)<size:
+            changed=False
+            for task in tasks:
+                if len(members)>=size:break
+                if isolated and (not root.get('context_group') or task.get('context_group')!=root['context_group']):continue
+                if task['category'].strip().casefold() in ('human review','git recovery') or task['id'] in used or task['locked'] or task['status'] not in ('TODO','Blocked') or not compatible(root,task) or not ready(db,project,task,used):continue
+                held=reservation(db,project,task['id'])
+                if held and held['actor']!=actor:continue
+                if db.execute('SELECT 1 FROM worker_launch_offers WHERE project=? AND task=? AND actor!=? AND expires>?',(project,task['id'],actor,time.time())).fetchone():continue
+                try:
+                    if coord.conflicts(db,coord.canonical_paths(folder,task['files']),task['id'],actor):continue
+                    chosen=model_routing.select(task,selection['client'],profile,available)
+                except (OSError,ValueError):continue
+                if chosen['model']!=selection['model']:continue
+                cost=len(json.dumps(context_tools.agent_task(task)).encode())
+                next_files=planned_files.union(task['files'])
+                if cost>(8000 if grouped else 4000) or total+cost>(24000 if grouped else 10000) or len(next_files)>CONTEXT_FILE_BUDGET:continue
+                members.append(task);used.add(task['id']);total+=cost;planned_files=next_files;changed=True
     ids=[task['id'] for task in members]
     previous=db.execute('SELECT * FROM context_batches WHERE project=? AND actor=?',(project,actor)).fetchone()
     group_id=''
@@ -137,6 +159,21 @@ def advance(db,project,actor,completed,policy,prefix):
         offered=db.execute('SELECT 1 FROM worker_launch_offers WHERE project=? AND task=? AND actor!=? AND expires>?',(project,task['id'],actor,time.time())).fetchone()
         if foreign or offered or task['status'] not in ('TODO','Blocked','In Progress') or not ready(db,project,task):position+=1;continue
         if task['status']=='In Progress' and not (task['locked'] and task['owner_id']==actor):position+=1;continue
+        import scheduling
+        all_tasks=[task_dict(r,prefix) for r in db.execute('SELECT * FROM tasks WHERE project=?',(project,))]
+        rank=scheduling.keys(all_tasks,actor,scheduling.blocked_history(db,project))
+        # Preserve context unless another ready task has greater urgency/impact.
+        # Leases, files and quota remain authoritative; no model call is added.
+        interrupt=False
+        for other in all_tasks:
+            if other['id'] in members or other['status'] not in ('TODO','Blocked') or other['locked'] or scheduling.human_only(other) or not ready(db,project,other):continue
+            if reservation(db,project,other['id']):continue
+            if db.execute('SELECT 1 FROM worker_launch_offers WHERE project=? AND task=? AND actor!=? AND expires>?',(project,other['id'],actor,time.time())).fetchone():continue
+            try:
+                if coord.conflicts(db,coord.canonical_paths(policy['workspace_root'],other['files']),other['id'],actor):continue
+            except (ValueError,OSError):continue
+            if rank[other['id']][1:4]<rank[task['id']][1:4]:interrupt=True;break
+        if interrupt:break
         if not compatible(root,task):break
         try:
             chosen=model_routing.select(task,row['client'],profile,available)

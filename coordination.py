@@ -7,10 +7,17 @@ import time
 from pathlib import Path
 
 from git_sync import GIT_DEFAULTS, validate as validate_git
-POLICY_DEFAULTS = {'agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS}
+from run_cost import DEFAULTS as COST_DEFAULTS
+POLICY_DEFAULTS = {'execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'mcp','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS, **COST_DEFAULTS}
 
 def validate_policy(changed):
     validate_git(changed)
+    if 'execution_instructions' in changed and (not isinstance(changed['execution_instructions'],str) or len(changed['execution_instructions'])>4000 or '\x00' in changed['execution_instructions']):raise ValueError('execution_instructions must be text, max4000 characters')
+    if 'autonomy_mode' in changed and changed['autonomy_mode'] not in ('Standard','Autonomous'):raise ValueError('autonomy_mode must be Standard or Autonomous')
+    if 'coordination_channel' in changed and changed['coordination_channel'] not in ('mcp','cli'):raise ValueError('coordination_channel must be mcp or cli')
+    for key in COST_DEFAULTS:
+        if key in changed and (type(changed[key]) is not int or not 0<=changed[key]<=1000000):
+            raise ValueError(key+' must be an integer 0..1000000; 0 disables this advisory')
     if 'agent_followup_tasks' in changed and (type(changed['agent_followup_tasks']) not in (bool,int) or changed['agent_followup_tasks'] not in (0,1)):raise ValueError('agent_followup_tasks must be boolean')
     if 'agent_approval_mode' in changed and changed['agent_approval_mode'] not in ('Auto review','Ask in chat','Full access'):
         raise ValueError('agent_approval_mode must be Auto review, Ask in chat or Full access')
@@ -90,9 +97,11 @@ def parallel_available(db,project,actor):
     return actor in actors or len(actors)<limit
 
 
+MAX_PLANNED_FILES=500
+
 def file_plan(value):
-    if not isinstance(value,list) or len(value)>100 or any(not isinstance(p,str) or not p.strip() or len(p)>1024 or '\x00' in p for p in value):
-        raise ValueError('files must contain at most 100 nonempty file paths, max 1024 characters each')
+    if not isinstance(value,list) or len(value)>MAX_PLANNED_FILES or any(not isinstance(p,str) or not p.strip() or len(p)>1024 or '\x00' in p for p in value):
+        raise ValueError(f'files must contain at most {MAX_PLANNED_FILES} nonempty file paths, max 1024 characters each')
     return list(dict.fromkeys(p.strip() for p in value))
 
 
@@ -103,7 +112,7 @@ def canonical_paths(root, paths):
     if not root:
         raise ValueError('Set project workspace_root before reserving files')
     base=Path(root).resolve()
-    result=[]
+    resolved=[]
     for value in paths:
         path=Path(value)
         path=(path if path.is_absolute() else base/path).resolve()
@@ -112,10 +121,15 @@ def canonical_paths(root, paths):
             path.relative_to(base)
         except ValueError:
             raise ValueError('File path escapes the project workspace') from None
-        if path == base or path.is_dir():
+        if path == base:raise ValueError('Reserve individual files, not directories')
+        resolved.append(path)
+    leaves=[path for path in resolved if not path.is_dir()]
+    for path in resolved:
+        if path.is_dir() and not any(child.is_relative_to(path) for child in leaves):
             raise ValueError('Reserve individual files, not directories')
-        result.append(os.path.normcase(str(path)))
-    return list(dict.fromkeys(result))
+    # Legacy plans may contain folder headings AND their explicit file list.
+    # Ignore only those redundant headings; never discover/expand a directory.
+    return list(dict.fromkeys(os.path.normcase(str(path)) for path in leaves))
 
 
 def conflicts(db, paths, task, actor):
@@ -266,10 +280,13 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         db.execute('UPDATE projects SET settings_version=settings_version+1 WHERE id=?',(project,))
         return settings(db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone())
     if action == 'session_resume':
-        actor=actor_user(db,a)
+        actor=actor_user(db,a);closing={}
+        if 'closing_task' in a:
+            if type(a['closing_task']) is not int or a['closing_task']<=0:raise ValueError('Invalid closing task')
+            closing['other_own_file_locks']=bool(db.execute('SELECT 1 FROM file_locks WHERE project=? AND owner_id=? AND task<>? AND lock_until>? LIMIT 1',(project,actor['id'],a['closing_task'],time.time())).fetchone())
         return {'settings':settings(project_row),'active_tasks':active_count(db,project,actor['id']),
                 'own_file_locks':page_locks(db,project=project,actor=actor['id'],after=a.get('after',0),limit=a.get('limit',20)),
-                'resume':resumable(db,project_row,actor['id'])}
+                'resume':resumable(db,project_row,actor['id']),**closing}
     mode=a.get('action','list')
     if mode=='list':
         if a.get('own'):
@@ -297,7 +314,7 @@ def operation(db, action, a, project_row, actor_user, activity, now):
             candidate=git_worktrees.logical(root,candidate if candidate.is_absolute() else root/candidate)
             discovered.append(candidate.relative_to(root).as_posix())
         previous=json.loads(task['files'] or '[]')
-        updated=file_plan([*previous,*discovered])
+        updated=file_plan(list(dict.fromkeys([*previous,*discovered])))
         added=len(updated)-len(previous)
         if added:
             db.execute('UPDATE tasks SET files=?,updated=? WHERE id=?',(json.dumps(updated),now(),task['id']))

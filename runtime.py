@@ -26,7 +26,7 @@ def migrate(db, separate=False):
         if name not in columns:db.execute(f'ALTER TABLE {ns}agent_sessions ADD COLUMN {name} {spec}')
 
 
-def quota_resume(db,project,actor,mode,why,old,running=False):
+def quota_resume(db,project,actor,mode,why,old,running=False,automatic=False):
     """Persist pause provenance and atomically consume one supervised reset."""
     policy=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
     session=db.execute('SELECT * FROM agent_sessions WHERE project=? AND actor=?',(project,actor)).fetchone()
@@ -34,21 +34,29 @@ def quota_resume(db,project,actor,mode,why,old,running=False):
     marker=session['resume_reset']
     state=session['auto_resume_status']
     consumed=False
+    closing=mode in ('pause','offline')
+    if automatic and closing:
+        # The lifecycle message is not a manual cancellation. Actual provider
+        # guards, not caller prose, establish a quota hold.
+        guard=quota_reason(policy,session,at)
+        why=guard
     if not policy['auto_resume_session_quota']:
         marker=None;state='disabled'
     elif c['paused'] or (marker is not None and session['resume_generation']!=c['generation']):
         marker=None;state='cancelled by human control'
-    elif mode in ('pause','offline') and not why.startswith('5h usage '):
+    elif closing and not automatic and not why.startswith('5h usage '):
         marker=None;state='cancelled by manual pause or session close'
-    elif state.startswith('cancelled') and mode=='observe':
+    elif state.startswith('cancelled') and (mode=='observe' or automatic):
         marker=None # Late supervisor observations cannot undo an explicit pause.
     elif mode=='check' and not why:
         state='active session; no quota pause'
-    elif why.startswith('5h usage ') and (mode=='check' or mode=='observe' and running or mode in ('pause','offline') and old and old['resume_reset'] is not None):
+    elif why.startswith('5h usage ') and (mode=='check' or mode=='observe' and (running or state=='eligible continuation after automatic session close') or closing and (automatic or old and old['resume_reset'] is not None)):
         reset=session['session_resets_at']
         if reset is not None and reset>at and session['usage_at']>=at-max(30,policy['usage_check_seconds']*2):
-            marker=reset;state='waiting for fresh session reset; requires connected CLI supervisor'
+            marker=marker if marker is not None else reset;state='waiting for fresh session reset; requires connected CLI supervisor'
             db.execute('UPDATE agent_sessions SET resume_generation=? WHERE project=? AND actor=?',(c['generation'],project,actor))
+    elif automatic and closing and marker is None:
+        state='eligible continuation after automatic session close'
     if marker is not None and mode=='observe' and not running and not why:
         fresh=at-max(30,policy['usage_check_seconds']*2)<=session['usage_at']<=at+5
         known=all(session[k] is not None for k in ('session_used_percent','weekly_used_percent','session_resets_at','weekly_resets_at'))
@@ -218,6 +226,7 @@ def operation(db, action, a, project, actor_user, required, now, activity):
     mode=a.get('action','check')
     if mode not in ['check','pause','offline','observe']:
         raise ValueError('action must be check, pause, offline or observe')
+    if type(a.get('automatic',False)) is not bool:raise ValueError('automatic must be boolean')
     client=a.get('client')
     if client not in ['codex','claude']:
         raise ValueError('client must be codex or claude')
@@ -225,15 +234,19 @@ def operation(db, action, a, project, actor_user, required, now, activity):
     db.execute('INSERT INTO agent_sessions(project,actor,client,heartbeat) VALUES(?,?,?,?) ON CONFLICT(project,actor) DO UPDATE SET client=excluded.client,heartbeat=excluded.heartbeat',(project,actor['id'],client,time.time()))
     fields=['session_used_percent','weekly_used_percent','session_resets_at','weekly_resets_at']
     if any(k in a for k in fields):
+        observed=a.get('observed_at',time.time())
+        if type(observed) not in [int,float] or not math.isfinite(observed) or observed<0 or observed>time.time()+5:
+            raise ValueError('Invalid usage observation timestamp')
         for key in fields:
             value=a.get(key)
             if value is not None and (type(value) not in [int,float] or not math.isfinite(value) or value<0 or ('percent' in key and value>100)):
                 raise ValueError('Invalid provider usage value')
-            db.execute(f'UPDATE agent_sessions SET {key}=? WHERE project=? AND actor=?',(value,project,actor['id']))
-        observed=a.get('observed_at',time.time())
-        if type(observed) not in [int,float] or not math.isfinite(observed) or observed<0 or observed>time.time()+5:
-            raise ValueError('Invalid usage observation timestamp')
-        db.execute('UPDATE agent_sessions SET usage_at=? WHERE project=? AND actor=?',(observed,project,actor['id']))
+        # Replayed bridge/cache samples cannot roll back newer provider telemetry.
+        # This never freshens a timestamp; expiry and quota limits still apply.
+        if old is None or observed>=old['usage_at']:
+            for key in fields:
+                db.execute(f'UPDATE agent_sessions SET {key}=? WHERE project=? AND actor=?',(a.get(key),project,actor['id']))
+            db.execute('UPDATE agent_sessions SET usage_at=? WHERE project=? AND actor=?',(observed,project,actor['id']))
     why=reason(db,project,actor['id'])
     if mode in ['pause','offline']:
         why=required(a.get('reason','Session paused' if mode=='pause' else 'Session closed'),'reason',500)
@@ -257,7 +270,7 @@ def operation(db, action, a, project, actor_user, required, now, activity):
     if not isinstance(text,str) or len(text)>2000:
         raise ValueError('summary must be text, max2000')
     released=handoff(db,project,actor['id'],why,text,now,activity) if why and mode!='observe' else 0
-    resume=quota_resume(db,project,actor['id'],mode,why,old,a.get('running',False))
+    resume=quota_resume(db,project,actor['id'],mode,why,old,a.get('running',False),a.get('automatic',False))
     db.execute('UPDATE agent_sessions SET status=?,reason=? WHERE project=? AND actor=?',(status,why,project,actor['id']))
     usage_error=''
     if 'cli_usage_report' in a:

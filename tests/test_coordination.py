@@ -12,6 +12,23 @@ from store import run
 
 
 class CoordinationTest(unittest.TestCase):
+
+    def test_redundant_folder_heading_does_not_expand_a_legacy_file_plan(self):
+        import coordination
+        with tempfile.TemporaryDirectory(dir='data') as temp:
+            root=Path(temp).resolve();folder=root/'UI';folder.mkdir()
+            (folder/'explicit.cs').write_text('known file')
+            (folder/'unlisted.cs').write_text('must not be reserved')
+            planned=coordination.canonical_paths(root,['UI','UI/explicit.cs','UI/future.cs'])
+            self.assertEqual(planned,[os.path.normcase(str(folder/'explicit.cs')),os.path.normcase(str(folder/'future.cs'))])
+            with self.assertRaisesRegex(ValueError,'individual files'):
+                coordination.canonical_paths(root,['UI'])
+            with self.assertRaisesRegex(ValueError,'individual files'):
+                coordination.canonical_paths(root,['.','UI/explicit.cs'])
+            with self.assertRaisesRegex(ValueError,'escapes'):
+                coordination.canonical_paths(root,['UI','../outside.cs'])
+
+
     def setUp(self):
         root=Path(__file__).resolve().parents[1]/'data'
         root.mkdir(exist_ok=True)
