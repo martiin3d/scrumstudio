@@ -700,6 +700,7 @@ def legacy_run(action, a, path=None, locks=None):
             lock_access(row, a)
             import context_batches
             context_batches.check_claim(db,project,row['id'],actor['id'])
+            if row['status']=='Backlog':raise ValueError('Backlog tasks require explicit human promotion to TODO before claiming')
             if row['status'] in ['Done', 'In Review','Cancelled']:
                 raise ValueError('Reopen the task before claiming it')
             if row['blocked_reason'].strip():
@@ -744,6 +745,9 @@ def legacy_run(action, a, path=None, locks=None):
             import planning
             return planning.apply(db,a,project)
         if action == 'task_create':
+            initial=a.get('status','TODO')
+            if initial not in ('TODO','Backlog'):raise ValueError('New tasks start in TODO or Backlog')
+            if initial=='Backlog' and actor_user(db,a)['kind']!='human':raise ValueError('Only a human can place tasks in Backlog')
             title = required(a.get('title'), 'title', 240)
             scope = required(a.get('description'),'description',12000)
             criteria = acceptance_criteria(a.get('acceptance_criteria'))
@@ -768,11 +772,12 @@ def legacy_run(action, a, path=None, locks=None):
             validate_verification(a.get('verification_level','auto'),a.get('verification_reason',''))
             db.execute('UPDATE tasks SET verification_level=?,verification_reason=? WHERE id=?',(a.get('verification_level','auto'),a.get('verification_reason',''),cur.lastrowid))
             db.execute('UPDATE tasks SET context_group=? WHERE id=?',(validate_context_group(a.get('context_group','')),cur.lastrowid))
-            telemetry.transition(db,cur.lastrowid,'TODO' ,a.get('actor'),source='created')
-            activity(db, cur.lastrowid, a.get('actor'), 'created', 'Task created in TODO.')
+            db.execute('UPDATE tasks SET status=? WHERE id=?',(initial,cur.lastrowid))
+            telemetry.transition(db,cur.lastrowid,initial,a.get('actor'),source='created')
+            activity(db, cur.lastrowid, a.get('actor'), 'created', 'Task created in '+initial+'.')
             if a.get('log'):
                 activity(db, cur.lastrowid, actor_user(db,a)['id'], 'work', required(a['log'], 'log', 2000))
-            return {'id': cur.lastrowid, 'code': f'{prefix}-{number}', 'status': 'TODO'}
+            return {'id': cur.lastrowid, 'code': f'{prefix}-{number}', 'status': initial}
         if action == 'task_update':
             db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT * FROM tasks WHERE id=? AND project=?', (int(a['id']), project)).fetchone()
@@ -805,7 +810,7 @@ def legacy_run(action, a, path=None, locks=None):
                     raise ValueError('Claim requires In Progress')
                 if old['status'] in ['Done', 'In Review','Cancelled']:
                     raise ValueError('Reopen the task before claiming')
-            recovering = old['lock_until'] <= time.time() and a.get('status') in ['TODO','Blocked','Cancelled'] and a.get('actor') is not None and actor_user(db,a)['kind'] == 'human'
+            recovering = old['lock_until'] <= time.time() and a.get('status') in ['Backlog','TODO','Blocked','Cancelled'] and a.get('actor') is not None and actor_user(db,a)['kind'] == 'human'
             if old['status'] == 'In Progress' and old['lock_until'] <= time.time() and not claiming and not recovering:
                 raise ValueError('Work lock expired or released; claim again before editing')
             if 'context_group' in a:
@@ -850,6 +855,9 @@ def legacy_run(action, a, path=None, locks=None):
                 activity(db,t['id'],a['actor'],'comment','Human requested retry in TODO; previous blocker cleared: '+old['blocked_reason'][:1800])
             if claiming:
                 t['status'] = 'In Progress'
+            if old['status']!=t['status'] and 'Backlog' in (old['status'],t['status']):
+                if actor_user(db,a)['kind']!='human':raise ValueError('Only a human can move tasks into or out of Backlog')
+                if old['status']=='Backlog' and t['status'] not in ('TODO','Cancelled'):raise ValueError('Move Backlog tasks to TODO before starting or completing them')
             required(t['title'], 'title', 240)
             description(t['description'])
             if 'description' in a:

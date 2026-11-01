@@ -42,7 +42,7 @@ def _apply(db,a,project):
     items=a.get('items')
     if not isinstance(items,list) or not 1<=len(items)<=10:
         raise ValueError('Plan needs 1..10 concrete outcomes')
-    allowed={'id','key','title','description','acceptance_criteria','priority','category','files','dependencies','scope_size','scope_reason','model_tier','model_reason','verification_level','verification_reason','context_group'}
+    allowed={'id','key','title','description','acceptance_criteria','priority','category','files','dependencies','scope_size','scope_reason','model_tier','model_reason','verification_level','verification_reason','context_group','status'}
     prepared=[];keys={};existing=set()
     for item in items:
         if not isinstance(item,dict) or set(item)-allowed:
@@ -67,6 +67,10 @@ def _apply(db,a,project):
             import model_routing
             validate_verification(item.get('verification_level','auto'),item.get('verification_reason',''))
             model_routing.validate('',item.get('model_tier','auto'),item.get('model_reason',''))
+        initial=item.get('status',old['status'] if old else 'TODO')
+        if old and initial!=old['status']:raise ValueError('Use task_update to move an existing task')
+        if not old and initial not in ('TODO','Backlog'):raise ValueError('New tasks start in TODO or Backlog')
+        if initial=='Backlog' and actor['kind']!='human':raise ValueError('Only a human can plan tasks in Backlog')
         description=required(item.get('description'),'description',12000)
         criteria=acceptance_criteria(item.get('acceptance_criteria'))
         size=item.get('scope_size',old['scope_size'] if old else 'Unknown')
@@ -99,9 +103,10 @@ def _apply(db,a,project):
             number=db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE project=?',(project,)).fetchone()[0]
             task=db.execute('INSERT INTO tasks(project,title,description,acceptance_criteria,priority,category,files,scope_size,scope_reason,number,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                             (project,value['title'],value['description'],json.dumps(value['criteria']),rank,category,json.dumps(value['files']),value['size'],value['reason'],number,now())).lastrowid
-            status='TODO'
+            status=item.get('status','TODO')
+            db.execute('UPDATE tasks SET status=? WHERE id=?',(status,task))
             telemetry.transition(db,task,status,actor['id'],source='created')
-            activity(db,task,actor['id'],'created','Task planned in TODO; execution remains unclaimed.')
+            activity(db,task,actor['id'],'created','Task planned in '+status+'; execution remains unclaimed.')
         import model_routing
         tier=item.get('model_tier',old['model_tier'] if old else 'auto')
         model_reason=item.get('model_reason',old['model_reason'] if old else '')

@@ -520,3 +520,7 @@ Settings → Agent autonomy offers Standard (default) and Autonomous. Autonomous
 Optional native screenshot diagnostics (requires Pillow in the selected interpreter; not a dependency of the web/MCP/CLI core): `python scripts/visual_compare.py --reference reference.png --actual actual.png --output comparison`. It produces a cached overlay, raw pixel diff and report. These are agent verification aids, not a fidelity percentage or a mandatory human review. Existing valid work should not be re-audited without changes or a concrete concern.
 
 Standing project execution instructions (human-only, max4000 characters) can be configured beside autonomy. They apply on each managed launch and are empty by default, avoiding duplicated policy text across task descriptions.
+
+### Human-controlled Backlog
+
+Backlog is an optional parking state before To do. Create a task there, or move an existing task to its Backlog column. Agents never select, claim or promote parked tasks; completing/cancelling prerequisites and Wakeup leave them parked. Move a task to To do manually, or explicitly instruct the assistant to activate that named task using your human profile. Human cancellation is supported; starting/completing parked work requires activation first. MCP task_create and new task_plan items accept status=Backlog for a human actor; TODO remains the default. This adds no model calls or polling.

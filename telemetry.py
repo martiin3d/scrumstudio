@@ -2,7 +2,7 @@
 import time
 from datetime import datetime, timedelta, timezone
 
-STATUSES = ['TODO','In Progress','Blocked','In Review','Done','Cancelled']
+STATUSES = ['Backlog','TODO','In Progress','Blocked','In Review','Done','Cancelled']
 
 
 def migrate(db):
@@ -103,10 +103,10 @@ def metrics(db, project, days=30, include_series=False, at=None, start_at=None, 
         began=next((r['entered'] for r in intervals if r['status']=='In Progress' and r['entered']<=last),None)
         if began is not None:
             cycle.append(max(0,last-began))
-    nonterminal=sum(state_seconds[s] for s in STATUSES if s not in ['Done','Cancelled'])
+    nonterminal=sum(state_seconds[s] for s in STATUSES if s not in ['Backlog','Done','Cancelled'])
     result={'days':days,'start_at':start,'end_at':at,'from_utc':datetime.fromtimestamp(start,timezone.utc).isoformat(),'as_of_utc':datetime.fromtimestamp(at,timezone.utc).isoformat(),
             'total_tasks':len(tasks),'distribution':distribution,
-            'open_tasks':sum(distribution[s] for s in STATUSES if s not in ['Done','Cancelled']),
+            'open_tasks':sum(distribution[s] for s in STATUSES if s not in ['Backlog','Done','Cancelled']),
             'done_transitions':len(done_events),'completed_tasks':len({r['task'] for r in done_events}),
             'cancelled_transitions':len(cancelled_events),
             'average_lead_seconds':round(sum(lead)/len(lead),3) if lead else None,'lead_samples':len(lead),
