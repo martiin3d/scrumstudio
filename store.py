@@ -207,6 +207,8 @@ def task_dict(row, prefix, include_cost=False):
     t['dependencies'] = json.loads(t['dependencies'])
     t['checklist'] = json.loads(t['checklist'])
     t['files'] = json.loads(t['files'])
+    decisions=json.loads(t.pop('decisions','[]'))
+    if decisions:t['decisions']=decisions
     t['attachments'] = json.loads(t['attachments'])
     t['model_selection']=json.loads(t['model_selection'])
     t['acceptance_criteria'] = json.loads(t['acceptance_criteria'])
@@ -618,6 +620,11 @@ def legacy_run(action, a, path=None, locks=None):
                     if inputs:
                         task['preserved_inputs']=inputs
                         task['version']=context_tools.digest(task)
+                import task_decisions
+                relevant=task_decisions.context(db,project,task,prefix,a)
+                if relevant:
+                    task['decision_context']=relevant
+                    task['version']=context_tools.digest(task)
                 if a.get('full'):
                     import context_batches
                     group=context_batches.detail(db,project,row['id'],prefix)
@@ -722,7 +729,7 @@ def legacy_run(action, a, path=None, locks=None):
             telemetry.transition(db,row['id'],'In Progress',actor['id'])
             if row['lock_until'] <= time.time():
                 activity(db, row['id'], actor['id'], 'claim', 'Claimed task; status In Progress.')
-            claimed={'claimed':True,'id': row['id'], 'code': f"{prefix}-{row['number']}", 'owner_id': actor['id'], 'token': token, 'lock_until': until, 'status': 'In Progress','files_reserved':len(paths)}
+            claimed={'claimed':True,'id': row['id'], 'code': f"{prefix}-{row['number']}", 'owner_id': actor['id'], 'token': token, 'lock_until': until, 'status': 'In Progress','files_reserved':len(paths) if coord.file_lock_mode(db,project,row['id'])=='files' else 0,'file_lock_mode':coord.file_lock_mode(db,project,row['id'])}
             if row['lock_until'] <= time.time():
                 # Fresh claim: tell the worker which planned files were already edited on
                 # disk (not its work) so it reviews them before building on them.
@@ -771,6 +778,11 @@ def legacy_run(action, a, path=None, locks=None):
             old = db.execute('SELECT * FROM tasks WHERE id=? AND project=?', (int(a['id']), project)).fetchone()
             if not old:
                 raise ValueError('Task not found')
+            if 'decisions' in a:
+                user=actor_user(db,a)
+                if user['kind']!='human' and not (old['status']=='In Progress' and old['owner_id']==user['id'] and old['lock_until']>time.time()):raise ValueError('Record decisions under your live task claim, or ask its human owner')
+                import task_decisions
+                task_decisions.save(db,project,old['id'],a['decisions'],prefix)
             routing_only=set(a)-{'project','id','actor','token','measurement_session'} <= {'model'} and 'model' in a
             if not (routing_only and actor_user(db,a)['kind']=='human'):lock_access(old, a)
             if routing_only:
@@ -860,6 +872,11 @@ def legacy_run(action, a, path=None, locks=None):
             t['category'] = required(t['category'], 'category', 80)
             t['checklist'] = checklist(t['checklist'])
             t['files'] = coord.file_plan(t['files'])
+            if 'additional_files' in a:
+                if 'files' in a:raise ValueError('Use files or additional_files, not both')
+                runtime.gate(db,project,a.get('actor'))
+                owned=coord.own_task(db,a)
+                t['files']=coord.extend_unreserved_scope(db,project,owned,a['additional_files'])
             if not isinstance(t['evidence'],str) or len(t['evidence'])>4000:
                 raise ValueError('evidence must be text, max 4000 characters')
             if old['status']=='Done' and t['status']!='Done' and 'evidence' not in a:
@@ -982,7 +999,7 @@ def legacy_run(action, a, path=None, locks=None):
             unblocked = resolve_dependents(db, project, t['id'], prefix, a.get('actor')) if t['status'] in ['Done','Cancelled'] and old['status'] != t['status'] else []
             result = {'id': t['id'], 'code': t['code'], 'status': t['status'], 'unblocked': unblocked[:20], 'unblocked_total': len(unblocked)}
             if claiming:
-                result.update(claimed=True,token=token, lock_until=until, owner_id=owner,files_reserved=len(paths))
+                result.update(claimed=True,token=token, lock_until=until, owner_id=owner,files_reserved=len(paths) if coord.file_lock_mode(db,project,t['id'])=='files' else 0,file_lock_mode=coord.file_lock_mode(db,project,t['id']))
                 if git:result['git']=git
             if completion_requested:
                 git=git_done(db,project,dict(t,context_group=a.get('context_group',old['context_group'])),prefix,a.get('actor') if a.get('actor') is not None else owner)
@@ -1152,7 +1169,7 @@ def legacy_run(action, a, path=None, locks=None):
                             unfinished=[t for t in tasks if task_branch(t)==owned and t['status']=='Blocked' and t['owner_id']==a.get('actor')]
                             safe=bool(unfinished)
                             reserved=any(Path(lock['path']).is_relative_to(Path(project_row['workspace_root']).resolve()) for lock in db.execute('SELECT path FROM file_locks WHERE lock_until>?',(time.time(),)))
-                            if safe and not reserved:
+                            if safe and not reserved and not db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>? LIMIT 1',(project,time.time())).fetchone():
                                 import git_paused
                                 planned=[]
                                 for t in unfinished:planned.extend(git_worktrees.files(project_row['workspace_root'],t['files']))
@@ -1160,9 +1177,9 @@ def legacy_run(action, a, path=None, locks=None):
                                     with git_sync.checkout_lock(project_row['workspace_root']):
                                         groups={t.get('context_group','').strip() for t in unfinished}
                                         group=next(iter(groups)) if len(groups)==1 else ''
-                                        paused=git_paused.pause(project_row['workspace_root'],owned,planned,[t['code'] for t in unfinished],context_group=group)
+                                        paused=git_paused.pause(project_row['workspace_root'],owned,planned,[t['code'] for t in unfinished],context_group=group,retain_unplanned=settings.get('autonomy_mode')=='Autonomous' and settings.get('max_parallel_agents',1)==1)
                                     if paused:
-                                        for t in unfinished:activity(db,t['id'],a['actor'],'comment','git: unfinished edits preserved in a private local checkpoint; restored automatically on this branch before resuming. Not merged or pushed.')
+                                        for t in unfinished:activity(db,t['id'],a['actor'],'comment','git: unfinished edits preserved in a private local checkpoint; restored automatically on this branch before resuming. Not merged or pushed.'+(' Unplanned edits retained separately, never adopted/restored as task work: '+paused['manifest'] if paused.get('unplanned_retained') else ''))
                                         owned=None;checkout_recovery=None
                                 except (ValueError,OSError,subprocess.SubprocessError) as error:
                                     # Preservation errors keep the branch busy. Its

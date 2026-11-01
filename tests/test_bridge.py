@@ -709,3 +709,12 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertIn('defer_task=current ID',prompt);self.assertIn('PLAN_REJECTED',prompt);self.assertIn('deferred=true',prompt)
             mcp=agent_bridge.execution_prompt(1,Path(temp),9,'codex',{},policy)
             self.assertIn('defer_task=current ID',mcp);self.assertIn('without rewriting acceptance',mcp)
+
+    def test_single_worker_prompt_omits_per_file_lock_commands(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            started={'task':{'id':7,'code':'FIX-7'},'token':'private-fixture','file_lock_mode':'checkout'}
+            prompt=agent_bridge.cli_prompt(1,temp,9,'codex',{}, {},started)
+            self.assertNotIn(' lock --task CODE',prompt)
+            self.assertNotIn('Reserve additional output files/Unity',prompt)
+            self.assertIn('additional_files',prompt);self.assertIn('do not call file_locks/lock',prompt)
+            self.assertIn('Single-worker checkout exclusivity',agent_bridge.preclaimed_prompt(started))

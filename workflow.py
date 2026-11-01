@@ -81,7 +81,7 @@ def operation(action, a, call):
             other_files=own.get('other_own_file_locks',own['own_file_locks']['has_more'] or any(lock['task']!=a['id'] for lock in own['own_file_locks'].get('items',[])))
             if own['active_tasks']>1 or other_files:
                 raise ValueError('Other own work/reservations require explicit handoff before closing')
-        update = base | {k: a[k] for k in ('id', 'token', 'evidence', 'checklist', 'log','continuity','usage_report') if k in a}
+        update = base | {k: a[k] for k in ('id', 'token', 'evidence', 'checklist', 'log','continuity','usage_report','additional_files','decisions') if k in a}
         update['status'] = 'Done'
         # A retried finish (lost response, resumed session) must not re-record
         # or ask the worker to redo verified delivery.
@@ -93,6 +93,9 @@ def operation(action, a, call):
         # Completion commits before selection. A later selection failure never
         # rolls back verified delivery or asks the worker to complete it again.
         result = {'completed': completed}
+        if completed.get('integration_pending'):
+            result['next']={'integration_pending':True,'ownership_granted':False,'instruction':'Verified source is not fully closed. Do not claim a successor or repeat implementation; native closure/recovery owns the remaining Git step.'}
+            return result if a.get('verbose',False) else decision_payload(result)
         try:
             if a.get('close_session'):
                 if items:

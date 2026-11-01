@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
@@ -49,3 +50,43 @@ class RetainedTest(unittest.TestCase):
         with patch('git_retained.shutil.copy2',side_effect=race):
             with self.assertRaisesRegex(ValueError,'changed during retention'):self.preserve()
         self.assertEqual(self.g('branch','--show-current'),'task/verified');self.assertIn('99',(self.root/'config.json').read_text())
+    def test_exact_man155_scope_uses_explicit_bounded_route(self):
+        planned=['config.json','generated.json']+[f'output/{i}.bin' for i in range(70)]
+        for name in planned[2:]:
+            path=self.root/name;path.parent.mkdir(exist_ok=True);path.write_bytes(bytes(range(256)))
+        remaining=39905707-sum((self.root/name).stat().st_size for name in planned if name!='generated.json')
+        with (self.root/'generated.json').open('wb') as stream:
+            stream.write(b'large exact-byte fixture\x00');stream.truncate(remaining)
+        before={name:hashlib.sha256((self.root/name).read_bytes()).hexdigest() for name in planned}
+        with self.assertRaisesRegex(ValueError,'32 MiB'):self.preserve(planned)
+        self.assertFalse((self.root/'.scrum/local/retained').exists())
+        self.assertEqual(self.g('branch','--show-current'),'task/verified')
+        r=git_retained.preserve(self.root,planned,'FIX-1','main',max_bytes=64*1024*1024)
+        self.assertEqual(r['total_bytes'],39905707);self.assertTrue(r['hashes_verified'])
+        self.assertEqual(r['tracked_files']+r['untracked_files'],72)
+        self.assertFalse(r['published']);self.assertEqual(r['deleted_files'],0)
+        archive=self.root/r['archive'];manifest=json.loads((archive/'manifest.json').read_text())
+        self.assertEqual(manifest['total_bytes'],39905707);self.assertEqual(manifest['max_bytes'],64*1024*1024)
+        self.assertEqual(sum(e['bytes'] for e in manifest['files'].values()),39905707)
+        for name,digest in before.items():
+            self.assertEqual(manifest['files'][name]['sha256'],digest)
+            self.assertEqual(git_retained.signature(archive/'files'/name),digest)
+            if name!='config.json':self.assertEqual(git_retained.signature(archive/'moved'/name),digest)
+        self.assertEqual(git.state(self.root),('main',[]));self.assertEqual(self.g('rev-parse','main'),self.base)
+        self.assertEqual(self.g('rev-parse','task/verified'),self.base)
+        self.assertIn('"value":2',self.g('show',r['private_branch']+':config.json'))
+    def test_supported_route_keeps_hard_cap_and_scope_staging_guards(self):
+        for invalid in (0,True,128*1024*1024):
+            with self.assertRaisesRegex(ValueError,'supported preservation bound'):
+                git_retained.preserve(self.root,['config.json','generated.json'],'FIX-1','main',max_bytes=invalid)
+        with self.assertRaisesRegex(ValueError,'explicit recovery'):
+            git_retained.preserve(self.root,['config.json'],'FIX-1','main',max_bytes=64*1024*1024)
+        self.g('add','config.json')
+        with self.assertRaisesRegex(ValueError,'staging'):
+            git_retained.preserve(self.root,['config.json','generated.json'],'FIX-1','main',max_bytes=64*1024*1024)
+    def test_opt_in_bound_is_refused_before_mutation(self):
+        with (self.root/'generated.json').open('wb') as stream:stream.truncate(64*1024*1024+1)
+        with self.assertRaisesRegex(ValueError,'64 MiB'):
+            git_retained.preserve(self.root,['config.json','generated.json'],'FIX-1','main',max_bytes=64*1024*1024)
+        self.assertFalse((self.root/'.scrum/local/retained').exists())
+        self.assertEqual(self.g('branch','--show-current'),'task/verified')

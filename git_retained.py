@@ -13,9 +13,15 @@ def signature(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
-def preserve(root,planned,task,target):
+DEFAULT_MAX_BYTES=32*1024*1024
+SUPPORTED_MAX_BYTES=(DEFAULT_MAX_BYTES,64*1024*1024)
+
+
+def preserve(root,planned,task,target,*,max_bytes=DEFAULT_MAX_BYTES):
     """Caller holds checkout lock and the sole live recovery claim/file scope."""
     root=Path(root).resolve()
+    if type(max_bytes) is not int or max_bytes not in SUPPORTED_MAX_BYTES:
+        raise ValueError('Choose a supported preservation bound: 32 or 64 MiB')
     if not re.fullmatch(r'[A-Za-z]+-[0-9]+',task):raise ValueError('Use the current recovery task code')
     current=git.state(root)
     if not current:raise ValueError('Git checkout unavailable')
@@ -33,7 +39,8 @@ def preserve(root,planned,task,target):
     if not names or len(names)>1000 or not names.issubset(set(planned)):
         raise ValueError('Every dirty file must belong to the explicit recovery file plan (1..1000 exact paths)')
     files={name:safe_path(root,name) for name in names}
-    if sum(p.stat().st_size for p in files.values() if p.exists())>32*1024*1024:raise ValueError('Retained edits exceed the 32 MiB preservation bound')
+    total_bytes=sum(p.stat().st_size for p in files.values() if p.exists())
+    if total_bytes>max_bytes:raise ValueError(f'Retained edits exceed the {max_bytes//(1024*1024)} MiB preservation bound')
     key=uuid.uuid4().hex
     archive=root/'.scrum/local/retained'/(task.lower()+'-'+key)
     if not archive.resolve().is_relative_to(root/'.scrum/local'):raise ValueError('Retention path escaped local storage')
@@ -41,18 +48,20 @@ def preserve(root,planned,task,target):
     if ignored.returncode:raise ValueError('Local retention must be ignored by Git')
     archive.mkdir(parents=True)
     private='private-local/scrum-retained-'+task.lower()+'-'+key
-    manifest={'schema':1,'state':'copying','task':task,'source_branch':source,'source_commit':base,'target':target,'target_commit':tip,'private_branch':private,'files':{}}
+    manifest={'schema':1,'state':'copying','task':task,'source_branch':source,'source_commit':base,'target':target,'target_commit':tip,'private_branch':private,'total_bytes':total_bytes,'max_bytes':max_bytes,'files':{}}
     for name,path in files.items():
         sha=signature(path);backup=archive/'files'/name
         if sha is not None:
             backup.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(path,backup)
             if signature(backup)!=sha:raise ValueError('Retention copy failed verification; originals untouched')
-        manifest['files'][name]={'sha256':sha,'untracked':name in untracked}
+        manifest['files'][name]={'sha256':sha,'bytes':path.stat().st_size if sha is not None else 0,'untracked':name in untracked}
     save(archive/'manifest.json',manifest)
     def unchanged():
-        if any(signature(safe_path(root,n))!=entry['sha256'] for n,entry in manifest['files'].items()):
+        if any(signature(safe_path(root,n))!=entry['sha256'] or (safe_path(root,n).stat().st_size if safe_path(root,n).exists() else 0)!=entry['bytes'] for n,entry in manifest['files'].items()):
             raise ValueError('Checkout changed during retention; inspect the saved manifest before retrying')
     unchanged()
+    if sum(entry['bytes'] for entry in manifest['files'].values())!=total_bytes:
+        raise ValueError('Checkout size changed during retention; originals and backups preserved')
     if paths(root)!=(tracked,untracked) or checked(root,'rev-parse','HEAD')!=base or git.state(root)[0]!=source:
         raise ValueError('Checkout scope changed during retention; originals and backups preserved')
     if git._git(root,'diff','--cached','--quiet').returncode!=0:raise ValueError('Staging changed; originals preserved')
@@ -74,9 +83,12 @@ def preserve(root,planned,task,target):
         if dest.exists():raise ValueError('Refuse retention overwrite')
         path.rename(dest)
         if signature(dest)!=manifest['files'][name]['sha256']:raise ValueError('Moved file failed verification; inspect saved manifest')
+    if git.state(root)!=(private,[]):
+        import git_index
+        git_index.refresh_identical(root)
     if git.state(root)!=(private,[]):raise ValueError('Additional edits appeared; retained branch is not clean, no destination switch')
     if checked(root,'rev-parse','refs/heads/'+target)!=tip:raise ValueError('Destination changed; preserve retained work and reconcile')
     checked(root,'switch',target)
     if git.state(root)!=(target,[]):raise ValueError('Destination is not clean; retained copies remain available')
     manifest['state']='retained';save(archive/'manifest.json',manifest)
-    return {'preserved':True,'tracked_files':len(tracked),'untracked_files':len(untracked),'private_branch':private,'private_commit':manifest['private_commit'],'archive':str(archive.relative_to(root)),'manifest':str((archive/'manifest.json').relative_to(root)),'checkout':target,'clean':True,'published':False,'deleted_files':0}
+    return {'preserved':True,'tracked_files':len(tracked),'untracked_files':len(untracked),'total_bytes':total_bytes,'max_bytes':max_bytes,'hashes_verified':True,'private_branch':private,'private_commit':manifest['private_commit'],'archive':str(archive.relative_to(root)),'manifest':str((archive/'manifest.json').relative_to(root)),'checkout':target,'clean':True,'published':False,'deleted_files':0}

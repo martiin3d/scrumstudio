@@ -43,7 +43,7 @@ TOOLS = [
     ('task_changes', 'Bounded review of uncommitted edits in the checkout, computed from git without a model call: changed files with +/- counts, planned vs unplanned, and a unified diff of the planned files (or files=[subset]) cut at max_lines (default 200, max 2000). Use on demand for missing review evidence or interrupted work; reuse a diff already inspected. Not a rollback; never commits.', schema(dict(P, id=I, files=FILES, max_lines=I, diff=B), ['project','id'])),
     ('task_timing', 'Calendar seconds per state for one task. Legacy histories are partial. Optional history returns 20 latest structured visits; before/limit paginate. Not worker CPU or token usage.', schema(dict(P, id=I, history=B, before=I, limit=I), ['project','id'])),
     ('project_metrics', 'On-demand project summary: state counts, completions, lead/cycle samples and observed state time. days 1..365 (default30); include_series adds daily UTC chart data. Avoid routine polling.', schema(dict(P, days=I, include_series=B), ['project'])),
-    ('project_settings', 'Read policy; humans configure WIP, task sizing, quota thresholds, guard, interval and git automation (git_mode Branches: server-side branch per context group or task at claim, commit per task/group at Done, push per group/task/never; never force; git_merge=Task requires verified integration before Done and isolates each task branch). auto_resume_session_quota defaults false; when enabled, a connected supervised CLI can resume previously authorized work once after a verified session reset, respecting weekly usage and Stop. Desktop chats are not relaunched. Folder workspace is pinned. Cache settings_version.', schema(dict(P, actor=I, max_active_per_agent=I, require_evidence=B, workspace_root=S, workflow_mode={'type':'string','enum':['Auto','Light','Standard']}, task_sizing={"type":"string","enum":["Small","Balanced","Unrestricted"]},session_stop_percent=I,weekly_stop_percent=I,usage_guard=B,usage_check_seconds=I,auto_resume_session_quota=B,git_mode={'type':'string','enum':['Off','Branches','Worktrees']},git_commit={'type':'string','enum':['Task','Group']},git_push={'type':'string','enum':['Group','Task','Never']},git_base_branch={'type':'string','maxLength':200},git_branch_prefix={'type':'string','maxLength':60},git_remote={'type':'string','maxLength':80}), ['project'])),
+    ('project_settings', 'Read policy; humans configure WIP, task sizing, quota thresholds, guard, interval and git automation (git_mode Branches: server-side branch per context group or task at claim, commit per task/group at Done, push per group/task/never; never force; git_merge=Task requires verified integration before Done and isolates each task branch). auto_resume_session_quota defaults false; when enabled, a connected supervised CLI can resume previously authorized work once after a verified session reset, respecting weekly usage and Stop. Desktop chats are not relaunched. Folder workspace is pinned. Cache settings_version.', schema(dict(P, actor=I, file_lock_policy={'type':'string','enum':['Auto','Always']},max_active_per_agent=I, require_evidence=B, workspace_root=S, workflow_mode={'type':'string','enum':['Auto','Light','Standard']}, task_sizing={"type":"string","enum":["Small","Balanced","Unrestricted"]},session_stop_percent=I,weekly_stop_percent=I,usage_guard=B,usage_check_seconds=I,auto_resume_session_quota=B,git_mode={'type':'string','enum':['Off','Branches','Worktrees']},git_commit={'type':'string','enum':['Task','Group']},git_push={'type':'string','enum':['Group','Task','Never']},git_base_branch={'type':'string','maxLength':200},git_branch_prefix={'type':'string','maxLength':60},git_remote={'type':'string','maxLength':80}), ['project'])),
     ('session_resume', 'Once at session start: get policy, active count and your remaining file locks in this project. Review and release obsolete own locks before editing. Paginate only if needed.', schema(dict(P, actor=I, after=I, limit=I), ['project','actor'])),
     ('file_locks', 'List project file locks, atomically acquire paths for an active claimed task, or release ids/all. Acquire needs actor+task id+token. Conflicts reserve nothing. Release defaults to own; force requires human. all=true affects selected project only. Locks are advisory, exact canonical file paths.', schema(dict(P, action={'type':'string','enum':['list','acquire','release']}, actor=I, id=I, token=S, paths=FILES, ids={'type':'array','items':I,'maxItems':100}, all=B, own=B, force=B, after=I, limit=I), ['project'])),
     ('task_get', 'Get complete execution scope and continuity without history or costs by default. Attachment count only; use task_attachment for details. include_notes opts into pending task-linked AI reminders; notes_content loads text. notes_audience=human/all is for explicit human lookup. include_cost=true opts into estimates and reported token summary; versions are view-specific. Prefer over snapshot. preserved_inputs exposes bounded verified read-only parked drafts for this task/context; inputs_after/inputs_limit paginate references.', schema(dict(P, id=I, code=S, version_seen=S,include_cost=B), ['project'])),
@@ -93,10 +93,16 @@ for _name,_description,_schema in TOOLS:
     if _name in ('task_create','task_update'):
         _schema['properties'].update(estimated_tokens={'type':['integer','null'],'minimum':0,'maximum':10**15},estimated_quota_percent={'type':['number','null'],'minimum':0,'maximum':100})
     if _name in ('task_update','work_finish'):
+        _schema['properties'].update(additional_files=FILES)
         _schema['properties']['usage_report']=schema({'run_id':S,'source':S,'input_tokens':{'type':'integer','minimum':0,'maximum':10**15},'output_tokens':{'type':'integer','minimum':0,'maximum':10**15}},['run_id','source','input_tokens','output_tokens'])
 
 
 # Explicit optional correlation; no additional model round trip.
+DECISIONS={'type':'array','maxItems':5,'items':schema({'key':S,'decision':S,'reason':S,'files':F,'supersedes':F},['key','decision','reason','files'])}
+for _name,_description,_schema in TOOLS:
+    if _name in ('work_finish','task_update'):_schema['properties']['decisions']=DECISIONS
+    if _name=='task_get':_schema['properties'].update(decision_files=F,decisions_after=I,decisions_limit=I)
+
 for _name, _description, _spec in TOOLS:
     if 'project' in _spec['properties']:
         _spec['properties']['measurement_session']=S
@@ -117,7 +123,7 @@ WORKER_DESCRIPTIONS={
     'task_update':'Edit task (actor+token when locked). claim=true starts it. continuity saves progress/next step for resumption. Done needs evidence; Cancelled needs cancel_reason.',
     'task_claim':'Claim task+files (In Progress); returns token. claimed=false means conflict: choose other work.',
     'task_release':'Release own task lock without changing status.',
-    'work_finish':'Done with evidence (+continuity if anything remains): releases locks, returns next work; claim_next=true also claims and loads it (token in next.claim). Idempotent: already_done=true on retry.',
+    'work_finish':'Exclusive single-worker mode accepts additional_files to extend explicit commit scope atomically at finish, without file-lock calls. Concurrent mode requires prior reservations. Done with evidence (+continuity if anything remains): releases locks, returns next work; claim_next=true also claims and loads it (token in next.claim). Idempotent: already_done=true on retry.',
     'agent_checkpoint':'Quota heartbeat (real 5h/weekly used %). action=pause/offline after editing stops: saves continuity, returns own tasks to TODO, releases locks.',
     'file_locks':'List/acquire/release file reservations for a claimed task. Successful acquire also extends its file plan for Git publication.',
     'note_add':'Optional note; AI reminder needs audience=agent, kind=Review, task.',
@@ -183,7 +189,7 @@ def _handle(msg):
         return None
     response = {'jsonrpc': '2.0', 'id': msg['id']}
     if method == 'initialize':
-        response['result'] = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'scrum-studio', 'version': '2.12.4'}}
+        response['result'] = {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'scrum-studio', 'version': '2.13.1'}}
     elif method == 'ping':
         response['result'] = {}
     elif method == 'tools/list':

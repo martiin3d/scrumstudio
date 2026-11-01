@@ -176,4 +176,25 @@ class PausedGitTest(unittest.TestCase):
         self.assertEqual((self.root/'one.txt').read_text(),'partial')
 
 
+
+
+    def test_cleaning_marker_after_completed_cleanup_is_reconciled_without_repeating_cleanup(self):
+        (self.root/'one.txt').write_bytes(b'partial edit\n');(self.root/'new file.bin').write_bytes(b'draft')
+        self.pause();pointer=git_paused.folder(self.root,'partial')/'manifest.json';meta=json.loads(pointer.read_text());meta['state']='cleaning';git_paused.save(pointer,meta)
+        with git_sync.checkout_lock(self.root):result=git_paused.restore(self.root,'partial','TEST-1')
+        self.assertTrue(result);self.assertEqual((self.root/'one.txt').read_bytes(),b'partial edit\n');self.assertEqual((self.root/'new file.bin').read_bytes(),b'draft')
+        self.assertEqual(json.loads(pointer.read_text())['state'],'restored')
+    def test_interrupted_cleaning_with_corrupt_backup_is_not_reconciled(self):
+        (self.root/'one.txt').write_bytes(b'partial edit\n');(self.root/'new file.bin').write_bytes(b'draft');self.pause()
+        pointer=git_paused.folder(self.root,'partial')/'manifest.json';meta=json.loads(pointer.read_text());meta['state']='cleaning';git_paused.save(pointer,meta)
+        before=(self.root/'one.txt').read_bytes()
+        directory=pointer.parent/meta['directory'];data=json.loads((directory/'manifest.json').read_text());entry=next(e for e in data['files'].values() if e['sha256'] is not None);(directory/entry['blob']).write_bytes(b'corrupt')
+        with self.assertRaisesRegex(ValueError,'backup failed'):git_paused.restore(self.root,'partial','TEST-1')
+        self.assertEqual(json.loads(pointer.read_text())['state'],'cleaning');self.assertEqual((self.root/'one.txt').read_bytes(),before)
+    def test_interrupted_cleaning_does_not_overwrite_new_work(self):
+        (self.root/'one.txt').write_bytes(b'partial edit\n');(self.root/'new file.bin').write_bytes(b'draft');self.pause()
+        pointer=git_paused.folder(self.root,'partial')/'manifest.json';meta=json.loads(pointer.read_text());meta['state']='cleaning';git_paused.save(pointer,meta);(self.root/'two.txt').write_bytes(b'new human edit')
+        with self.assertRaisesRegex(ValueError,'incomplete'):git_paused.restore(self.root,'partial','TEST-1')
+        self.assertEqual((self.root/'two.txt').read_bytes(),b'new human edit')
+
 if __name__=='__main__':unittest.main()

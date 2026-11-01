@@ -113,3 +113,19 @@ class NativeCliTest(unittest.TestCase):
         with patch.object(cli,'invoke',side_effect=ValueError('Failure outside planning rollback boundary')):
             with self.assertRaises(ValueError):cli.coordinated('task_plan',args,path)
         self.assertIn('pending',cli.context_file(path))
+
+    def test_finish_paths_batches_scope_without_an_extra_lock_operation(self):
+        import io
+        human=run('user_register',dict(identity='human:single-cli',name='Human',kind='human'))['id']
+        run('project_settings',dict(project=self.p,actor=human,file_lock_policy='Auto',max_parallel_agents=1,workspace_root=str(Path(self.temp.name))))
+        task=self.task('Single-worker CLI completion');path=self.context()
+        started=cli.coordinated('work_start',dict(id=task,claim=True,session_used_percent=1,weekly_used_percent=1),path)
+        self.assertEqual(started['claim']['file_lock_mode'],'checkout')
+        out=io.StringIO()
+        with patch('sys.stdout',out):
+            result=cli.main(['finish','--context',str(path),'--task',str(task),'--paths','extra.py','--evidence','Targeted behavior passed.'])
+        self.assertEqual(result,0);self.assertEqual(json.loads(out.getvalue())['completed']['status'],'Done')
+        self.assertEqual(run('task_get',dict(project=self.p,id=task))['files'],['extra.py'])
+        self.assertEqual(run('file_locks',dict(project=self.p))['items'],[])
+        import overhead
+        self.assertEqual(overhead.metrics(self.p)['totals']['calls'],2)

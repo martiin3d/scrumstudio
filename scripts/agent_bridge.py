@@ -203,6 +203,13 @@ def execution_prompt(project,folder,actor,client,offer,policy,role='',automatic=
     return prompt
 
 
+def file_scope_guidance(started):
+    if started.get('file_lock_mode')!='checkout':return ''
+    return ('\nSingle-worker checkout exclusivity is active: keep the task claim and explicit file plan, but do not call file_locks/lock for individual outputs. '
+            'For newly discovered output files and sidecars, include only your explicit additional_files in work_finish (CLI finish --paths FILES) in the existing closing call. '
+            'Do not adopt unrelated or pre-existing dirty files. This overrides generic per-file reservation wording; Stop/quota and actual permissions still apply.')
+
+
 def cli_prompt(project,folder,actor,client,offer,policy,started,role=''):
     from scrum_cli import redact
     import shlex
@@ -238,6 +245,9 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role=''):
     if policy.get('autonomy_mode')=='Autonomous':
         prompt=prompt.replace('; wait for the actual answer.', '; if deferred=true, exit so other work continues.').replace('; wait for an actual answer.', '; if deferred=true, exit so other work continues.')
         prompt=prompt.replace('For human decisions use request_user_input or this Python + ', 'For indispensable typed human decisions use this Python + ').replace('For real human decisions use request_user_input or ', 'For indispensable typed human decisions use ')
+    if started.get('file_lock_mode')=='checkout':
+        prompt=prompt.replace('Reserve additional output files/Unity .meta sidecars before editing. ', 'Keep additional outputs and Unity .meta sidecars in the explicit completion file plan. ').replace(cli+' lock --task CODE --paths relative/file; ', '')
+    prompt+=file_scope_guidance(started)
     prompt+=autonomy_prompt(policy)
     if role:prompt+='\nRole instructions: '+role
     return prompt
@@ -342,7 +352,7 @@ def preclaim(rpc,project,actor,client,task,observed):
         branch_reason=('Checkout branch '+str(busy.get('current_branch','unknown'))+' cannot switch to '+str(busy.get('wanted','task branch'))+': '+str(busy.get('reason') or 'uncommitted work must be preserved')) if busy else ''
         reason=result.get('claim_deferred') or claim.get('reason') or branch_reason or 'Task ownership was not granted; inspect dependencies, file reservations and workflow policy'
         return {'should_stop':True,'reason':str(reason)[:500],**({'git_recovery':str(reason)[:1000]} if 'Git branch preparation failed:' in str(reason) else {})}
-    return {'task':result['task'],'token':claim['token'],'measurement_session':result.get('measurement_session'),**{k:claim[k] for k in ('dirty_planned','git') if k in claim}}
+    return {'task':result['task'],'token':claim['token'],'measurement_session':result.get('measurement_session'),**{k:claim[k] for k in ('dirty_planned','git','file_lock_mode') if k in claim}}
 
 def preclaimed_prompt(started):
     task=started['task']
@@ -351,7 +361,7 @@ def preclaimed_prompt(started):
             ' Claim diagnostics: '+json.dumps({k:started[k] for k in ('dirty_planned','git') if k in started},separators=(',',':'))+
             ' Full task (acceptance criteria, checklist, files, evidence, continuity): '+json.dumps(task,ensure_ascii=False,separators=(',',':'))+
             '\nIf continuity is present, resume from it and never redo recorded work. Edit, verify, then finish in one call: work_finish with evidence and continuity if anything remains.'
-            ' Quota is supervised outside the model; call agent_checkpoint only to pause or when a long step ends.')
+            ' Quota is supervised outside the model; call agent_checkpoint only to pause or when a long step ends.')+file_scope_guidance(started)
 
 def chat_event(rpc,project,actor,text):
     # Visibility must not interrupt a worker or invalidate a committed handoff.

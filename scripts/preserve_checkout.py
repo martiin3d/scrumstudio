@@ -14,6 +14,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--context',default=os.environ.get('SCRUM_CLI_CONTEXT'))
     p.add_argument('--target',required=True,help='Existing local integrated branch; never inferred from dirty HEAD')
+    p.add_argument('--max-bytes',type=int,choices=git_retained.SUPPORTED_MAX_BYTES,default=git_retained.DEFAULT_MAX_BYTES,help='Explicit bounded retention size (default 33554432; opt in to 67108864 for larger claimed scopes)')
     a=p.parse_args()
     if not a.context:p.error('A private claimed CLI context is required')
     state=cli.context_file(a.context);current=state.get('current') or {}
@@ -28,7 +29,7 @@ def main():
     # Server validates the private token, quotas and exact planned file ownership.
     cli.coordinated('file_locks',{'id':task['id'],'action':'acquire','paths':task['files']},a.context)
     with git.checkout_lock(policy['workspace_root']):
-        result=git_retained.preserve(policy['workspace_root'],task['files'],task['code'],a.target)
+        result=git_retained.preserve(policy['workspace_root'],task['files'],task['code'],a.target,max_bytes=a.max_bytes)
     print(json.dumps(result,separators=(',',':')))
 
 

@@ -8,10 +8,11 @@ from pathlib import Path
 
 from git_sync import GIT_DEFAULTS, validate as validate_git
 from run_cost import DEFAULTS as COST_DEFAULTS
-POLICY_DEFAULTS = {'execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'mcp','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS, **COST_DEFAULTS}
+POLICY_DEFAULTS = {'file_lock_policy':'Always','execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'mcp','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS, **COST_DEFAULTS}
 
 def validate_policy(changed):
     validate_git(changed)
+    if 'file_lock_policy' in changed and changed['file_lock_policy'] not in ('Auto','Always'):raise ValueError('file_lock_policy must be Auto or Always')
     if 'execution_instructions' in changed and (not isinstance(changed['execution_instructions'],str) or len(changed['execution_instructions'])>4000 or '\x00' in changed['execution_instructions']):raise ValueError('execution_instructions must be text, max4000 characters')
     if 'autonomy_mode' in changed and changed['autonomy_mode'] not in ('Standard','Autonomous'):raise ValueError('autonomy_mode must be Standard or Autonomous')
     if 'coordination_channel' in changed and changed['coordination_channel'] not in ('mcp','cli'):raise ValueError('coordination_channel must be mcp or cli')
@@ -55,7 +56,7 @@ def migrate(db, separate=False):
             spec = f"TEXT NOT NULL DEFAULT '{value}'" if isinstance(value,str) else f'INTEGER NOT NULL DEFAULT {int(value)}'
             db.execute(f'ALTER TABLE projects ADD COLUMN {name} {spec}')
     columns = {r['name'] for r in db.execute('PRAGMA table_info(tasks)')}
-    for name, spec in [('files', "TEXT NOT NULL DEFAULT '[]'"), ('evidence', "TEXT NOT NULL DEFAULT ''")]:
+    for name, spec in [('decisions', "TEXT NOT NULL DEFAULT '[]'"), ('files', "TEXT NOT NULL DEFAULT '[]'"), ('evidence', "TEXT NOT NULL DEFAULT ''")]:
         if name not in columns:
             db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {spec}')
     namespace = 'reservations.' if separate else ''
@@ -81,7 +82,33 @@ def active_count(db, project, actor, exclude=-1):
     return db.execute("SELECT COUNT(*) FROM tasks WHERE project=? AND owner_id=? AND status='In Progress' AND lock_until>? AND id<>?", (project, actor, time.time(), exclude)).fetchone()[0]
 
 
+def checkout_policy(db,project):
+    policy=db.execute('SELECT file_lock_policy,max_parallel_agents FROM projects WHERE id=?',(project,)).fetchone()
+    return policy['file_lock_policy']=='Auto' and policy['max_parallel_agents']==1
+
+
+def file_lock_mode(db,project,task=None):
+    if not checkout_policy(db,project):return 'files'
+    # Legacy claims survive a policy change; never drop their protection.
+    other=db.execute('SELECT 1 FROM tasks WHERE project=? AND id<>? AND lock_until>? LIMIT 1',(project,task if task is not None else -1,time.time())).fetchone()
+    return 'files' if other else 'checkout'
+
+
+def extend_unreserved_scope(db,project,task,additions):
+    if file_lock_mode(db,project,task['id'])!='checkout':
+        raise ValueError('additional_files requires exclusive single-worker checkout mode; reserve files before editing in concurrent mode')
+    values=file_plan(additions)
+    root=Path(db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]).resolve()
+    paths=canonical_paths(root,values)
+    if conflicts(db,paths,task['id'],task['owner_id']):raise ValueError('Additional files conflict with existing reservations')
+    import json
+    normalized=[Path(path).relative_to(root).as_posix() for path in paths]
+    return file_plan(json.loads(task['files'])+normalized)
+
+
 def check_capacity(db, project, actor, task):
+    if checkout_policy(db,project) and db.execute('SELECT 1 FROM tasks WHERE project=? AND id<>? AND lock_until>? LIMIT 1',(project,task,time.time())).fetchone() and not db.execute('SELECT 1 FROM tasks WHERE project=? AND id=? AND lock_until>?',(project,task,time.time())).fetchone():
+        raise ValueError('Single-worker checkout already has a live task; finish or release it before another claim (including the same actor)')
     user = db.execute('SELECT kind FROM users WHERE id=?', (actor,)).fetchone()
     limit = db.execute('SELECT max_active_per_agent FROM projects WHERE id=?', (project,)).fetchone()[0]
     if user and user['kind'] == 'agent' and active_count(db,project,actor,task) >= limit:
@@ -146,6 +173,7 @@ def digest(token):
 
 
 def reserve(db, paths, project, task, actor, token, until, created):
+    if file_lock_mode(db,project,task)=='checkout':return 0
     for path in paths:
         db.execute('DELETE FROM file_locks WHERE path=? AND lock_until<=?', (path,time.time()))
         db.execute('''INSERT INTO file_locks(path,project,task,owner_id,token_hash,lock_until,created) VALUES(?,?,?,?,?,?,?)
@@ -210,6 +238,9 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         db.execute('BEGIN IMMEDIATE')
         current=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
         validate_policy(changed)
+        leaving_exclusive=(current['file_lock_policy']=='Auto' and current['max_parallel_agents']==1 and (changed.get('file_lock_policy',current['file_lock_policy'])!='Auto' or changed.get('max_parallel_agents',1)>1))
+        if leaving_exclusive and db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>? LIMIT 1',(project,time.time())).fetchone():
+            raise ValueError('Finish live single-worker claims before enabling concurrent work or changing reservation policy')
         if any(key in changed and changed[key]!=current[key] for key in ('git_mode','workspace_root')):
             import git_paused
             if git_paused.any_pending(current['workspace_root']):
@@ -318,9 +349,9 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         added=len(updated)-len(previous)
         if added:
             db.execute('UPDATE tasks SET files=?,updated=? WHERE id=?',(json.dumps(updated),now(),task['id']))
-            activity(db,task['id'],actor['id'],'files',f'Extended task file plan with {added} reserved files.')
+            activity(db,task['id'],actor['id'],'files',f'Extended task file plan with {added} explicit files.')
         reserve(db,paths,project,task['id'],actor['id'],a['token'],task['lock_until'],now())
-        return {'acquired':True,'count':len(paths),'plan_added':added,'lock_until':task['lock_until']}
+        return {'acquired':True,'count':len(paths) if file_lock_mode(db,project,task['id'])=='files' else 0,'file_lock_mode':file_lock_mode(db,project,task['id']),'scope_files':len(paths),'plan_added':added,'lock_until':task['lock_until'],**({'instruction':'Checkout exclusivity replaces per-file reservations. Declare further additional_files with finish; keep explicit commit scope.'} if file_lock_mode(db,project,task['id'])=='checkout' else {})}
     force=a.get('force',False)
     if force and actor['kind']!='human':
         raise ValueError('Only a human can force-release another worker\'s files')

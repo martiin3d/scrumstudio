@@ -553,6 +553,80 @@ def _finish_locked(item):
     return report
 
 
+def generated_leftover(root,name):
+    """Recognize output-only files and dynamic TMP feature-cache deltas.
+
+    Never classify authored source/prefabs/materials or arbitrary config as
+    disposable. Recognized data is retained byte-exact privately, not deleted.
+    """
+    path=Path(name);parts={part.casefold() for part in path.parts}
+    if 'artifacts' in parts and 'assets' not in parts and path.suffix.casefold() in {'.json','.pdf','.png','.jpg','.jpeg','.svg','.xml','.log','.txt','.md'}:
+        return True
+    if path.suffix.casefold()!='.asset':return False
+    base=_git(root,'show','HEAD:'+name,timeout=10)
+    if base.returncode:return False
+    try:actual=(Path(root)/name).read_text(encoding='utf-8')
+    except (OSError,UnicodeError):return False
+    def without_cache(text):
+        lines=text.splitlines()
+        if '  m_AtlasPopulationMode: 1' not in lines or '  m_GetFontFeatures: 1' not in lines:return None
+        result=[];skipping=False;found=0
+        for line in lines:
+            if line=='  m_FontFeatureTable:':skipping=True;found+=1;continue
+            if skipping and line.strip() and not line.startswith('    '):skipping=False
+            if not skipping:result.append(line)
+        return result if found==1 else None
+    original=without_cache(base.stdout);updated=without_cache(actual)
+    return original is not None and updated==original
+
+
+def close_verified_checkout(root,settings,source,target,sha,task):
+    """Caller holds checkout lock and has excluded live task/file claims.
+
+    Integration/publication is verified by the completion receipt first. This
+    closes a canonical Branches checkout, independently of branch deletion.
+    """
+    if settings.get('git_mode')!='Branches':return {'closed':True,'reason':'isolated workspace retained'}
+    current=state(root)
+    if current==(target,[]):return {'closed':True,'already_parent':True,'branch':target}
+    if not current or current[0]!=source:return {'closed':False,'reason':'Another checkout branch owns the workspace; do not switch it'}
+    if parent_branch(root,source)!=target:return {'closed':False,'reason':'Recorded parent changed; preserve checkout'}
+    incoming=_git(root,'rev-parse','--verify','refs/heads/'+source)
+    if incoming.returncode or incoming.stdout.strip()!=sha or not is_ancestor(root,sha,'refs/heads/'+target):
+        return {'closed':False,'reason':'Source/parent changed after verified integration'}
+    if _git(root,'diff','--cached','--quiet').returncode!=0 or _git(root,'ls-files','--unmerged').stdout.strip():
+        return {'closed':False,'reason':'Existing staging or conflicts require scoped reconciliation'}
+    if current[1]:
+        import git_index
+        git_index.refresh_identical(root)
+        current=state(root)
+    retained=None
+    if current[1]:
+        import git_paused,git_retained
+        tracked,untracked=git_paused.paths(root)
+        planned=set(planned_paths(root,task.get('files') or [],include_ignored=True))
+        if tracked and not untracked and _git(root,'diff','--quiet',target,'--',*sorted(tracked),timeout=15).returncode==0:
+            # These bytes already belong to the accepted parent: no archive or
+            # model is needed just because the old source has an older cache.
+            moved=_git(root,'switch',target,timeout=20)
+            if moved.returncode==0 and state(root)==(target,[]):return {'closed':True,'branch':target,'matched_parent':True}
+            return {'closed':False,'reason':'Parent-equivalent checkout changed while switching; preserve work'}
+        if (tracked|untracked).intersection(planned):
+            return {'closed':False,'reason':'Verified task files changed after commit; keep them unfinished for review'}
+        if not all(generated_leftover(root,name) for name in tracked|untracked):
+            return {'closed':False,'reason':'Unplanned source/config edits are not generated residue; preserve them for scoped review'}
+        if settings.get('autonomy_mode')!='Autonomous' or not settings.get('git_pause_blocked') or settings.get('max_parallel_agents',1)!=1:
+            return {'closed':False,'reason':'Unplanned edits preserved in place; automatic private retention is not authorized'}
+        # The human opted into autonomous private preservation. These files are
+        # not adopted by the product commit, merged or pushed. No model/task.
+        retained=git_retained.preserve(root,sorted(tracked|untracked),task['code'],target,max_bytes=64*1024*1024)
+    else:
+        moved=_git(root,'switch',target,timeout=20)
+        if moved.returncode:return {'closed':False,'reason':(moved.stderr or moved.stdout)[-300:]}
+    if state(root)!=(target,[]):return {'closed':False,'reason':'Checkout changed while closing; preserve saved files'}
+    return {'closed':True,'branch':target,**({'retained':retained} if retained else {})}
+
+
 def finish_cleanup(item,report):
     root=item['root'];settings=item['settings']
     if settings.get('git_cleanup') and report.get('merge',{}).get('merged') and not report['merge'].get('error'):
@@ -608,9 +682,10 @@ def flush(call,jobs,result,external_project=None):
                 finalized=call('git_finalize',dict(project=project,id=item['task']['id'],actor=item['actor'],capability=FINALIZE_TOKEN,expected=item['task'].get('completion_basis'),outcome=outcome,root=item['root']))
                 if result.get('id')==item['task']['id']:result.update(finalized)
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
-        if outcome.get('merge',{}).get('error'):
+        closure_error=outcome.get('checkout',{}).get('reason') if outcome.get('checkout',{}).get('closed') is False else ''
+        if outcome.get('merge',{}).get('error') or closure_error:
             try:
-                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description='Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+outcome['merge']['error'],acceptance_criteria=['Target contains the source outcome, conflicts are resolved and verification is recorded.','Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
+                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description=('Git checkout closure remains pending after verified integration. Preserve actual remaining source/staging; do not repeat implementation or adopt unknown edits. ' if closure_error else '')+'Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+(closure_error or outcome['merge']['error']),acceptance_criteria=[('Canonical checkout is clean on its recorded parent without losing source/staging; existing integration/publication is preserved.' if closure_error else 'Target contains the source outcome, conflicts are resolved and verification is recorded.'),'Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
                 outcome['recovery_task']=recovery
                 import idle_signals
                 idle_signals.notify('git_recovery',{'project':project})

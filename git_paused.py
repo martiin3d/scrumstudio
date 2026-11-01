@@ -31,8 +31,8 @@ def checked(root, *args):
 def paths(root):
     # NUL delimiters preserve spaces, quotes and rename endpoints.
     # Do not strip a NUL-delimited pathname list.
-    result=git._git(root,'diff','--no-renames','--name-only','-z','HEAD','--','.',':!.scrum')
-    untracked=git._git(root,'ls-files','--others','--exclude-standard','-z','--','.',':!.scrum')
+    result=git._git(root,'diff','--no-renames','--name-only','-z','HEAD','--','.',':!.scrum',timeout=15)
+    untracked=git._git(root,'ls-files','--others','--exclude-standard','-z','--','.',':!.scrum',timeout=15)
     if result.returncode or untracked.returncode:raise ValueError('Cannot inspect checkpoint files')
     return set(result.stdout.rstrip('\0').split('\0'))-{''},set(untracked.stdout.rstrip('\0').split('\0'))-{''}
 
@@ -46,29 +46,66 @@ def safe_path(root, name):
     return path
 
 
-def pause(root, branch, planned, tasks, context_group=''):
+
+def scoped_ref(root, ref, names, directory):
+    """Make an owned-path stash tree in a private index, never the live index.
+
+    Keep the original private ref as the independent backup of foreign edits.
+    Tree operations avoid dependence on diff prefixes, drivers or text patches.
+    """
+    if not names:return None
+    index=directory/'owned.index'
+    def isolated(*args):
+        result=git._git(root,*args,index_file=index,timeout=20)
+        if result.returncode:raise ValueError('Cannot scope private checkpoint: '+(result.stderr or result.stdout)[-300:])
+        return result.stdout.strip()
+    base=checked(root,'rev-parse',ref+'^1')
+    isolated('read-tree',base)
+    for chunk in git.path_chunks(sorted(names)):isolated('restore','--source='+ref,'--staged','--',*chunk)
+    tree=isolated('write-tree')
+    changed=git._git(root,'diff','--name-only','--no-renames','-z',base,tree,timeout=20)
+    if changed.returncode or not set(filter(None,changed.stdout.split('\0'))).issubset(names):raise ValueError('Private checkpoint tree escaped declared scope')
+    commit=checked(root,'commit-tree',tree,'-p',base,'-p',checked(root,'rev-parse',ref+'^2'),'-m','SCRUM private task-only blocked snapshot')
+    target='refs/scrum/paused/'+uuid.uuid4().hex
+    checked(root,'update-ref',target,commit,'0'*len(commit))
+    index.unlink(missing_ok=True)
+    return target
+
+
+def pause(root, branch, planned, tasks, context_group='', *, retain_unplanned=False):
     """Caller holds the checkout lock and has excluded live claims/reservations.
 
-    Unknown edits and staging are deliberately refused. They need actual ownership
-    reconciliation, never automatic publication or a blanket stash.
+    Foreign staging is refused. Optional mixed-checkout preservation is enabled
+    only by the caller's autonomous single-worker policy. Unplanned originals
+    stay separate and are never restored as task work or published.
     """
     current=git.state(root)
     if current is None or current[0]!=branch:return None
     if Path(checked(root,'rev-parse','--show-toplevel')).resolve()!=Path(root).resolve():return None
     directory=folder(root,branch);manifest=directory/'manifest.json'
     if manifest.exists() and json.loads(manifest.read_text())['state']!='restored':return None
-    if git._git(root,'diff','--cached','--quiet').returncode!=0:return None
+    staged=git._git(root,'diff','--cached','--no-renames','--name-only','-z',timeout=15)
+    if staged.returncode:return None
+    staged_names=set(filter(None,staged.stdout.split('\0')))
+    if staged_names and not retain_unplanned:return None
     if git._git(root,'ls-files','--unmerged').stdout.strip():return None
     if git._git(root,'diff','--quiet','HEAD','--','.scrum').returncode!=0:return None
-    tracked,untracked=paths(root);names=tracked|untracked
-    planned={Path(name).as_posix() for name in planned}
-    if not names or len(names)>1000 or not names.issubset(planned):return None
+    original_paths=paths(root);tracked,untracked=original_paths
+    tracked=tracked|staged_names;names=tracked|untracked
+    path_key=lambda name:os.path.normcase(Path(name).as_posix())
+    planned={path_key(name) for name in planned}
+    if not names or len(names)>1000 or (not retain_unplanned and not {path_key(name) for name in names}.issubset(planned)):return None
+    if not {path_key(name) for name in staged_names}.issubset(planned):return None
+    index_tree=checked(root,'write-tree') if staged_names else None
+    added_result=git._git(root,'diff','--cached','--no-renames','--diff-filter=A','--name-only','-z',timeout=15)
+    if added_result.returncode:return None
+    added_names=set(filter(None,added_result.stdout.split('\0')))
     # Bound local copying; never scan ignored Unity caches or generated libraries.
     files={name:safe_path(root,name) for name in names}
-    if sum(path.stat().st_size for path in files.values() if path.exists())>32*1024*1024:return None
+    if sum(path.stat().st_size for path in files.values() if path.exists())>(64 if retain_unplanned else 32)*1024*1024:return None
     directory=directory/uuid.uuid4().hex;directory.mkdir(parents=True)
     data={'branch':branch,'base':checked(root,'rev-parse','HEAD'),'tasks':tasks,
-          'state':'preparing','files':{},'ref':None,'context_group':context_group}
+          'state':'preparing','files':{},'unplanned':{},'ref':None,'context_group':context_group,'staged_files':sorted(staged_names),'index_tree':index_tree}
     for index,(name,path) in enumerate(sorted(files.items())):
         raw=path.read_bytes() if path.exists() else None
         entry={'blob':str(index),'sha256':hashlib.sha256(raw).hexdigest() if raw is not None else None,
@@ -76,35 +113,50 @@ def pause(root, branch, planned, tasks, context_group=''):
         if raw is not None:
             with (directory/str(index)).open('wb') as stream:
                 stream.write(raw);stream.flush();os.fsync(stream.fileno())
-        data['files'][name]=entry
+        data['files' if path_key(name) in planned else 'unplanned'][name]=entry
     # stash create writes objects without changing files, the index or refs/stash.
     if tracked:
         sha=checked(root,'stash','create','SCRUM private blocked work')
         if not sha:raise ValueError('Checkpoint did not capture tracked edits')
         ref='refs/scrum/paused/'+uuid.uuid4().hex
         checked(root,'update-ref',ref,sha,'0'*len(sha));data['ref']=ref
+    if data['ref'] and data['unplanned']:
+        data['retained_ref']=data['ref']
+        data['ref']=scoped_ref(root,data['ref'],{name for name,entry in data['files'].items() if not entry['untracked']},directory)
+        data['task_scoped_ref']=True
     data['state']='saved';save(directory/'manifest.json',data)
     # Recheck bytes and index before any removal; do not overwrite a human race.
-    for name,entry in data['files'].items():
+    for name,entry in {**data['files'],**data['unplanned']}.items():
         path=safe_path(root,name);raw=path.read_bytes() if path.exists() else None
         if (hashlib.sha256(raw).hexdigest() if raw is not None else None)!=entry['sha256']:
             raise ValueError('Files changed during checkpoint; originals preserved')
-    if git._git(root,'diff','--cached','--quiet').returncode!=0:
+    if (checked(root,'write-tree')!=index_tree if staged_names else git._git(root,'diff','--cached','--quiet').returncode!=0):
         raise ValueError('Staging changed during checkpoint; originals preserved')
-    if checked(root,'rev-parse','HEAD')!=data['base'] or git.state(root)[0]!=branch or paths(root)!=(tracked,untracked):
+    if checked(root,'rev-parse','HEAD')!=data['base'] or git.state(root)[0]!=branch or paths(root)!=original_paths:
         raise ValueError('Checkout changed during checkpoint; originals preserved')
     # Pointer is durable before cleaning: a process crash cannot orphan the backup.
     save(manifest,{'state':'cleaning','directory':directory.name})
-    for path_chunk in git.path_chunks(sorted(tracked)):checked(root,'restore','--source=HEAD','--worktree','--',*path_chunk)
-    for name in untracked:safe_path(root,name).unlink()
+    for path_chunk in git.path_chunks(sorted(staged_names)):checked(root,'restore','--source=HEAD','--staged','--',*path_chunk)
+    for path_chunk in git.path_chunks(sorted(tracked-added_names)):checked(root,'restore','--source=HEAD','--worktree','--',*path_chunk)
+    for name in untracked|added_names:
+        if name in data['unplanned']:
+            # Keep the original as well as its verified byte copy. Never feed
+            # it to the resumed model or silently adopt it into task scope.
+            destination=directory/'unplanned-originals'/data['unplanned'][name]['blob']
+            destination.parent.mkdir(exist_ok=True)
+            safe_path(root,name).rename(destination)
+        else:safe_path(root,name).unlink(missing_ok=True)
     # Windows CRLF/stat entries can remain falsely dirty after restore. Re-add
     # only the restored paths, then require an unchanged index tree.
-    for path_chunk in git.path_chunks(sorted(tracked)):checked(root,'add','-u','--',*path_chunk)
+    for path_chunk in git.path_chunks(sorted(tracked-added_names)):checked(root,'add','-u','--',*path_chunk)
     if git._git(root,'diff','--cached','--quiet').returncode!=0:
         raise ValueError('Restored files differ from HEAD; backup retained')
+    if git.state(root)!=(branch,[]):
+        import git_index
+        git_index.refresh_identical(root)
     if git.state(root)!=(branch,[]):raise ValueError('Checkpoint cleanup incomplete; backup retained')
     save(manifest,{'state':'paused','directory':directory.name})
-    return {'branch':branch,'tasks':tasks,'files':len(names)}
+    return {'branch':branch,'tasks':tasks,'files':len(data['files']),'unplanned_retained':len(data['unplanned']),'manifest':str((directory/'manifest.json').relative_to(Path(root).resolve()))}
 
 
 def pending(root, branch):
@@ -125,12 +177,25 @@ def restore(root, branch, task_code=None, allowed=True, context_group=''):
     pointer=json.loads(manifest.read_text())
     if pointer['state']=='restored':return None
     if not allowed:raise ValueError('Finish active work before restoring a local checkpoint')
-    if pointer['state']!='paused':raise ValueError('Interrupted local checkpoint needs reconciliation; backup retained')
     key=pointer['directory']
     if len(key)!=32 or any(c not in '0123456789abcdef' for c in key):raise ValueError('Invalid checkpoint location')
     directory=manifest.parent/key;data=json.loads((directory/'manifest.json').read_text())
     if task_code and task_code not in data['tasks'] and not (context_group and context_group==data.get('context_group')):
         raise ValueError('Branch has saved edits for another task; resume its blocked task first')
+    if pointer['state']=='cleaning':
+        if checked(root,'rev-parse','HEAD')!=data['base']:raise ValueError('Interrupted checkpoint base changed; preserve backup')
+        if git._git(root,'diff','--cached','--quiet').returncode!=0 or git._git(root,'ls-files','--unmerged').stdout.strip():raise ValueError('Interrupted checkpoint has staged work/conflicts; preserve backup')
+        import git_index
+        git_index.refresh_identical(root)
+        if git.state(root)!=(branch,[]):raise ValueError('Interrupted local checkpoint cleanup is incomplete; preserve originals')
+        for name,entry in {**data['files'],**data.get('unplanned',{})}.items():
+            safe_path(root,name)
+            if entry['sha256'] is not None:
+                raw=(directory/entry['blob']).read_bytes()
+                if hashlib.sha256(raw).hexdigest()!=entry['sha256']:raise ValueError('Interrupted checkpoint backup failed verification')
+        if data.get('ref') and checked(root,'rev-parse',data['ref']+'^1')!=data['base']:raise ValueError('Interrupted checkpoint ref/base mismatch')
+        save(manifest,{'state':'paused','directory':key});pointer['state']='paused'
+    if pointer['state']!='paused':raise ValueError('Interrupted local checkpoint needs reconciliation; backup retained')
     if git.state(root)!=(branch,[]):raise ValueError('Cannot restore blocked work into a dirty checkout')
     retained={}
     current_tip=checked(root,'rev-parse','HEAD')
@@ -151,7 +216,12 @@ def restore(root, branch, task_code=None, allowed=True, context_group=''):
     save(manifest,dict(pointer,state='restoring'))
     if data['ref']:
         if not data['ref'].startswith('refs/scrum/paused/'):raise ValueError('Invalid private checkpoint ref')
-        checked(root,'stash','apply',data['ref'])
+        if data.get('unplanned') and not data.get('task_scoped_ref'):
+            # Reconcile any mixed snapshots created by an older local runtime.
+            data['retained_ref']=data['ref']
+            data['ref']=scoped_ref(root,data['ref'],{name for name,entry in data['files'].items() if not entry['untracked']},directory)
+            data['task_scoped_ref']=True;save(directory/'manifest.json',data)
+        if data['ref']:checked(root,'stash','apply',*(['--index'] if data.get('staged_files') else []),data['ref'])
     same_base=checked(root,'rev-parse','HEAD')==data['base']
     for name,entry in data['files'].items():
         # Keep Git's three-way result if the base advanced; preserve original raw

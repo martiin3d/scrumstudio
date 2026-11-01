@@ -2,6 +2,7 @@
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 import git_sync as git
 
@@ -110,6 +111,26 @@ def finalize(db,a,project_row,prefix,activity,now,resolve_dependents):
     settings=dict(project_row)
     if settings.get('require_evidence') and not row['evidence'].strip():return pending
     if settings.get('git_push')!='Never' and not merge.get('pushed'):return pending
+    if settings.get('git_mode')=='Branches':
+        receipt['checkout_pending']=True
+        write_receipt(receipt_path,receipt)
+        # The DB transaction excludes new claims through the checkout boundary;
+        # existing workers (including humans) always retain their workspace.
+        live=db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>? LIMIT 1',(project_row['id'],time.time())).fetchone()
+        reserved=db.execute('SELECT 1 FROM file_locks WHERE project=? AND lock_until>? LIMIT 1',(project_row['id'],time.time())).fetchone()
+        if live or reserved:return dict(pending,integration_note='Integration verified; another live claim still owns the checkout')
+        try:
+            with git.checkout_lock(root):
+                checkout=git.close_verified_checkout(root,settings,receipt['source'],receipt['target'],receipt['sha'],{'code':f"{prefix}-{row['number']}",'files':json.loads(row['files'])})
+        except (OSError,ValueError,git.subprocess.SubprocessError) as error:
+            checkout={'closed':False,'reason':str(error)[:300]}
+        outcome['checkout']=checkout
+        if not checkout.get('closed'):return dict(pending,checkout=checkout,integration_note='Integration verified; checkout closure pending: '+checkout.get('reason','unknown'))
+        receipt.pop('checkout_pending',None)
+        write_receipt(receipt_path,receipt)
+        if checkout.get('retained'):
+            kept=checkout['retained']
+            activity(db,row['id'],a.get('actor'),'comment','Unplanned leftovers retained privately by native closure, without another model: '+kept['manifest']+'. Not merged or published.')
     # The receipt identifies immutable verified content; later source commits do
     # not silently enlarge the outcome. No Done event precedes integration.
     db.execute("UPDATE tasks SET status='Done',updated=? WHERE id=?",(now(),row['id']))
@@ -117,7 +138,7 @@ def finalize(db,a,project_row,prefix,activity,now,resolve_dependents):
     telemetry.transition(db,row['id'],'Done',a.get('actor'))
     activity(db,row['id'],a.get('actor'),'comment','Verified outcome integrated into '+receipt['target']+'; task completed.')
     unblocked=resolve_dependents(db,project_row['id'],row['id'],prefix,a.get('actor'))
-    return {'status':'Done','integration_pending':False,'unblocked':unblocked[:20],'unblocked_total':len(unblocked)}
+    return {'status':'Done','integration_pending':False,'unblocked':unblocked[:20],'unblocked_total':len(unblocked),**({'checkout':checkout} if settings.get('git_mode')=='Branches' else {})}
 
 
 def reconcile(db,a,project_row,prefix,activity,now,resolve_dependents):
@@ -167,6 +188,14 @@ def reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,act
     if not db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Review' AND category!='Git recovery' LIMIT 1",(project_row['id'],)).fetchone():return []
     rows=db.execute("SELECT title FROM tasks WHERE project=? AND status='Done' AND category='Git recovery' AND title LIKE 'Resolve Git integration: %'",(project_row['id'],)).fetchall()
     sources={r['title'][len('Resolve Git integration: '):].split(' into ',1)[0] for r in rows}
+    import git_worktrees
+    for row in db.execute("SELECT * FROM tasks WHERE project=? AND status='In Review' AND category!='Git recovery'",(project_row['id'],)):
+        root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(row))
+        path=location(root,row['id'])
+        if path.exists():
+            receipt=json.loads(path.read_text())
+            if receipt.get('checkout_pending') and receipt.get('basis')==git.completion_basis(dict(row)):
+                sources.add(receipt['source'])
     completed=[]
     for source in sources:
         result=reconcile(db,dict(project=project_row['id'],actor=actor,source=source,capability=git.FINALIZE_TOKEN,only_published=True),project_row,prefix,activity,now,resolve_dependents)

@@ -176,6 +176,7 @@ def parser():
     p.add_argument('--stdin',action='store_true',help='Read JSON arguments from stdin, never shell-built JSON')
     for field in ('evidence','continuity','reason','query','status','file'):p.add_argument('--'+field)
     for field in ('evidence','continuity'):p.add_argument('--'+field+'-file',type=Path)
+    p.add_argument('--decisions-file',type=Path)
     p.add_argument('--paths',nargs='+');p.add_argument('--action');p.add_argument('--limit',type=int);p.add_argument('--after',type=int)
     return p
 
@@ -222,7 +223,10 @@ def main(argv=None):
                     if not isinstance(value,str):raise ValueError('JSON evidence file requires an evidence string')
             if value is not None:args[field]=value
         if ns.reason is not None:args['reason' if name=='agent_checkpoint' else 'blocked_reason']=ns.reason
-        if ns.paths is not None:args['paths']=ns.paths
+        if ns.decisions_file:
+            if ns.decisions_file.stat().st_size>32000:raise ValueError('Decision file too large')
+            args['decisions']=json.loads(ns.decisions_file.read_text(encoding='utf-8-sig'))
+        if ns.paths is not None:args['additional_files' if name=='work_finish' else 'paths']=ns.paths
         if ns.command=='ask':
             args.setdefault('action','request');args.setdefault('kind','question')
             if state.get('current'):args.setdefault('task',state['current']['id'])
