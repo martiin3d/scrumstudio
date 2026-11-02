@@ -229,6 +229,18 @@ def refresh_index_state(root):
     return current
 
 
+def integrated_origin(root,branch):
+    """Skip already accepted task origins, without crossing unmerged history."""
+    seen=set()
+    for _ in range(16):
+        if branch in seen:raise ValueError('Recorded parent cycle; preserve checkout for review')
+        seen.add(branch)
+        parent=parent_branch(root,branch)
+        if not parent or not is_ancestor(root,'refs/heads/'+branch,'refs/heads/'+parent):return branch
+        branch=parent
+    raise ValueError('Recorded parent chain exceeds the automatic bound')
+
+
 def _on_claim(root, settings, task):
     """Move the checkout to the task's branch. Returns {'branch','switched'|'created'} or {'busy':...}/{'error':...}."""
     if not enabled(settings) or not root:
@@ -238,7 +250,9 @@ def _on_claim(root, settings, task):
     if current is None:
         return {'branch': target, 'error': 'git unavailable or not a repository'}
     branch, dirty = current
-    destination=target if _git(root,'rev-parse','--verify','--quiet','refs/heads/'+target).returncode==0 else settings.get('git_base_branch') or 'HEAD'
+    exists=_git(root,'rev-parse','--verify','--quiet','refs/heads/'+target).returncode==0
+    base=settings.get('git_base_branch') or (integrated_origin(root,branch) if not exists and settings.get('git_merge') in ('Group','Task') else branch)
+    destination=target if exists else base
     missing=[]
     for dep in task.get('dependencies',[]):
         dependency=branch_for(settings,dep)
@@ -258,12 +272,10 @@ def _on_claim(root, settings, task):
     if dirty:
         return {'busy': {'current_branch': branch, 'wanted': target, 'dirty': dirty[:20], 'dirty_total': len(dirty)}}
     try:
-        exists = _git(root, 'rev-parse', '--verify', '--quiet', 'refs/heads/' + target).returncode == 0
         if exists:
             result = _git(root, 'checkout', '--quiet', target, timeout=20)
             outcome = 'switched'
         else:
-            base = settings.get('git_base_branch') or 'HEAD'
             if base != 'HEAD' and _git(root, 'rev-parse', '--verify', '--quiet', base).returncode:
                 return {'branch': target, 'error': f'base branch {base} not found; staying on {branch}'}
             origin=_git(root,'rev-parse','--symbolic-full-name',base)
@@ -550,6 +562,13 @@ def _finish_locked(item):
                 if strict:report['merge']=merge_completed(root,settings,report['branch'],expected_source=receipt['sha'],expected_parent=receipt['target'])
                 else:report['merge']=(merge_dependency_checkpoint if item.get('dependency_checkpoint') else merge_completed)(root,settings,report['branch'])
             except (OSError,ValueError,subprocess.SubprocessError) as error:report['merge']={'merged':False,'error':str(error)[:300]}
+    merged=report.get('merge',{})
+    if (not strict and settings.get('git_merge')=='Group' and settings.get('git_mode')=='Branches'
+            and (not group or item['group_done']) and merged.get('merged') and not merged.get('error')):
+        scope=dict(task)
+        if group:scope['files']=sorted({p for m in item['members'] if m['status']=='Done' for p in m.get('files',[])})
+        try:report['checkout']=close_verified_checkout(root,settings,report['branch'],merged['target'],merged['source_sha'],scope)
+        except (OSError,ValueError,subprocess.SubprocessError) as error:report['checkout']={'closed':False,'reason':str(error)[:300]}
     return report
 
 
@@ -661,6 +680,9 @@ def describe(report):
     if report.get('cleanup'):parts.append('cleanup: '+report['cleanup'].get('reason','pending worker exit'))
     if report.get('note'):
         parts.append(report['note'])
+    if report.get('checkout'):
+        checkout=report['checkout']
+        parts.append('checkout returned to '+checkout.get('branch','recorded parent') if checkout.get('closed') else 'checkout preserved: '+checkout.get('reason','closure pending'))
     return '; '.join(parts) + '.'
 
 def flush(call,jobs,result,external_project=None):
@@ -682,7 +704,7 @@ def flush(call,jobs,result,external_project=None):
                 finalized=call('git_finalize',dict(project=project,id=item['task']['id'],actor=item['actor'],capability=FINALIZE_TOKEN,expected=item['task'].get('completion_basis'),outcome=outcome,root=item['root']))
                 if result.get('id')==item['task']['id']:result.update(finalized)
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
-        closure_error=outcome.get('checkout',{}).get('reason') if outcome.get('checkout',{}).get('closed') is False else ''
+        closure_error=outcome.get('checkout',{}).get('reason') if strict and outcome.get('checkout',{}).get('closed') is False else ''
         if outcome.get('merge',{}).get('error') or closure_error:
             try:
                 recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description=('Git checkout closure remains pending after verified integration. Preserve actual remaining source/staging; do not repeat implementation or adopt unknown edits. ' if closure_error else '')+'Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+(closure_error or outcome['merge']['error']),acceptance_criteria=[('Canonical checkout is clean on its recorded parent without losing source/staging; existing integration/publication is preserved.' if closure_error else 'Target contains the source outcome, conflicts are resolved and verification is recorded.'),'Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))

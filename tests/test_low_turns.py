@@ -496,7 +496,7 @@ class GitAutomationTest(unittest.TestCase):
                 git('checkout','-q',branch);(folder/'a.py').write_text('source change')
                 done=run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Checked'))
                 report=done['completed']['git'];self.assertEqual(done['completed']['status'],'Done')
-                self.assertEqual(git('branch','--show-current'),branch);self.assertEqual(git('status','--porcelain'),'')
+                self.assertEqual(git('branch','--show-current'),branch if conflict else 'main');self.assertEqual(git('status','--porcelain'),'')
                 if not conflict:
                     self.assertTrue(report['merge']['pushed'])
                     self.assertEqual(len(git('rev-list','--parents','-1','main').split()),3)
