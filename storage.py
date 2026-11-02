@@ -426,6 +426,7 @@ def snapshot_data(db, meta, folder):
             if 'task' in row:
                 row['task'] = task_ids[row['task']] if row['task'] is not None else None
             if table == 'tasks':
+                row['review_data']=json.loads(row.get('review_data','{}'))
                 row['decisions']=json.loads(row.get('decisions','[]'))
                 row['attachments']=json.loads(row['attachments'])
                 row['cost_data'] = json.loads(row['cost_data'])
@@ -513,6 +514,8 @@ def validate_snapshot(data, meta):
         task_decisions.validate(row.get('decisions',[]))
         from attachments import validate_metadata
         validate_metadata(row.get('attachments',[]))
+        import reviews
+        reviews.validate(row.get('review_data',{}))
         from coordination import validate_scope
         import task_cost
         task_cost.validate(row.get('cost_data',task_cost.empty()))
@@ -588,6 +591,7 @@ def restore_into(db, data, meta):
         row.setdefault('task',None)
         row.setdefault('audience','human')
     for row in data['tables']['tasks']:
+        row.setdefault('review_data',{})
         row.setdefault('decisions',[])
         row.setdefault('attachments',[])
         row.setdefault('acceptance_criteria',[])
@@ -635,6 +639,7 @@ def restore_into(db, data, meta):
             if 'task' in row:
                 row['task'] = task_map.get(row['task'])
             if table == 'tasks':
+                row['review_data']=json.dumps(row.get('review_data',{}))
                 row['decisions']=json.dumps(row.get('decisions',[]))
                 row['attachments']=json.dumps(row['attachments'])
                 row['cost_data'] = json.dumps(row['cost_data'])

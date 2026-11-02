@@ -60,6 +60,17 @@ class CompletionRecoveryTest(unittest.TestCase):
         run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Verified source integrated'))
         self.assertEqual(run('task_get',dict(project=project,id=task))['status'],'Done')
 
+    def test_git_recovery_does_not_approve_human_review(self):
+        project,root,git,task,branch,recovery=self.failed_commit()
+        run('task_update',dict(project=project,id=task,actor=self.agent,status='In Review'))
+        claim=self.recover(project,root,git,branch,recovery)
+        run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Verified source integrated'))
+        current=run('task_get',dict(project=project,id=task))
+        self.assertEqual(current['status'],'In Review')
+        self.assertTrue(current['review']['awaiting_human'])
+        approved=run('task_review',dict(project=project,id=task,actor=self.human,decision='approve'))
+        self.assertEqual(approved['status'],'Done',approved)
+
     def test_recovery_with_changed_unverified_bytes_does_not_complete_original(self):
         project,root,git,task,branch,recovery=self.failed_commit()
         (root/'a.py').write_text('unverified replacement')

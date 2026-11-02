@@ -170,6 +170,9 @@ def git_done(db, project, t, prefix, actor):
         members=[{'id':r['id'],'code':f"{prefix}-{r['number']}",'status':r['status'],'files':json.loads(r['files'])} for r in db.execute('SELECT id,number,status,files FROM tasks WHERE project=? AND context_group=? ORDER BY id',(project,group))]
         group_done=all(m['status'] in ('Done','Cancelled') for m in members)
     task={'id':t['id'],'code':t['code'],'title':t['title'],'files':t.get('files') or [],'context_group':group}
+    import reviews
+    review=reviews.view(db.execute('SELECT * FROM tasks WHERE id=?',(t['id'],)).fetchone())
+    if review:task['review']=review
     if git_sync.integrated_completion(settings):
         task['completion_basis']=git_sync.completion_basis(dict(db.execute('SELECT * FROM tasks WHERE id=?',(t['id'],)).fetchone()))
     dependency_checkpoint=False
@@ -204,6 +207,10 @@ def description(value):
 
 def task_dict(row, prefix, include_cost=False):
     t = dict(row)
+    import reviews
+    review=reviews.view(row)
+    t.pop('review_data',None)
+    if review:t['review']=review
     t['dependencies'] = json.loads(t['dependencies'])
     t['checklist'] = json.loads(t['checklist'])
     t['files'] = json.loads(t['files'])
@@ -379,6 +386,9 @@ def run(action, a):
         if candidate:result['git_recovery_id']=candidate['id']
     import idle_signals
     idle_signals.notify(action,a)
+    if action=='task_review' and a.get('decision')=='request_changes' and isinstance(result,dict):
+        import managed_agents
+        result['review_resume']=managed_agents.resume_review(a,run)
     if action in ('agent_checkpoint','project_control') and isinstance(result,dict):
         import metrics_periods
         metrics_periods.capture(a['project'],action,a,result)
@@ -778,11 +788,15 @@ def legacy_run(action, a, path=None, locks=None):
             if a.get('log'):
                 activity(db, cur.lastrowid, actor_user(db,a)['id'], 'work', required(a['log'], 'log', 2000))
             return {'id': cur.lastrowid, 'code': f'{prefix}-{number}', 'status': initial}
-        if action == 'task_update':
+        if action in ('task_update','task_review'):
             db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT * FROM tasks WHERE id=? AND project=?', (int(a['id']), project)).fetchone()
             if not old:
                 raise ValueError('Task not found')
+            if action=='task_review':
+                import reviews
+                a=reviews.prepare(db,a,old,project_row,actor_user,now,activity)
+                old=db.execute('SELECT * FROM tasks WHERE id=?',(old['id'],)).fetchone()
             if 'decisions' in a:
                 user=actor_user(db,a)
                 if user['kind']!='human' and not (old['status']=='In Progress' and old['owner_id']==user['id'] and old['lock_until']>time.time()):raise ValueError('Record decisions under your live task claim, or ask its human owner')
@@ -940,11 +954,13 @@ def legacy_run(action, a, path=None, locks=None):
                         raise ValueError('Finish dependencies before progressing this task')
             import git_sync
             completion_requested=t['status']=='Done' and old['status']!='Done'
+            import reviews
+            awaiting_review=reviews.transition(db,old,a,t,claiming,completion_requested)
             if completion_requested and t['category']=='Git recovery':
                 import git_completion
                 git_completion.validate_recovery(db,project_row,t,prefix)
             strict_completion=completion_requested and t['category']!='Git recovery' and git_sync.integrated_completion(coord.settings(project_row))
-            if strict_completion:
+            if strict_completion or awaiting_review:
                 # Persist verification before Git, but do not unblock dependents yet.
                 t['status']='In Review'
             paths=[]
@@ -1009,6 +1025,9 @@ def legacy_run(action, a, path=None, locks=None):
                 activity(db, t['id'], actor_user(db,a)['id'], 'work', required(a['log'], 'log', 2000))
             unblocked = resolve_dependents(db, project, t['id'], prefix, a.get('actor')) if t['status'] in ['Done','Cancelled'] and old['status'] != t['status'] else []
             result = {'id': t['id'], 'code': t['code'], 'status': t['status'], 'unblocked': unblocked[:20], 'unblocked_total': len(unblocked)}
+            review=reviews.view(db.execute('SELECT * FROM tasks WHERE id=?',(t['id'],)).fetchone())
+            if review:result['review']=review
+            if awaiting_review:result['awaiting_human_review']=True
             if claiming:
                 result.update(claimed=True,token=token, lock_until=until, owner_id=owner,files_reserved=len(paths) if coord.file_lock_mode(db,project,t['id'])=='files' else 0,file_lock_mode=coord.file_lock_mode(db,project,t['id']))
                 if git:result['git']=git

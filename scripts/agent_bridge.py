@@ -57,6 +57,7 @@ def continue_after_task(task, batch_run, released):
     # Ordinary chaining never retries In Progress; closure recovery is bounded
     # separately and targets only the same unfinished task.
     if task.get('status') in ('Blocked','Cancelled'):return True
+    if task.get('status')=='In Review' and task.get('review',{}).get('required') and task['review'].get('state')=='pending' and task.get('evidence'):return True
     # A verified Done result is progress even if an old worker closed its batch
     # early. Release has already removed its reservations; native selection can
     # safely choose remaining work. Stop/quota gates are checked by the caller.

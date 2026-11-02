@@ -510,9 +510,10 @@ def _finish_locked(item):
     current=state(root)
     if current is None:return dict(report,error='git unavailable or not a repository')
     strict=integrated_completion(settings)
-    if strict:
+    review_approval=task.get('review',{}).get('required') and task['review'].get('state')=='approved'
+    if strict or review_approval:
         import git_completion
-        existing=git_completion.already_integrated(root,settings,task,report['branch'])
+        existing=git_completion.already_integrated(root,settings,task,report['branch'],record=strict)
         if existing:
             report.update(existing)
             return report

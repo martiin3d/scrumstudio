@@ -52,6 +52,26 @@ class GroupCheckoutTest(unittest.TestCase):
                 self.assertEqual(g('show','main:a.py'),'First')
                 self.assertEqual(g('show','main:b.py'),'Second')
 
+    def test_human_approval_after_delivery_preserves_git_gates(self):
+        for mode in ('Task','Group'):
+            with self.subTest(mode=mode):
+                project,root,g=self.setup_repo()
+                self.enable(project,git_merge=mode,git_commit='Task',git_push='Group',usage_guard=False)
+                task=self.task(project,'Human-reviewed outcome','review.py')
+                claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+                (root/'review.py').write_text('verified artwork')
+                run('task_update',dict(project=project,id=task,actor=self.agent,token=claim['token'],status='In Review',evidence='Camera and assertions verified'))
+                delivered=run('task_update',dict(project=project,id=task,actor=self.agent,status='Done',evidence='Camera and assertions verified'))
+                self.assertEqual(delivered['status'],'In Review')
+                # Native publication or a later reconciliation is not approval.
+                current=run('task_get',dict(project=project,id=task))
+                self.assertEqual(current['status'],'In Review')
+                self.assertTrue(current['review']['awaiting_human'])
+                approved=run('task_review',dict(project=project,id=task,actor=self.human,decision='approve'))
+                self.assertEqual(approved['status'],'Done',approved)
+                self.assertEqual(g('show','main:review.py'),'verified artwork')
+                self.assertEqual(g('rev-parse','main'),g('ls-remote','origin','refs/heads/main').split()[0])
+
     def test_open_group_keeps_its_branch_until_last_delivery(self):
         project,root,g=self.setup_repo()
         first=self.task(project,'First','a.py','Shared')

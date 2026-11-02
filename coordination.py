@@ -56,7 +56,7 @@ def migrate(db, separate=False):
             spec = f"TEXT NOT NULL DEFAULT '{value}'" if isinstance(value,str) else f'INTEGER NOT NULL DEFAULT {int(value)}'
             db.execute(f'ALTER TABLE projects ADD COLUMN {name} {spec}')
     columns = {r['name'] for r in db.execute('PRAGMA table_info(tasks)')}
-    for name, spec in [('decisions', "TEXT NOT NULL DEFAULT '[]'"), ('files', "TEXT NOT NULL DEFAULT '[]'"), ('evidence', "TEXT NOT NULL DEFAULT ''")]:
+    for name, spec in [('review_data', "TEXT NOT NULL DEFAULT '{}'"), ('decisions', "TEXT NOT NULL DEFAULT '[]'"), ('files', "TEXT NOT NULL DEFAULT '[]'"), ('evidence', "TEXT NOT NULL DEFAULT ''")]:
         if name not in columns:
             db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {spec}')
     namespace = 'reservations.' if separate else ''

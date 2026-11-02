@@ -676,6 +676,8 @@ class ManagedBridgeTest(unittest.TestCase):
             self.assertFalse(agent_bridge.continue_after_task({'status':'In Progress'},batch,{}))
         self.assertTrue(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':False}))
         self.assertTrue(agent_bridge.continue_after_task({'status':'Done'},True,{'batch_complete':True}))
+        self.assertTrue(agent_bridge.continue_after_task({'status':'In Review','evidence':'Verified output','review':{'required':True,'state':'pending'}},False,{}))
+        self.assertFalse(agent_bridge.continue_after_task({'status':'In Review','evidence':'Verified output'},False,{}))
 
     def test_each_completed_task_gets_its_own_model_before_next_launch(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:

@@ -83,7 +83,7 @@ def save_receipt(root, task, branch, pending=False, expected_blobs=None):
     return write_receipt(path,data)
 
 
-def already_integrated(root,settings,task,branch):
+def already_integrated(root,settings,task,branch,record=True):
     """Idempotent explicit finish; never checkout/stage another task's work."""
     parent=git.parent_branch(root,branch)
     if not parent:return None
@@ -92,7 +92,7 @@ def already_integrated(root,settings,task,branch):
     if source.returncode or target.returncode or not git.is_ancestor(root,source.stdout.strip(),target.stdout.strip()):return None
     files=file_blobs(root,task.get('files') or [])
     if not matches_commit(root,files,source.stdout.strip()):return None
-    receipt=save_receipt(root,task,branch,expected_blobs=files)
+    receipt=save_receipt(root,task,branch,expected_blobs=files) if record else {'sha':source.stdout.strip()}
     merged=git.merge_completed(root,settings,branch,expected_source=receipt['sha'],expected_parent=parent)
     return {'branch':branch,'commit':{'committed':False,'reason':'nothing to commit'},'push':{'pushed':False,'reason':'Existing task commit already integrated; publication verified on target'},'merge':merged,'verified_source_sha':receipt['sha']}
 
@@ -169,6 +169,10 @@ def finalize(db,a,project_row,prefix,activity,now,resolve_dependents):
         if checkout.get('retained'):
             kept=checkout['retained']
             activity(db,row['id'],a.get('actor'),'comment','Unplanned leftovers retained privately by native closure, without another model: '+kept['manifest']+'. Not merged or published.')
+    import reviews
+    review=reviews.data(row)
+    if review.get('required') and review.get('state')!='approved':
+        return dict(pending,awaiting_human_review=True)
     # The receipt identifies immutable verified content; later source commits do
     # not silently enlarge the outcome. No Done event precedes integration.
     db.execute("UPDATE tasks SET status='Done',updated=? WHERE id=?",(now(),row['id']))

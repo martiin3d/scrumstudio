@@ -35,3 +35,9 @@ html[data-theme=dark] :is(.task-editor-meta,.task-editor-meta fieldset){border-c
 .interaction-card{border:1px solid #648b75;border-radius:10px;padding:18px;margin:0 0 16px}.interaction-question{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto}.interaction-options{display:flex;flex-wrap:wrap;gap:10px}.interaction-answer{margin-top:12px}.interaction-result{color:#b24e46}
 
 [data-delete-note]{display:block;margin-top:12px}
+:root .task-review{border:1px solid var(--accent,#629bd0);border-radius:12px;padding:16px;margin-bottom:20px;background:var(--panel,transparent)}
+:root .task-review h3{margin-top:0}
+:root .review-actions{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
+:root .task-review blockquote{margin:12px 0;padding:8px 12px;border-left:3px solid var(--accent,#629bd0);white-space:pre-wrap;overflow-wrap:anywhere}
+:root #review-feedback-panel[hidden]{display:none}
+.human-review-tag{display:inline-block;padding:4px 8px;margin:5px 0;border:1px solid #c59336;border-radius:6px;background:#b7801820;color:var(--text);font-size:11px;font-weight:650;line-height:1.4}

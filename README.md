@@ -526,3 +526,10 @@ Standing project execution instructions (human-only, max4000 characters) can be 
 ### Human-controlled Backlog
 
 Backlog is an optional parking state before To do. Create a task there, or move an existing task to its Backlog column. Agents never select, claim or promote parked tasks; completing/cancelling prerequisites and Wakeup leave them parked. Move a task to To do manually, or explicitly instruct the assistant to activate that named task using your human profile. Human cancellation is supported; starting/completing parked work requires activation first. MCP task_create and new task_plan items accept status=Backlog for a human actor; TODO remains the default. This adds no model calls or polling.
+
+
+### Human review
+
+Tasks submitted to In Review show **Waiting for human review** on the board and task list. A selected human can **Approve**, or choose **Request changes**, enter required feedback and **Submit**. Approval retains evidence and Git integration checks; publishing files alone does not approve the work. Requested changes return the same task to To do, preserve attachments and prior evidence in history, and put feedback in its continuation. Revised work returns for human review, and agents cannot approve it themselves.
+
+Feedback signals a connected worker or restores its enabled Codex profile. It respects project Stop, disabled profiles and quota checks, and does not interrupt current work. The shared CLI/MCP action is `task_review` with `decision=approve` or `request_changes`; the latter requires `comment`.

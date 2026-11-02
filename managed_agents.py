@@ -183,6 +183,25 @@ def wakeup(a,call,signal):
     return result
 
 
+def resume_review(a,call):
+    """A submitted review resumes only already enabled, authorized workers."""
+    try:
+        state=call('agent_status',{'project':a['project']})
+        if state['control']['paused']:return {'status':'stopped','message':'Changes saved. Project Stop remains active; use Wakeup when ready.'}
+        task=call('task_get',{'project':a['project'],'id':a['id']})
+        agents=operation({'project':a['project'],'action':'list'},call)['agents']
+        row=next((p for p in agents if p['actor']==task.get('owner_id') and p['enabled'] and p['resume_on_wakeup']),None)
+        if row and not row['connected']:
+            if row['client']!='codex':return {'status':'authorization_required','message':'Changes saved. Confirm the configured provider account in Agents to resume.'}
+            result=operation({'project':a['project'],'actor':a['actor'],'action':'start','id':row['id'],'_restore_only':True},call)
+            return {'status':result['request'],'message':'Changes saved. Agent continuation requested; quota and reservations still apply.'}
+        if row or state['wakeup']['connected_bridges']:
+            return {'status':'signal_sent','message':'Changes saved. The agent will take eligible work after its current task; Stop, quota and reservations still apply.'}
+        return {'status':'no_enabled_agent','message':'Changes saved. Start an agent in Agents to process the task.'}
+    except (OSError,ValueError,sqlite3.Error) as error:
+        return {'status':'pending','message':'Changes saved. Agent continuation needs attention in Agents: '+str(error)[:300]}
+
+
 def checkpoint(a,call):
     p=project_info(a['project'],call)
     with closing(connect(p['path'])) as db:row=profile(db,a['profile_id'])

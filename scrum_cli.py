@@ -93,7 +93,7 @@ def _advance(state,name,args,result):
     if name=='work_finish':
         following=result.get('next',{});claim=following.get('claim',{});task=following.get('task',{})
         if claim.get('claimed'):state['current']={'id':claim['id'],'code':task.get('code'),'token':claim['token']}
-        elif result.get('completed',{}).get('status')=='Done':state['current']=None
+        elif result.get('completed',{}).get('status')=='Done' or result.get('completed',{}).get('awaiting_human_review'):state['current']=None
     if name=='agent_interaction' and result.get('deferred'):
         state['current']=None;state['batch']=False
     if name=='task_plan' and result.get('deferred'):
