@@ -7,6 +7,10 @@ from pathlib import Path
 import git_sync as git
 
 
+class RecoveryIncomplete(ValueError):
+    """Known pre-transition rejection; ownership and completion stay intact."""
+
+
 def location(root, task):
     return Path(root)/'.scrum'/'local'/'git-completions'/(str(int(task))+'.json')
 
@@ -91,6 +95,40 @@ def already_integrated(root,settings,task,branch):
     receipt=save_receipt(root,task,branch,expected_blobs=files)
     merged=git.merge_completed(root,settings,branch,expected_source=receipt['sha'],expected_parent=parent)
     return {'branch':branch,'commit':{'committed':False,'reason':'nothing to commit'},'push':{'pushed':False,'reason':'Existing task commit already integrated; publication verified on target'},'merge':merged,'verified_source_sha':receipt['sha']}
+
+
+def validate_recovery(db,project_row,task,prefix):
+    """Equal branch tips do not prove that a task's outputs were committed."""
+    marker='Resolve Git integration: '
+    if task.get('category')!='Git recovery' or not task['title'].startswith(marker):return
+    source,separator,target=task['title'][len(marker):].partition(' into ')
+    if not separator:raise RecoveryIncomplete('Git recovery requires its recorded source and target')
+    import git_worktrees
+    settings=dict(project_row)
+    for original in db.execute("SELECT * FROM tasks WHERE project=? AND status='In Review' AND category!='Git recovery'",(project_row['id'],)).fetchall():
+        original=dict(original)
+        root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(original))
+        path=location(root,original['id'])
+        receipt=json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+        original.update(code=f"{prefix}-{original['number']}",files=json.loads(original['files']))
+        if (receipt.get('source') if receipt else git.branch_for(settings,original))!=source:continue
+        tip=git._git(root,'rev-parse','--verify','refs/heads/'+source)
+        files=receipt['files'] if receipt else file_blobs(root,original['files'])
+        # Ignored reports are retained local evidence, not publication scope.
+        # Reconciliation separately checks their unchanged bytes before it can
+        # complete the original task; never drop them from its receipt here.
+        if receipt:
+            ignored=git.ignored_paths(root,list(files))
+            files={name:blob for name,blob in files.items() if name not in ignored}
+        if tip.returncode or (not receipt and original['files'] and not files) or not matches_commit(root,files,tip.stdout.strip()):
+            raise RecoveryIncomplete('Git recovery incomplete: verified planned files are not committed in '+source+'; preserve and publish the original outputs before completing recovery')
+        if not git.is_ancestor(root,tip.stdout.strip(),'refs/heads/'+target):
+            raise RecoveryIncomplete('Git recovery incomplete: target does not contain the verified source')
+        if settings.get('git_push')!='Never':
+            published=git._git(root,'ls-remote','--heads',settings.get('git_remote','origin'),'refs/heads/'+target,timeout=git.PUSH_TIMEOUT)
+            remote_sha=published.stdout.split()[0] if not published.returncode and published.stdout.strip() else ''
+            if not remote_sha or not git.is_ancestor(root,tip.stdout.strip(),remote_sha):
+                raise RecoveryIncomplete('Git recovery incomplete: remote target publication is not verified')
 
 
 def finalize(db,a,project_row,prefix,activity,now,resolve_dependents):

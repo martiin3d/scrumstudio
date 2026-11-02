@@ -152,7 +152,8 @@ def coordinated(name,args,path=None):
             # This API is a single SQLite transaction with no post-commit Git
             # jobs. A rejected question is known not to have been committed.
             from planning import PlanRejected
-            if mutation and (name=='agent_interaction' or isinstance(error,PlanRejected)):
+            from git_completion import RecoveryIncomplete
+            if mutation and (name=='agent_interaction' or isinstance(error,(PlanRejected,RecoveryIncomplete))):
                 state.pop('pending',None);atomic(path,state)
             raise
         if mutation:
@@ -251,9 +252,12 @@ def main(argv=None):
     except Exception as error:
         if isinstance(error,ValueError):
             from planning import PlanRejected
+            from git_completion import RecoveryIncomplete
             rejected=isinstance(error,PlanRejected)
-            detail={'code':'PLAN_REJECTED' if rejected else 'VALIDATION_ERROR','message':str(error)[:1000]}
+            recovery=isinstance(error,RecoveryIncomplete)
+            detail={'code':'PLAN_REJECTED' if rejected else 'RECOVERY_INCOMPLETE' if recovery else 'VALIDATION_ERROR','message':str(error)[:1000]}
             if rejected:detail.update(committed=False,next_step='Correct this rejected plan; the transaction was rolled back. Do not pause solely for this validation rejection.')
+            if recovery:detail.update(committed=False,next_step='The completion was rejected before transition. Preserve the current claim; commit and publish only the original verified scope before finishing recovery.')
             print(json.dumps({'error':detail,'retried':False},separators=(',',':')),file=sys.stderr)
             return 1
         from diagnostics import failure

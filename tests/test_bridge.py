@@ -87,6 +87,24 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('mcp_servers.scrum-studio.enabled=false',default)
         self.assertIn('mcp_servers.scrum-studio.enabled=true',explicit)
 
+    def test_native_cli_grants_only_its_project_git_metadata(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            root=Path(temp);(root/'.git').mkdir()
+            self.assertEqual(agent_bridge.native_git_filesystem(root),{(root/'.git').resolve().as_posix():'write'})
+            with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=[]):
+                args=agent_bridge.command('codex',root,'scope')
+                mcp=agent_bridge.command('codex',root,'scope',coordination_channel='mcp')
+            def rules(args):
+                value=next(a.split('=',1)[1] for a in args if a.startswith('permissions.scrum-worker.filesystem='))
+                return tomllib.loads('paths='+value)['paths']
+            self.assertEqual(rules(args)[(root/'.git').resolve().as_posix()],'write')
+            self.assertNotIn((root/'.git').resolve().as_posix(),rules(mcp))
+            self.assertNotIn('--dangerously-bypass-approvals-and-sandbox',args)
+            metadata=root/'.git/worktrees/unit';metadata.mkdir(parents=True)
+            (metadata/'commondir').write_text('../..')
+            worktree=root/'unit';worktree.mkdir();(worktree/'.git').write_text('gitdir: '+str(metadata))
+            self.assertEqual(set(agent_bridge.native_git_filesystem(worktree)),{metadata.resolve().as_posix(),(root/'.git').resolve().as_posix()})
+
     def test_missed_notification_refreshes_quota_on_wakeup_generation(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
             folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)

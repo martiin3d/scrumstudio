@@ -940,6 +940,9 @@ def legacy_run(action, a, path=None, locks=None):
                         raise ValueError('Finish dependencies before progressing this task')
             import git_sync
             completion_requested=t['status']=='Done' and old['status']!='Done'
+            if completion_requested and t['category']=='Git recovery':
+                import git_completion
+                git_completion.validate_recovery(db,project_row,t,prefix)
             strict_completion=completion_requested and t['category']!='Git recovery' and git_sync.integrated_completion(coord.settings(project_row))
             if strict_completion:
                 # Persist verification before Git, but do not unblock dependents yet.

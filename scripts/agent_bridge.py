@@ -161,6 +161,24 @@ def worker_filesystem(folder):
         if local.is_absolute():rules[(local/'Unity/Caches').as_posix()]='write'
     return rules
 
+
+def native_git_filesystem(folder):
+    """Only this project's Git metadata, required by native claim/finish."""
+    root=Path(folder).resolve();metadata=root/'.git'
+    try:
+        if metadata.is_file():
+            pointer=metadata.read_text(encoding='utf-8').strip()
+            if not pointer.startswith('gitdir:'):return {}
+            metadata=(root/pointer[7:].strip()).resolve()
+        if not metadata.is_dir():return {}
+        rules={metadata.as_posix():'write'}
+        common=metadata/'commondir'
+        if common.is_file():
+            shared=(metadata/common.read_text(encoding='utf-8').strip()).resolve()
+            if shared.is_dir():rules[shared.as_posix()]='write'
+        return rules
+    except (OSError,ValueError):return {}
+
 # Only the board workflow authorized by Start/Wakeup; never provider, human,
 # project administration, filesystem, network or arbitrary tool approvals.
 SCRUM_WORK_TOOLS=EXECUTION_TOOLS
@@ -300,7 +318,7 @@ def command(client,folder,prompt,model='',policy_folder=None,coordination_channe
         rules=worker_filesystem(policy_folder or folder)
         if coordination_channel=='cli':
             import storage
-            rules={**rules,storage.registry_path().parent.as_posix():'write',(Path(policy_folder or folder)/'.scrum').as_posix():'write'}
+            rules={**rules,storage.registry_path().parent.as_posix():'write',(Path(policy_folder or folder)/'.scrum').as_posix():'write',**native_git_filesystem(policy_folder or folder)}
         options+=['-c','permissions.scrum-worker.filesystem={'+','.join(json.dumps(path)+'='+json.dumps(mode) for path,mode in rules.items())+'}']
         if coordination_channel=='cli':
             options+=['-c','mcp_servers.scrum-studio.enabled=false']

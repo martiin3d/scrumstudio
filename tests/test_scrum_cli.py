@@ -45,6 +45,16 @@ class NativeCliTest(unittest.TestCase):
         with patch.object(cli,'invoke') as dispatch:
             with self.assertRaisesRegex(ValueError,'uncertain'):cli.coordinated('work_start',args,path)
             dispatch.assert_not_called()
+
+    def test_incomplete_recovery_rejection_preserves_claim_without_uncertain_journal(self):
+        from git_completion import RecoveryIncomplete
+        task=self.task('Recovery validation');path=self.context()
+        cli.coordinated('work_start',dict(id=task,claim=True,session_used_percent=1,weekly_used_percent=1),path)
+        with patch.object(cli,'invoke',side_effect=RecoveryIncomplete('Original outputs are not committed')):
+            with self.assertRaises(RecoveryIncomplete):cli.coordinated('work_finish',dict(id=task,evidence='Incomplete integration'),path)
+        state=cli.context_file(path)
+        self.assertNotIn('pending',state)
+        self.assertEqual(state['current']['id'],task)
     def test_durable_result_repairs_context_without_repeating_write(self):
         path=self.context();state=cli.context_file(path)
         state['current']=dict(id=17,code='FIX-17',token='private-token');state['pending']=dict(key='fixture',operation='work_finish',task=17)

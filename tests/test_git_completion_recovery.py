@@ -17,17 +17,17 @@ class CompletionRecoveryTest(unittest.TestCase):
     repo=fixtures.GitAutomationTest.repo
     enable=fixtures.GitAutomationTest.enable
 
-    def failed_commit(self):
+    def failed_commit(self,name='a.py'):
         project,root=self.project();git=self.repo(root)
         self.enable(project,git_merge='Task',git_push='Never',usage_guard=False)
-        task=run('task_create',dict(project=project,title='Verified source',files=['a.py'],**SPEC))['id']
+        task=run('task_create',dict(project=project,title='Verified source',files=[name],**SPEC))['id']
         claim=run('task_claim',dict(project=project,id=task,actor=self.agent));branch=claim['git']['branch']
-        (root/'a.py').write_text('verified source')
+        (root/name).write_text('verified source')
         with patch.object(git_sync,'_commit',return_value={'error':'Simulated commit failure'}):
             result=run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Retained successful check'))
         self.assertEqual(result['completed']['status'],'In Review')
         receipt=json.loads(git_completion.location(root,task).read_text())
-        self.assertIsNone(receipt['sha']);self.assertIn('a.py',receipt['files'])
+        self.assertIsNone(receipt['sha']);self.assertIn(name,receipt['files'])
         return project,root,git,task,branch,result['completed']['git']['recovery_task']['id']
 
     def recover(self,project,root,git,branch,recovery):
@@ -64,8 +64,32 @@ class CompletionRecoveryTest(unittest.TestCase):
         project,root,git,task,branch,recovery=self.failed_commit()
         (root/'a.py').write_text('unverified replacement')
         claim=self.recover(project,root,git,branch,recovery)
-        run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Manual integration recorded'))
+        with self.assertRaisesRegex(ValueError,'verified planned files are not committed'):
+            run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Manual integration recorded'))
         self.assertEqual(run('task_get',dict(project=project,id=task))['status'],'In Review')
+
+    def test_equal_old_tips_cannot_complete_recovery_with_untracked_outputs(self):
+        project,root,git,task,branch,recovery=self.failed_commit('new-output.py')
+        claim=run('task_claim',dict(project=project,id=recovery,actor=self.agent))
+        self.assertEqual(git('rev-parse',branch),git('rev-parse','main'))
+        for legacy in (False,True):
+            with self.subTest(legacy=legacy):
+                if legacy:git_completion.location(root,task).unlink()
+                with self.assertRaisesRegex(ValueError,'verified planned files are not committed'):
+                    run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Branch tips coincide'))
+                self.assertEqual(run('task_get',dict(project=project,id=recovery))['status'],'In Progress')
+                self.assertEqual((root/'new-output.py').read_text(),'verified source')
+                self.assertEqual(git('ls-files','new-output.py'),'')
+
+    def test_local_integration_without_required_remote_publication_cannot_complete_recovery(self):
+        project,root,git,task,branch,recovery=self.failed_commit()
+        claim=self.recover(project,root,git,branch,recovery)
+        run('project_settings',dict(project=project,actor=self.human,git_push='Task'))
+        with self.assertRaisesRegex(git_completion.RecoveryIncomplete,'remote target publication'):
+            run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Only locally integrated'))
+        git('push','origin','main')
+        run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Original outputs committed, integrated and published'))
+        self.assertEqual(run('task_get',dict(project=project,id=task))['status'],'Done')
 
     def test_changed_acceptance_does_not_reuse_old_intent(self):
         project,root,git,task,branch,recovery=self.failed_commit()
