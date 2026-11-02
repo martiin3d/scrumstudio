@@ -285,6 +285,50 @@ class BridgeTest(unittest.TestCase):
         rpc.call.return_value={'claim_deferred':'Git branch preparation failed: Dependency branch not integrated'}
         self.assertIn('Dependency branch',agent_bridge.preclaim(rpc,1,9,'codex',70,{})['git_recovery'])
 
+    def test_standard_preclaim_uses_explicit_claim_after_clean_ownership_review(self):
+        deferred={'checkpoint':{'should_stop':False},'claim_deferred':'Standard workflow required: Standard selected by project policy','own_file_locks':{'has_more':False},'measurement_session':'fixture'}
+        rpc=Mock();rpc.call.side_effect=[deferred,{'claimed':True,'token':'private','file_lock_mode':'checkout'},{'id':70,'code':'FIX-70','status':'In Progress'}]
+        result=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
+        self.assertEqual(result['task']['id'],70)
+        self.assertEqual(result['file_lock_mode'],'checkout')
+        self.assertEqual([c.args[0] for c in rpc.call.call_args_list],['work_start','task_claim','task_get'])
+        self.assertEqual(rpc.call.call_args_list[1].args[1],{'project':1,'actor':9,'id':70})
+
+    def test_standard_preclaim_does_not_bypass_stop_own_locks_or_failed_claim(self):
+        base={'checkpoint':{'should_stop':False},'claim_deferred':'Standard workflow required: Standard selected by project policy','own_file_locks':{'has_more':False}}
+        for change in ({'checkpoint':{'should_stop':True,'reason':'Human Stop'}},{'own_file_locks':{'items':[{'task':8}]}},{'own_file_locks':{'has_more':True}},{'own_file_locks':None},{'active_tasks':1}):
+            rpc=Mock();rpc.call.return_value=base|change
+            self.assertTrue(agent_bridge.preclaim(rpc,1,9,'codex',70,{})['should_stop'])
+            rpc.call.assert_called_once()
+        for refused in ({'claimed':False,'reason':'File reservation conflict'},RuntimeError('Connection closed; uncertain claim')):
+            rpc=Mock();rpc.call.side_effect=[dict(base),refused]
+            self.assertTrue(agent_bridge.preclaim(rpc,1,9,'codex',70,{})['should_stop'])
+            self.assertEqual(rpc.call.call_count,2)
+
+    def test_standard_preclaim_through_real_mcp_and_native_cli_engine(self):
+        import test_storage
+        import mcp_server
+        import scrum_cli
+        from store import run
+        for channel in ('mcp','cli'):
+            with self.subTest(channel=channel):
+                fixture=test_storage.StorageTest();fixture.setUp()
+                try:
+                    project,_=fixture.project()
+                    run('project_settings',dict(project=project,actor=fixture.human,workflow_mode='Standard'))
+                    task=run('task_create',dict(project=project,title='Standard Wakeup outcome',description='Verify a supervised explicit Standard claim',acceptance_criteria=['Ownership is granted before inference']))['id']
+                    def call(name,args):
+                        if channel=='cli':return scrum_cli.invoke(name,args)
+                        result=mcp_server.handle({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':name,'arguments':args}})['result']
+                        self.assertFalse(result.get('isError'),result)
+                        return json.loads(result['content'][0]['text'])
+                    rpc=Mock();rpc.call.side_effect=call
+                    result=agent_bridge.preclaim(rpc,project,fixture.agent,'codex',task,{'session_used_percent':1,'weekly_used_percent':2})
+                    self.assertNotIn('should_stop',result)
+                    self.assertEqual(result['task']['status'],'In Progress')
+                    self.assertTrue(result['token'])
+                finally:fixture.tearDown()
+
     def test_plain_config_startup_failure_is_reported_without_other_log_content(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as folder:
             path=Path(folder)/'worker.log'

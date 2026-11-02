@@ -341,6 +341,18 @@ def preclaim(rpc,project,actor,client,task,observed):
     """Claim the offered task before inference; never launch an unclaimed worker."""
     try:
         result=rpc.call('work_start',{'project':project,'actor':actor,'client':client,'id':task,'claim':True,**observed})
+        # Explicit Standard deliberately separates session startup from its
+        # claim. The supervisor can perform that normal claim after reviewing
+        # its returned ownership, rather than treating the deferral as a Stop.
+        locks=result.get('own_file_locks')
+        if (not result.get('checkpoint',{}).get('should_stop')
+                and result.get('claim_deferred')=='Standard workflow required: Standard selected by project policy'
+                and isinstance(locks,dict) and not locks.get('items') and not locks.get('has_more')
+                and not result.get('active_tasks')):
+            result['claim']=rpc.call('task_claim',{'project':project,'actor':actor,'id':task})
+            if result['claim'].get('claimed'):
+                result['task']=rpc.call('task_get',{'project':project,'id':task})
+                result.pop('claim_deferred',None)
     except RuntimeError as error:
         message=str(error)
         return {'should_stop':True,'reason':'Task reservation failed: '+message[:500],**({'git_recovery':message[:1000]} if 'Git branch preparation failed:' in message else {})}
