@@ -80,6 +80,43 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('mcp_servers.unity.enabled=true',cmd)
         self.assertNotIn('--execution-schema',str(cmd))
 
+    def test_cli_is_default_but_explicit_mcp_remains_available(self):
+        with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=[]):
+            default=agent_bridge.command('codex',Path('.'),'scope')
+            explicit=agent_bridge.command('codex',Path('.'),'scope',coordination_channel='mcp')
+        self.assertIn('mcp_servers.scrum-studio.enabled=false',default)
+        self.assertIn('mcp_servers.scrum-studio.enabled=true',explicit)
+
+    def test_missed_notification_refreshes_quota_on_wakeup_generation(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            folder=Path(temp);(folder/'.scrum/local').mkdir(parents=True)
+            rpc=Mock();observations=[]
+            def call(name,args):
+                if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                if name=='user_register':return {'id':9}
+                if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                if name=='project_settings':return {'usage_check_seconds':300}
+                if name=='agent_checkpoint' and args['action']=='observe':
+                    observations.append(args)
+                    fresh=args.get('observed_at')==2
+                    return {'should_stop':not fresh,'reason':'' if fresh else 'Usage unknown or stale; report both provider windows before work','control':{'generation':0 if len(observations)==1 else 1,'paused':False}}
+                if name=='worker_launch' and args.get('action')=='reserve':return {'eligible':False,'reason':'No eligible work'}
+                return {}
+            rpc.call.side_effect=call
+            pool=Mock();futures=[]
+            for stamp in (1,2):
+                future=Mock();future.done.return_value=True
+                future.result.return_value={'session_used_percent':1,'weekly_used_percent':2,'observed_at':stamp}
+                futures.append(future)
+            pool.submit.side_effect=futures
+            with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge.idle_signals,'stamp',return_value='unchanged'),patch.object(agent_bridge.time,'monotonic',return_value=0),patch.object(agent_bridge.time,'sleep',side_effect=[None,None,None,KeyboardInterrupt]),patch.object(agent_bridge.subprocess,'Popen') as spawn:
+                agent_bridge.main()
+            self.assertEqual(pool.submit.call_count,2)
+            reserves=[c for c in rpc.call.call_args_list if c.args[0]=='worker_launch' and c.args[1].get('action')=='reserve']
+            self.assertEqual(len(reserves),1)
+            self.assertEqual(observations[-1]['observed_at'],2)
+            spawn.assert_not_called()
+
     def test_managed_run_disables_redundant_scrum_skill_catalog_entries(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
             home=Path(temp);skill_root=home/'.codex/skills'
@@ -335,8 +372,8 @@ class BridgeTest(unittest.TestCase):
 
     def test_cli_commands_preserve_permission_checks(self):
         with patch.object(agent_bridge.shutil,'which',return_value='cli'):
-            codex=agent_bridge.command('codex',Path.cwd(),'Task')
-            claude=agent_bridge.command('claude',Path.cwd(),'Task')
+            codex=agent_bridge.command('codex',Path.cwd(),'Task',coordination_channel='mcp')
+            claude=agent_bridge.command('claude',Path.cwd(),'Task',coordination_channel='mcp')
         self.assertEqual(codex[-1],'-')
         self.assertIn('--ephemeral',codex)
         self.assertNotIn('Task',codex);self.assertNotIn('Task',claude)
@@ -374,7 +411,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_claude_worker_uses_compact_preapproved_scrum_catalog(self):
         with patch.object(agent_bridge.shutil,'which',return_value='claude'):
-            claude=agent_bridge.command('claude',Path.cwd(),'Task')
+            claude=agent_bridge.command('claude',Path.cwd(),'Task',coordination_channel='mcp')
         self.assertNotIn('--strict-mcp-config',claude)
         config=Path(next(arg.split('=',1)[1] for arg in claude if arg.startswith('--mcp-config=')))
         server=json.loads(config.read_text(encoding='utf-8'))['mcpServers']['scrum-studio']
@@ -406,7 +443,7 @@ class BridgeTest(unittest.TestCase):
                 if name=='project_settings':return {'usage_check_seconds':60}
                 if name=='agent_checkpoint' and args['action']=='observe':
                     observations+=1
-                    return {'should_stop':observations>2,'reason':'Human Stop','control':{'generation':observations,'paused':observations>2}}
+                    return {'should_stop':observations>2,'reason':'Human Stop','control':{'generation':1 if observations<=2 else 2,'paused':observations>2}}
                 events.append(args.get('action'));return {}
             rpc.call.side_effect=call
             child=Mock();child.poll.return_value=None
@@ -586,7 +623,7 @@ class ManagedBridgeTest(unittest.TestCase):
                 if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
                 if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'','generation':1,'model':'profile-model'}
                 if name=='agent_status':return {'agents':[],'control':{'generation':0}}
-                if name=='project_settings':return {'usage_check_seconds':60}
+                if name=='project_settings':return {'usage_check_seconds':60,'coordination_channel':'mcp'}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','profile_enabled':True,'control':{'generation':0,'paused':False}}
                 if name=='work_start':return {'claim':{'claimed':True,'token':'fixture'},'task':{'id':args['id'],'code':'FIX-'+str(args['id'])}}
                 if name=='task_get':return {'status':'Done'}
@@ -615,7 +652,7 @@ class ManagedBridgeTest(unittest.TestCase):
                 if name=='projects':return [{'id':1,'uuid':'project','checkout':'checkout','path':str(folder),'available':True}]
                 if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'You review performance.','generation':1,'model':'fixture-model'}
                 if name=='agent_status':return {'agents':[],'control':{'generation':0}}
-                if name=='project_settings':return {'usage_check_seconds':60}
+                if name=='project_settings':return {'usage_check_seconds':60,'coordination_channel':'mcp'}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'profile_enabled':True,'profile_generation':1,'control':{'generation':0,'paused':False}}
                 return {}
             rpc.call.side_effect=call

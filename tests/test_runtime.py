@@ -162,6 +162,33 @@ class RuntimeTest(unittest.TestCase):
                 self.assertEqual((result['status'],result['held_bridges'],result['ready_bridges']),('held',1,0))
                 self.assertIn(reason,result['held'][0]['reason'])
 
+    def test_unknown_usage_guidance_preserves_pending_wakeup_without_bypassing_guard(self):
+        p,_=self.project()
+        self.checkpoint(p,action='observe',running=False,session_used_percent=1)
+        result=run('project_control',dict(project=p,actor=self.human,action='wakeup',start_agents=False))['wakeup']
+        self.assertEqual(result['status'],'held')
+        self.assertEqual(result['ready_bridges'],0)
+        self.assertIn('pending request resumes after a valid reading',result['next_step'])
+        self.assertNotIn('send a new Wakeup',result['next_step'])
+
+    def test_mcp_and_native_cli_share_wakeup_holds_and_fresh_quota_recovery(self):
+        import mcp_server
+        import scrum_cli
+        p,_=self.project()
+        self.checkpoint(p,action='observe',running=False,session_used_percent=1)
+        def mcp(name,args):
+            result=mcp_server.handle({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':name,'arguments':args}})['result']
+            self.assertFalse(result.get('isError'),result)
+            return json.loads(result['content'][0]['text'])
+        for dispatch in (mcp,scrum_cli.invoke):
+            self.assertEqual(dispatch('project_settings',{'project':p})['coordination_channel'],'cli')
+            result=dispatch('project_control',dict(project=p,actor=self.human,action='wakeup',start_agents=False))
+            self.assertEqual(result['wakeup']['status'],'held')
+            self.assertFalse(result['wakeup']['workers_started'])
+        self.checkpoint(p,action='observe',running=False,session_used_percent=1,weekly_used_percent=2)
+        for dispatch in (mcp,scrum_cli.invoke):
+            self.assertEqual(dispatch('agent_status',{'project':p})['wakeup']['status'],'ready')
+
     def test_wakeup_status_expires_with_bridge_and_does_not_bypass_stop(self):
         p,_=self.project()
         self.checkpoint(p,action='observe',running=False,session_used_percent=1,weekly_used_percent=2)

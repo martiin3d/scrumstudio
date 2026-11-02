@@ -506,7 +506,9 @@ Legacy file plans may include redundant folder headings alongside explicit file 
 
 ### Native CLI coordination
 
-Project Settings → Agent coordination channel selects MCP (default) or native CLI for the next managed worker. CLI uses the same validated operation engine, claims, Stop/quota, reservations and Git integration. It disables only the worker's Scrum MCP; selected specialist servers remain available. No additional service or model is needed.
+Project Settings → Agent coordination channel selects native CLI (default, preferred) or explicit MCP for the next managed worker. Existing explicit project selections are preserved. CLI uses the same validated operation engine, claims, Stop/quota, reservations and Git integration. It disables only the worker's Scrum MCP; selected specialist servers remain available. No additional service or model is needed.
+
+Wakeup and per-profile Start request fresh provider telemetry by their authoritative control generation, even if the local notification is missed. A connected supervisor keeps the authorized request pending while quota is unknown and resumes after a valid reading; Stop, disabled profiles and actual quota thresholds still hold work. Provider reads run outside the model and do not block the Stop loop.
 
 Run `python /path/to/SCRUM/scrum.py --help`; `help OPERATION` shows an operation schema. An interactive claim requires an explicit private context, for example `python scrum.py start --project /path/to/project --actor ACTOR_ID --client codex --task CODE --context /private/path/context.json`. Managed workers inherit their context automatically and use `show`, `lock`, `update` and `finish --task CODE --evidence TEXT`. JSON files/stdin support complex operations. Do not expose context files, tokens or receipts. Failed uncertain writes require state reconciliation, not blind retries.
 

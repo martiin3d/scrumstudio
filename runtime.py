@@ -141,7 +141,7 @@ def wakeup_readiness(policy,sessions,project_control,at):
     else:
         status='held'
         message=f'Wakeup cannot start work yet: {len(held)} connected agent(s) held by quota checks.'
-        next_step=' '.join(f"{item['name']}: {item['reason']}." for item in held)+' Refresh provider telemetry or wait for quota availability, then send a new Wakeup.'
+        next_step=' '.join(f"{item['name']}: {item['reason']}." for item in held)+(' Wakeup requests fresh telemetry from the connected supervisor; the pending request resumes after a valid reading. If it remains held, inspect provider access and the bridge log.' if held and all(item['reason'].startswith('Usage unknown') for item in held) else ' Wait for quota availability, then send a new Wakeup unless automatic quota resume is enabled.')
     return {'status':status,'connected_bridges':len(connected),'ready_bridges':ready,'running_bridges':len(running),
             'held_bridges':len(held),'held':held,'failed_bridges':len(failed),'can_receive_signal':bool(connected),'workers_started':False,
             'message':message,'next_step':next_step}

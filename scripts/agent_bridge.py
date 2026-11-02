@@ -285,7 +285,7 @@ def skill_options():
         return ['-c','skills.config='+value] if entries else []
     except (OSError,ValueError,KeyError,TypeError):return []
 
-def command(client,folder,prompt,model='',policy_folder=None,coordination_channel='mcp'):
+def command(client,folder,prompt,model='',policy_folder=None,coordination_channel='cli'):
     model=model_name(model)
     model_args=['--model',model] if model else []
     executable=codex_executable() if client=='codex' else shutil.which(client)
@@ -505,6 +505,7 @@ def main():
         attempted=generation # Ordinary bridge startup never consumes old Wakeup.
         pending_start=args.start_now
         pending_usage_resume=False
+        usage_request=None
         pending_auto=False
         recovery_attempts=set()
         checkout_attempts=set()
@@ -521,7 +522,6 @@ def main():
             at=time.monotonic()
             signal_stamp=idle_signals.stamp(folder)
             signal_changed=signal_stamp!=control_stamp
-            control_signal_changed=signal_changed
             control_stamp=signal_stamp
             running=child is not None and child.poll() is None
             if checkout_watch is not None and child is None:
@@ -549,19 +549,21 @@ def main():
                 usage_future=None
             try:usage_measurement.observe(folder,observed,args.client)
             except (OSError,ValueError,KeyError):pass
+            report=rpc.call('agent_checkpoint',dict(project=args.project,actor=actor,client=args.client,action='observe',running=running,**({'profile_id':args.profile} if args.profile else {}),**observed))
+            request_key=(report['control']['generation'],report.get('profile_generation',profile_generation))
+            requested=pending_start or request_key[0]>attempted or request_key[1]>profile_generation
+            refresh_request=(requested and request_key!=usage_request and not running
+                             and not report['control']['paused'] and report.get('profile_enabled',True))
             wants_usage=running or pending_start or pending_usage_resume or pending_auto or capacity_due or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
-            if wants_usage and at-last_usage>=policy.get('usage_check_seconds',60) and usage_future is None:
+            if usage_future is None and (refresh_request or wants_usage and at-last_usage>=policy.get('usage_check_seconds',60)):
                 # A slow provider request must never block the local Stop loop.
+                # Generation is authoritative: a missed/coalesced notification
+                # must not consume Wakeup using a stale cached observation.
                 usage_future=usage_pool.submit(usage_file,args.usage_file) if args.usage_file else usage_pool.submit(codex_usage) if args.client=='codex' else None
                 if args.client=='claude' and not args.usage_file:
                     observed={}
                 last_usage=at
-            report=rpc.call('agent_checkpoint',dict(project=args.project,actor=actor,client=args.client,action='observe',running=running,**({'profile_id':args.profile} if args.profile else {}),**observed))
-            if control_signal_changed and not running and usage_future is None and not report['control']['paused'] and report.get('profile_enabled',True):
-                # A human Wakeup/Start needs fresh native telemetry even within
-                # the ordinary polling interval. Checkout stat changes do not.
-                usage_future=usage_pool.submit(usage_file,args.usage_file) if args.usage_file else usage_pool.submit(codex_usage) if args.client=='codex' else None
-                last_usage=at
+                if refresh_request:usage_request=request_key
             actual=reported_model(log_path,log_offset) if log_path and selected_model else ''
             if actual and actual!=seen_model:
                 seen_model=actual
@@ -729,7 +731,7 @@ def main():
                             'For an unresolved concrete constraint save precise continuity; an unidentified owner alone is not a blocker. '
                             'Respect Stop/quota/reservations and real permission review. '
                             f'Python: {worker_python()}; MCP fallback: {ROOT / "scripts/mcp_client.py"}. '+preclaimed_prompt(started))
-                    channel=policy.get('coordination_channel','mcp')
+                    channel=policy.get('coordination_channel','cli')
                     if channel=='cli':prompt=cli_prompt(args.project,folder,actor,args.client,offer,policy,started,role)
                     if args.client=='codex' and policy.get('agent_approval_mode')=='Full access':
                         prompt+='\nThis launch uses human-authorized Full access with approval policy never. Execute authorized project commands directly; previous sandbox-only failures do not establish a current access failure. The escalation advice above applies only to sandboxed launches. Do not request permission that this launch already has. Actual organization/OS restrictions still apply; diagnose real failures and attempt a bounded authorized repair, without weakening Stop, quota, ownership or verification.'

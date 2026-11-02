@@ -49,7 +49,7 @@ Recommended `git_merge="Task"`: one branch per task regardless of context_group;
 Human-only run_advisory_minutes=20, run_advisory_tools=60 and run_advisory_output_tokens=30000 configure native run-cost advisories (0 disables a threshold; max1000000). Web Settings exposes the same fields. They apply at the next supervisor launch, deliver at most once at an existing worker MCP boundary, and never interrupt/relaunch work or override mandatory acceptance. Token counts may be unavailable until provider completion. Metrics audits show last local observations; no model or extra polling is used.
 
 
-Human project setting `coordination_channel` selects `mcp` (default) or `cli` for the next managed launch. Both enforce identical workflow rules; CLI disables only Scrum MCP. Do not change transport while a worker is active.
+Human project setting `coordination_channel` selects `cli` (default, preferred) or explicit `mcp` for the next managed launch. Both enforce identical workflow rules; CLI disables only Scrum MCP. Do not change transport while a worker is active.
 
 
 Human-only `autonomy_mode`: `Standard` (default) or `Autonomous`. Autonomous delegates routine decisions and permits only specific typed human questions, parked natively so other work can continue. It never grants permissions, bypasses Stop/quota or certifies unverified work.

@@ -3,7 +3,7 @@ name: scrum-work
 description: Execute or resume Scrum Studio tasks with claimed scope, native continuation and concise task continuity.
 ---
 
-When the supervisor selects native CLI coordination, use its supplied `scrum.py` command and inherited private context instead of Scrum MCP. Read [CLI commands](references/cli.md) only as needed. The operations below describe workflow semantics; invoke them through the selected channel. Do not inspect claim context files or print tokens. Other specialist MCP servers remain available.
+Prefer the first-party native `scrum.py` CLI for Scrum coordination; use MCP only when explicitly selected. Both use the same validation, claims, quotas and Git rules. When the supervisor selects native CLI coordination, use its supplied `scrum.py` command and inherited private context instead of Scrum MCP. Read [CLI commands](references/cli.md) only as needed. The operations below describe workflow semantics; invoke them through the selected channel. Do not inspect claim context files or print tokens. Other specialist MCP servers remain available.
 
 When `autonomy_mode=Autonomous`, resolve routine implementation/recovery/design choices yourself. Read [autonomous decisions](references/autonomous-decisions.md) only for a genuinely indispensable human question. Screenshots are internal verification, not routine consultation. Do not infer defects or redo valid work.
 

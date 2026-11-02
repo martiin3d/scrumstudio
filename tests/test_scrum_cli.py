@@ -58,7 +58,7 @@ class NativeCliTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'overridden'):cli.coordinated('task_get',dict(project=self.q,id=1),path)
         with self.assertRaisesRegex(ValueError,'Use finish'):cli.invoke('task_update',dict(project=self.p,id=1,status='Done'))
     def test_policy_round_trip(self):
-        self.assertEqual(run('project_settings',dict(project=self.p))['coordination_channel'],'mcp')
+        self.assertEqual(run('project_settings',dict(project=self.p))['coordination_channel'],'cli')
         human=run('user_register',dict(identity='human:cli',name='CLI owner',kind='human'))['id']
         self.assertEqual(run('project_settings',dict(project=self.p,actor=human,coordination_channel='cli'))['coordination_channel'],'cli')
         with self.assertRaises(ValueError):run('project_settings',dict(project=self.p,actor=human,coordination_channel='bad'))

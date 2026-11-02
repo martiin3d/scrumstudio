@@ -8,7 +8,7 @@ from pathlib import Path
 
 from git_sync import GIT_DEFAULTS, validate as validate_git
 from run_cost import DEFAULTS as COST_DEFAULTS
-POLICY_DEFAULTS = {'file_lock_policy':'Always','execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'mcp','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS, **COST_DEFAULTS}
+POLICY_DEFAULTS = {'file_lock_policy':'Always','execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'cli','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS, **COST_DEFAULTS}
 
 def validate_policy(changed):
     validate_git(changed)
