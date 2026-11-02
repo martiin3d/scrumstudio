@@ -48,6 +48,7 @@ def event(kind,**fields):
 def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=None,signals=None,full_access=False):
     owned=rpc is None
     child=None;pending={};messages=queue.Queue();usage={};exit_code=1;items={}
+    permission_profile=':danger-full-access' if full_access else 'scrum-worker'
     def send(value):
         child.stdin.write(json.dumps(value)+'\n');child.stdin.flush()
     def request(name,params,key):send({'jsonrpc':'2.0','id':key,'method':name,'params':params})
@@ -78,11 +79,14 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
                     send({'jsonrpc':'2.0','method':'initialized'})
                     # Task continuity and worker diagnostics live in SCRUM. Do
                     # not persist an extra Codex sidebar chat for every launch.
-                    request('thread/start',{'cwd':str(cwd),'ephemeral':True,'approvalPolicy':'never' if full_access else 'on-request','approvalsReviewer':reviewer,**({'model':model} if model else {})},'scrum:thread')
+                    request('thread/start',{'cwd':str(cwd),'ephemeral':True,'permissions':permission_profile,'approvalPolicy':'never' if full_access else 'on-request','approvalsReviewer':reviewer,**({'model':model} if model else {})},'scrum:thread')
                 elif message['id']=='scrum:thread':
+                    active=result.get('activePermissionProfile')
+                    if active and active.get('id')!=permission_profile:
+                        raise RuntimeError('Expected permission profile '+permission_profile+', received '+str(active.get('id'))+'; worker inference was not started')
                     thread=result['thread']['id'];event('thread.started',thread_id=thread)
                     if result.get('model'):event('system',subtype='init',model=result['model'])
-                    request('turn/start',{'threadId':thread,'input':[{'type':'text','text':prompt}]},'scrum:turn')
+                    request('turn/start',{'threadId':thread,'permissions':permission_profile,'input':[{'type':'text','text':prompt}]},'scrum:turn')
             method=message.get('method','');params=message.get('params',{})
             # App-server also broadcasts delegated threads. Their completion must
             # never close the owning worker or replace its answer/usage report.

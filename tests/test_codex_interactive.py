@@ -27,8 +27,10 @@ for line in sys.stdin:
   assert params['ephemeral'] is True
   assert params['approvalPolicy']==sys.argv[1]
   assert params['approvalsReviewer']==sys.argv[2]
-  print(json.dumps({'id':request['id'],'result':{'thread':{'id':'temporary','ephemeral':True}}}),flush=True)
+  assert params['permissions']==(':danger-full-access' if sys.argv[1]=='never' else 'scrum-worker')
+  print(json.dumps({'id':request['id'],'result':{'thread':{'id':'temporary','ephemeral':True},'activePermissionProfile':{'id':params['permissions']}}}),flush=True)
  elif method=='turn/start':
+  assert request['params']['permissions']==(':danger-full-access' if sys.argv[1]=='never' else 'scrum-worker')
   print(json.dumps({'method':'turn/completed','params':{'threadId':'temporary','turn':{'status':sys.argv[3]}}}),flush=True)
   break
 ''',encoding='utf-8')
@@ -37,6 +39,20 @@ for line in sys.stdin:
                     with self.subTest(full_access=full_access,reviewer=reviewer,status=status),contextlib.redirect_stdout(io.StringIO()):
                         result=client.run([sys.executable,str(server),'never' if full_access else 'on-request',reviewer,status],1,9,folder,'task',rpc=Mock(),reviewer=reviewer,full_access=full_access)
                         self.assertEqual(result,0 if status=='completed' else 1)
+
+    def test_wrong_effective_profile_stops_before_inference(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]/'data') as folder:
+            server=Path(folder)/'wrong_profile.py'
+            server.write_text('''import json,sys
+for line in sys.stdin:
+ request=json.loads(line);method=request.get('method')
+ if method=='initialize':print(json.dumps({'id':request['id'],'result':{}}),flush=True)
+ elif method=='thread/start':
+  print(json.dumps({'id':request['id'],'result':{'thread':{'id':'fixture'},'activePermissionProfile':{'id':':read-only'}}}),flush=True)
+ elif method=='turn/start':raise AssertionError('Inference must not start under another profile')
+''',encoding='utf-8')
+            with contextlib.redirect_stdout(io.StringIO()),self.assertRaisesRegex(RuntimeError,'Expected permission profile scrum-worker'):
+                client.run([sys.executable,str(server)],1,9,folder,'task',rpc=Mock())
 
     def test_full_access_is_explicit_and_reaches_native_configuration(self):
         cmd=['codex','-c','approval_policy="on-request"','-c','default_permissions="scrum-worker"','exec','--json']
