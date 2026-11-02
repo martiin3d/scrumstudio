@@ -16,6 +16,7 @@ ALIASES={'ask':'agent_interaction','show':'task_get','search':'task_search','pla
 def read_operation(name,args):
     return (name in READS or (name=='file_locks' and args.get('action')=='list')
             or (name=='agent_interaction' and args.get('action','list') in ('list','get'))
+            or (name=='task_attachment' and args.get('action','list') in ('list','get'))
             or (name=='project_settings' and not set(args)-{'project','actor','measurement_session'}))
 
 
@@ -128,7 +129,8 @@ def coordinated(name,args,path=None):
             for old in reversed(state.get('receipts',[])):
                 if old['operation']==name and old['task']==args.get('id'):
                     return {'completed':old['result'].get('completed'),'replayed':True,'current_task':{k:v for k,v in current.items() if k!='token'},'instruction':'Completion was already committed. Reconcile current scope with show before continuing; no write was replayed.'}
-        needs_token=name in ('work_finish','task_update','task_release','file_locks')
+        needs_token=(name in ('work_finish','task_update','task_release','file_locks')
+                     or name=='task_attachment' and args.get('action') in ('add','remove'))
         if name=='task_plan' and 'defer_task' in args:
             if not current or args['defer_task']!=current['id']:raise ValueError('defer_task must be the current claimed task')
             if args.get('token') not in (None,current['token']):raise ValueError('Claim token cannot be overridden')

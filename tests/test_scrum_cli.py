@@ -5,6 +5,56 @@ import unittest
 import test_app
 import scrum_cli as cli
 from store import run
+import test_storage
+
+class NativeAttachmentTest(unittest.TestCase):
+    tearDown=test_storage.StorageTest.tearDown
+    project=test_storage.StorageTest.project
+
+    def setUp(self):
+        test_storage.StorageTest.setUp(self)
+        self.p,self.folder=self.project()
+        self.path=Path(self.temp.name)/'private.json'
+        cli.atomic(self.path,dict(schema=1,project=self.p,actor=self.agent,client='codex',batch=False,current=None,receipts=[]))
+        self.task_id=run('task_create',dict(project=self.p,title='Attach verified review artifacts',description='Retain the reference and captured screenshot',acceptance_criteria=['Reference is attached under its live claim']))['id']
+        cli.coordinated('work_start',dict(id=self.task_id,claim=True,session_used_percent=1,weekly_used_percent=1),self.path)
+
+    def test_private_claim_is_injected_for_add_remove_and_reads_are_not_journaled(self):
+        args=dict(id=self.task_id,action='add',name='reference.txt',content_base64='cmVmZXJlbmNl')
+        added=cli.coordinated('task_attachment',args,self.path)
+        self.assertEqual(added['author'],'agent:portable')
+        with patch.object(cli,'atomic',wraps=cli.atomic) as writes,patch.object(cli,'invoke',wraps=cli.invoke) as calls:
+            listed=cli.coordinated('task_attachment',dict(id=self.task_id),self.path)
+            content=cli.coordinated('task_attachment',dict(id=self.task_id,action='get',attachment_id=added['id'],include_content=True),self.path)
+        writes.assert_not_called()
+        self.assertTrue(all('token' not in call.args[1] for call in calls.call_args_list))
+        self.assertEqual(listed['items'][0]['id'],added['id'])
+        self.assertEqual(content['content_base64'],args['content_base64'])
+        result=cli.coordinated('task_attachment',dict(id=self.task_id,action='remove',attachment_id=added['id']),self.path)
+        self.assertTrue(result['removed'])
+        self.assertNotIn(cli.context_file(self.path)['current']['token'],json.dumps([added,listed,content,result]))
+        self.assertEqual(run('task_attachment',dict(project=self.p,id=self.task_id))['items'],[])
+
+    def test_attachment_writes_cannot_override_actor_or_private_token(self):
+        args=dict(id=self.task_id,action='add',name='reference.txt',content_base64='YQ==')
+        for override in ({'actor':self.human},{'token':'foreign-claim-token'}):
+            with patch.object(cli,'invoke') as dispatch:
+                with self.assertRaisesRegex(ValueError,'overridden'):cli.coordinated('task_attachment',args|override,self.path)
+            dispatch.assert_not_called()
+            self.assertNotIn('pending',cli.context_file(self.path))
+
+    def test_current_token_is_not_used_to_write_another_agents_locked_task(self):
+        other=run('user_register',dict(identity='agent:other-attachments',name='Other',kind='agent'))['id']
+        run('agent_checkpoint',dict(project=self.p,actor=other,client='codex',session_used_percent=1,weekly_used_percent=1))
+        task=run('task_create',dict(project=self.p,title='Other claimed task',description='Keep attachment ownership isolated',acceptance_criteria=['No other worker can attach']))['id']
+        run('task_claim',dict(project=self.p,id=task,actor=other))
+        with self.assertRaisesRegex(ValueError,'only the claiming session'):
+            cli.coordinated('task_attachment',dict(id=task,action='add',name='reference.txt',content_base64='YQ=='),self.path)
+        self.assertIn('pending',cli.context_file(self.path))
+        self.assertEqual(cli.coordinated('task_attachment',dict(id=task),self.path)['items'],[])
+        self.assertIn('pending',cli.context_file(self.path))
+        self.assertEqual(run('task_attachment',dict(project=self.p,id=task))['items'],[])
+
 
 class NativeCliTest(unittest.TestCase):
     setUp=test_app.WorkflowTest.setUp
