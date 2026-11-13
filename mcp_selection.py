@@ -130,6 +130,17 @@ def selected(client,folder):
     if missing:raise ValueError('Selected MCP servers are unavailable: '+', '.join(sorted(missing)))
     return configured,set(choice['servers'])|{REQUIRED}
 
+
+def effective(client,folder,home=None):
+    """Names-only diagnosis for the managed worker, without starting a client."""
+    choice=load(folder).get(client,{'mode':'inherit','servers':[]})
+    configured,warnings=discover(client,folder,home)
+    missing=sorted(set(choice['servers'])-configured.keys()) if choice['mode']=='selected' else []
+    names=set(choice['servers']) & configured.keys() if choice['mode']=='selected' else {
+        name for name,entry in configured.items() if entry.get('enabled',True)}
+    return {'mode':choice['mode'],'effective_specialists':sorted(names-{REQUIRED}),
+            'scrum_registered':REQUIRED in configured,'missing':missing,'warnings':warnings}
+
 def codex_options(folder):
     configured,names=selected('codex',folder)
     if names is None:return []

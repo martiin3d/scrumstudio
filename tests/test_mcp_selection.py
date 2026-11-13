@@ -106,7 +106,8 @@ class SelectionTest(unittest.TestCase):
         self.assertIn('--strict-mcp-config',command)
         path=Path(next(x.split('=',1)[1] for x in command if x.startswith('--mcp-config=')))
         self.assertTrue(path.is_relative_to(self.folder/'.scrum/local'))
-        self.assertEqual(set(json.loads(path.read_text())['mcpServers']),{'graph','scrum-studio'})
+        self.assertEqual(set(json.loads(path.read_text())['mcpServers']),{'graph'})
+        self.assertEqual(selection.effective('claude',self.folder)['effective_specialists'],['graph'])
 
 class SelectionApiTest(unittest.TestCase):
     setUp=test_storage.StorageTest.setUp

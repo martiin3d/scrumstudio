@@ -11,6 +11,32 @@ setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(setup)
 
 class SetupTest(unittest.TestCase):
+    def test_doctor_preview_repairs_and_restores_exact_files(self):
+        import json
+        with tempfile.TemporaryDirectory(dir=ROOT/'data') as temp:
+            profile=Path(temp);config=profile/'.codex';backups=config/'backups'
+            path=profile/'.claude/settings.json';path.parent.mkdir()
+            managed={'type':'command','command':'python claude_hooks.py stop'}
+            foreign={'type':'command','command':'other-hook'}
+            original=json.dumps({'hooks':{'Stop':[{'matcher':'x','hooks':[managed,foreign]},{'hooks':[managed]}]}}).encode()
+            path.write_bytes(original)
+            plan,changes=setup.repair_plan(['claude'],profile,config,profile)
+            self.assertEqual(path.read_bytes(),original)
+            self.assertFalse(backups.exists())
+            self.assertEqual(plan['findings']['claude']['duplicate_hooks'],{'Stop':2})
+            with self.assertRaisesRegex(ValueError,'plan changed'):
+                setup.apply_repair(plan,changes,'wrong',backups)
+            applied=setup.apply_repair(plan,changes,plan['plan_id'],backups)
+            self.assertGreater(applied['changed'],1)
+            hooks=json.loads(path.read_bytes())['hooks']['Stop']
+            self.assertEqual(hooks[0],{'matcher':'x','hooks':[foreign]})
+            self.assertEqual(len(hooks),2)
+            installed=profile/'.claude/skills/scrum-work/SKILL.md'
+            self.assertTrue(installed.exists())
+            setup.restore_repair(backups,applied['backup'],profile)
+            self.assertEqual(path.read_bytes(),original)
+            self.assertFalse(installed.exists())
+
     def test_legacy_skill_repair_preserves_resources_and_is_repeatable(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'data') as temp:
             profile=Path(temp);config=profile/'custom-codex';backup=config/'backups/repair'
