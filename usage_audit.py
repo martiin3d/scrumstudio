@@ -94,6 +94,13 @@ def audit(db,project,root,start=None,end=None,include_logs=False):
         result['flow']={k:flow.get(k) for k in ('attempted_tasks','metadata_only_tasks','todo_returns_after_work','reopened_done_tasks','completed_tasks','worked_tasks','period_distribution','start_at','end_at')}
     import run_cost
     result['live_executions']=run_cost.current(root)
+    import overhead
+    by_run={item['run_id']:item for item in runs}
+    result['startup_samples']=[
+        {**sample,**totals([by_run[sample['run_id']]])['known_totals']}
+        if sample['run_id'] in by_run and by_run[sample['run_id']].get('input_tokens') is not None else sample
+        for sample in overhead.startup_samples(project,start,end)
+    ]
     import usage_measurement
     measurement=usage_measurement.summary(root)
     if measurement:result['measurement']=measurement

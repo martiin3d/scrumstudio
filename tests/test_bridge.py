@@ -64,13 +64,22 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('Never auto-answer permission',text)
 
     def test_cli_prompt_is_single_scope_without_private_token_or_mcp_fallback(self):
-        started={'task':{'id':7,'code':'FIX-7','acceptance_criteria':['UNIQUE_ACCEPTANCE']},'token':'secret-claim','git':{}}
-        prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{'code':'FIX-7'}, {},started)
+        started={'task':{'id':7,'code':'FIX-7','acceptance_criteria':['UNIQUE_ACCEPTANCE'],
+                         'continuity':'Resume verified work','decision_context':{'has_more':True},
+                         'model_selection':{'reason':'metadata-only'}},
+                 'token':'secret-claim','measurement_session':'internal-measurement','git':{}}
+        sections={}
+        prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{'code':'FIX-7'}, {},started,sections=sections)
         self.assertEqual(prompt.count('UNIQUE_ACCEPTANCE'),1)
         self.assertNotIn('secret-claim',prompt)
         self.assertNotIn('mcp_client.py',prompt)
         self.assertIn('SCRUM_CLI_CONTEXT',prompt)
         self.assertIn('finish --task CODE',prompt)
+        self.assertIn('Resume verified work',prompt)
+        self.assertIn('decision_context',prompt)
+        self.assertNotIn('metadata-only',prompt)
+        self.assertNotIn('internal-measurement',prompt)
+        self.assertEqual(sum(sections.values())+len(sections)-1,len(prompt.encode('utf-8')))
 
     def test_cli_command_disables_only_scrum_and_keeps_specialist_selection(self):
         with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=['-c','mcp_servers.unity.enabled=true']):

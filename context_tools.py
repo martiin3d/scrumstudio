@@ -74,6 +74,18 @@ def agent_task(task, files_after=0, files_limit=20):
     return result
 
 
+def startup_task(task):
+    """Project the claimed task onto fields that can affect execution."""
+    fields=(
+        'id','code','version','title','description','category','status',
+        'acceptance_criteria','checklist','files','files_page','dependencies',
+        'blocked_reason','blocked_reason_kind','evidence','continuity','continuity_stale',
+        'preserved_inputs','decision_context','pending_ai_notes','attachment_count',
+        'verification_level','verification_reason','review','context_group','context_batch',
+        'specification',
+    )
+    return {key:task[key] for key in fields if key in task and task[key] not in (None,'',[],{})}
+
 def search(db, project, prefix, args):
     limit=args.get('limit',5);after=args.get('after',0)
     if type(limit) is not int or not 1<=limit<=50 or type(after) is not int or after<0:

@@ -27,7 +27,31 @@ def connection(project):
             if 'channel' not in {r[1] for r in db.execute('PRAGMA table_info(timed_calls)')}:raise
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_at ON timed_calls(at)')
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_session ON timed_calls(session)')
+    db.execute('CREATE TABLE IF NOT EXISTS startup(run_id TEXT PRIMARY KEY,actor INTEGER,at REAL,client TEXT,model TEXT,session TEXT,tasks TEXT,prompt_bytes INTEGER,sections TEXT)')
     return db
+
+
+def record_startup(project,actor,run_id,client,model,session,tasks,prompt_bytes,sections):
+    from contextlib import closing
+    try:
+        with closing(connection(project)) as db, db:
+            db.execute('INSERT OR IGNORE INTO startup VALUES(?,?,?,?,?,?,?,?,?)',
+                       (run_id,actor,time.time(),client,model,session,json.dumps(tasks),prompt_bytes,json.dumps(sections)))
+            db.execute('DELETE FROM startup WHERE run_id IN (SELECT run_id FROM startup ORDER BY at DESC LIMIT -1 OFFSET 1000)')
+    except (OSError,ValueError,sqlite3.Error):
+        pass
+
+
+def startup_samples(project,start=None,end=None,limit=30):
+    from contextlib import closing
+    try:
+        with closing(connection(project)) as db:
+            where='WHERE startup.at BETWEEN ? AND ?' if start is not None else ''
+            params=(start,end,limit) if where else (limit,)
+            rows=db.execute('SELECT startup.*, (SELECT SUM(calls) FROM timed_calls WHERE timed_calls.session=startup.session AND timed_calls.channel IN (\'cli\',\'mcp\')) AS coordination_calls FROM startup '+where+' ORDER BY at DESC LIMIT ?',params)
+            return [dict(row,sections=json.loads(row['sections']),tasks=json.loads(row['tasks'])) for row in rows]
+    except (OSError,ValueError,sqlite3.Error):
+        return []
 
 
 def start_session(project,actor,mode,existing=None):

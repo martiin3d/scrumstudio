@@ -25,6 +25,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 import execution_usage
 import idle_signals
+import overhead
 import run_cost
 import usage_measurement
 from worker_catalog import EXECUTION_TOOLS
@@ -229,47 +230,46 @@ def file_scope_guidance(started):
             'Do not adopt unrelated or pre-existing dirty files. This overrides generic per-file reservation wording; Stop/quota and actual permissions still apply.')
 
 
-def cli_prompt(project,folder,actor,client,offer,policy,started,role=''):
-    from scrum_cli import redact
+def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections=None):
     import shlex
+    from scrum_cli import redact
+    from context_tools import startup_task
     cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
-    prompt=(f'Use scrum-work for project {project}, actor {actor}, in {folder}. Human Wakeup authorizes this backlog. '
-        'SCRUM coordination channel is native CLI, not MCP. This overrides legacy transport wording in checkout instructions. '
-        'Use the supplied CLI only for Scrum; other configured MCP servers remain available for their own capabilities. '
-        'The supervisor already claimed the full task below. Do not start, claim, rediscover, scan the board or probe quota. '
-        'SCRUM_CLI_CONTEXT holds private ownership; never read/print it or supply tokens. Commands inherit it automatically. '
-        'Read scrum-work references/cli.md only for command details. '
-        'Execute the current acceptance, preserve existing work and reuse continuity and unchanged verification. '
-        'Use codebase-memory for structural queries with coverage/source fallback; stop graph retries after transport failure. '
-        'Reserve additional output files/Unity .meta sidecars before editing. Verify proportionally; no routine full suite, '
-        'duplicate review essay or successful log dump. Diagnose scoped errors with a changed hypothesis before blocking. '
-        'Respect Stop, quota, ownership, dependencies, physical review and actual permission review. Never bypass a rejection. '
-        'An explicit design decision does not by itself mean human approval: for routine missing UI states within authorized scope, record a minimal consistent choice unless the project explicitly reserves it for the human. Never claim unreferenced states match Figma. '
-        'Do not manually stash/reset/switch/publish in an ordinary task; Git integration is native at finish. '
-        'CLI command: '+cli+' show; '+cli+' lock --task CODE --paths relative/file; '
-        +cli+' update --task CODE --continuity "Done: ...; Next: ..."; '
-        +cli+' finish --task CODE --evidence "Verified ...". Finish only verified acceptance. '
-        'For complex arguments use call OPERATION --input JSON_FILE; help OPERATION shows its schema. '
-        'A failed/uncertain write must be reconciled, never blindly repeated; show/status are safe, pause hands control back. '
-        'Quota and idle checks are native, outside the model. ')
-    if policy.get('agent_followup_tasks'):
-        prompt+='Necessary scoped follow-ups are allowed: search/reuse before plan --input FILE. For a missing prerequisite of the current task, use a JSON object with items, defer_task=current ID, prerequisites=[plan keys or existing IDs], continuity; the CLI supplies the token, preserves acceptance and releases the claim/batch atomically. On deferred=true exit for supervisor selection. PLAN_REJECTED means rolled back: correct the plan in this run; only uncertain writes require pause. No speculative backlog. '
-    if offer.get('batch'):
-        prompt+='Reserved batch headers: '+json.dumps(offer['batch'],separators=(',',':'))+'. Other tasks remain TODO and reserved. Finish automatically requests the next fresh claim. Continue ONLY with successful next.claim and next.task, without restarting or rereading unchanged scope. Exit on batch_done, failed next claim, Stop/quota or real impediment. '
-    else:prompt+='Finish closes this session. Exit; the supervisor selects subsequent eligible work. '
-    if started['task'].get('category')=='Git recovery':
-        prompt+='Scoped Git recovery: preserve staging/unrelated work; honor recorded parents, never force push. Reuse retained verification; retest only conflict-resolution changes. If cleanup was rejected, do not repeat deletion. After inspecting and explicitly reserving every dirty file, native helper '+json.dumps(str(ROOT/'scripts/preserve_checkout.py'))+' --target EXISTING_INTEGRATED_BRANCH can retain exact bytes/hashes and unknown tracked edits in a private local branch, move exact untracked files without deletion, and switch only to a target already containing the source commits. It refuses foreign scope, staging, conflicts and unfinished integration. Do not publish retained unknown edits or infer provenance. Request normal reviewed execution; do not bypass a rejection. '
-    prompt+='Full claimed task and diagnostics: '+json.dumps(redact(started),ensure_ascii=False,separators=(',',':'))
-    prompt+='\nHelpers: '+json.dumps(str(ROOT/'scripts/unity_verify.py'))+' --reuse for Unity checks; '+json.dumps(str(ROOT/'scripts/work_checks.py'))+' --help for large file sets. Require actual executed machine-readable tests; compile is not visual proof. For real human decisions use request_user_input or '+json.dumps(str(ROOT/'scripts/ask_human.py'))+f' --project {project} --actor {actor} --question TEXT --options JSON_ARRAY; wait for an actual answer.'
-    if policy.get('autonomy_mode')=='Autonomous':
-        prompt=prompt.replace('; wait for the actual answer.', '; if deferred=true, exit so other work continues.').replace('; wait for an actual answer.', '; if deferred=true, exit so other work continues.')
-        prompt=prompt.replace('For human decisions use request_user_input or this Python + ', 'For indispensable typed human decisions use this Python + ').replace('For real human decisions use request_user_input or ', 'For indispensable typed human decisions use ')
+    rules=(
+        f'Use scrum-work for project {project}, actor {actor}, in {folder}. '
+        'The supervisor claimed the task below. Resume its continuity and reuse valid checks. '
+        'Use the native CLI with inherited SCRUM_CLI_CONTEXT. Keep that context private. '
+        'Start/claim and quota checks are handled by the supervisor. Respect Stop and permissions. '
+        'Read scrum-work references/cli.md for commands, evidence and recovery when needed. '
+        'Use codebase-memory for structural queries with coverage/source fallback. '
+        f'CLI: {cli} finish --task CODE --evidence TEXT. Finish only verified acceptance.'
+    )
     if started.get('file_lock_mode')=='checkout':
-        prompt=prompt.replace('Reserve additional output files/Unity .meta sidecars before editing. ', 'Keep additional outputs and Unity .meta sidecars in the explicit completion file plan. ').replace(cli+' lock --task CODE --paths relative/file; ', '')
-    prompt+=file_scope_guidance(started)
-    prompt+=autonomy_prompt(policy)
-    if role:prompt+='\nRole instructions: '+role
-    return prompt
+        rules+=' Checkout exclusivity: do not call file_locks/lock. Declare additional_files at finish (--paths).'
+    else:
+        rules+=' Reserve newly discovered output paths with CLI lock before editing.'
+    if policy.get('agent_followup_tasks'):
+        rules+=' For a discovered prerequisite use plan with defer_task=current ID. PLAN_REJECTED rolled back. Exit on deferred=true.'
+    if offer.get('batch'):
+        rules+=' Finish each task separately. Continue only with the fresh next.claim and next.task. Exit when the batch ends or the next claim fails.'
+    else:
+        rules+=' Finish closes the session. Exit so the supervisor can select the next task.'
+    task=started['task']
+    if task.get('category')=='Git recovery':
+        rules+=' Git recovery: preserve staging and unrelated work, follow recorded parents, and reuse retained verification. Verify conflict-resolution edits. Never force push.'
+    diagnostics={key:started[key] for key in ('dirty_planned','file_lock_mode') if started.get(key)}
+    git=started.get('git') or {}
+    diagnostics.update({key:git[key] for key in ('branch','parent','worktree','error','refreshed_from') if git.get(key)})
+    parts={
+        'rules':rules,
+        'claim':'Claim: '+json.dumps(redact(startup_task(task)),ensure_ascii=False,separators=(',',':')),
+        'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
+        'project_policy':autonomy_prompt(policy).strip(),
+        'role':'Role instructions: '+role if role else '',
+    }
+    if sections is not None:
+        sections.update({name:len(value.encode('utf-8')) for name,value in parts.items() if value})
+    return '\n'.join(value for value in parts.values() if value)
 
 
 def autonomy_prompt(policy):
@@ -763,7 +763,8 @@ def main():
                             'Respect Stop/quota/reservations and real permission review. '
                             f'Python: {worker_python()}; MCP fallback: {ROOT / "scripts/mcp_client.py"}. '+preclaimed_prompt(started))
                     channel=policy.get('coordination_channel','cli')
-                    if channel=='cli':prompt=cli_prompt(args.project,folder,actor,args.client,offer,policy,started,role)
+                    prompt_sections={}
+                    if channel=='cli':prompt=cli_prompt(args.project,folder,actor,args.client,offer,policy,started,role,prompt_sections)
                     if args.client=='codex' and policy.get('agent_approval_mode')=='Full access':
                         prompt+='\nThis launch uses human-authorized Full access with approval policy never. Execute authorized project commands directly; previous sandbox-only failures do not establish a current access failure. The escalation advice above applies only to sandboxed launches. Do not request permission that this launch already has. Actual organization/OS restrictions still apply; diagnose real failures and attempt a bounded authorized repair, without weakening Stop, quota, ownership or verification.'
                     run_folder=Path(started.get('git',{}).get('worktree') or folder)
@@ -788,6 +789,7 @@ def main():
                             launch=interactive_command(command(args.client,run_folder,prompt,selected_model,policy_folder=folder,coordination_channel=channel),args.client,args.project,actor,run_folder,selected_model,policy)
                             cost_path=Path(folder)/'.scrum/local/run-cost'/f'{actor}.json'
                             child=subprocess.Popen(launch,cwd=run_folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**worker_env,'SCRUM_RUN_COST_STATE':str(cost_path)},**options)
+                            overhead.record_startup(args.project,actor,run_id,args.client,selected_model,started.get('measurement_session'),run_tasks,len(prompt.encode('utf-8')),prompt_sections)
                             cost_watch=run_cost.Watch(log_path,log_offset,cost_path,run_id,run_tasks,policy,args.client)
                     except (OSError,RuntimeError,ValueError) as error:
                         run_id=''
