@@ -2,6 +2,58 @@
 import hashlib
 import json
 import time
+import re
+from pathlib import PurePosixPath
+
+
+FINDING_STATES=('open','fixed','false_positive','intentional','deferred')
+
+
+def findings(db,task,args):
+    """Keep a stable issue key across revisions and preserve its transitions."""
+    db.execute("""CREATE TABLE IF NOT EXISTS review_findings (
+        task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        key TEXT NOT NULL, path TEXT NOT NULL, summary TEXT NOT NULL, revision TEXT NOT NULL,
+        state TEXT NOT NULL, disposition TEXT NOT NULL, updated REAL NOT NULL,
+        PRIMARY KEY(task,key,path)
+    )""")
+    action=args.get('action','list')
+    limit=args.get('limit',20);after=args.get('after',0)
+    if type(limit) is not int or not 1<=limit<=50 or type(after) is not int or after<0:
+        raise ValueError('Invalid findings page')
+    if action=='list':
+        states=FINDING_STATES if args.get('include_resolved') else ('open','deferred')
+        rows=db.execute('SELECT key,path,summary,revision,state,disposition,updated FROM review_findings '
+                        'WHERE task=? AND state IN ('+','.join('?' for _ in states)+') '
+                        'ORDER BY key,path LIMIT ? OFFSET ?',(task,*states,limit+1,after)).fetchall()
+        return {'items':[dict(row) for row in rows[:limit]],'has_more':len(rows)>limit,'next_after':after+min(len(rows),limit)}
+    key=args.get('key','')
+    path=args.get('path','');normalized=PurePosixPath(path)
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,79}',key) or not normalized.parts or normalized.is_absolute() or '..' in normalized.parts or normalized.as_posix()!=path or any(c in path for c in ('\\',':','\x00')):
+        raise ValueError('Use a stable issue key and repository-relative file path')
+    revision=args.get('revision','')
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}',revision):
+        raise ValueError('Supply the Git revision reviewed')
+    existing=db.execute('SELECT * FROM review_findings WHERE task=? AND key=? AND path=?',(task,key,path)).fetchone()
+    if action=='record':
+        summary=args.get('summary','').strip()
+        if not summary:raise ValueError('Describe the observed finding')
+        if existing and existing['state']!='fixed':
+            return {'key':key,'path':path,'state':existing['state'],'repeat':True}
+        if existing and existing['revision']==revision:
+            return {'key':key,'path':path,'state':existing['state'],'repeat':True}
+        state='open';disposition=''
+    else:
+        if action!='resolve' or not existing:raise ValueError('Finding does not exist')
+        state=args.get('state');disposition=args.get('disposition','').strip()
+        if state not in FINDING_STATES[1:] or not disposition:raise ValueError('Supply a finding outcome and its evidence')
+        summary=existing['summary']
+    updated=time.time()
+    db.execute('INSERT INTO review_findings VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(task,key,path) DO UPDATE SET '
+               'summary=excluded.summary,revision=excluded.revision,state=excluded.state,disposition=excluded.disposition,updated=excluded.updated',
+               (task,key,path,summary,revision,state,disposition,updated))
+    return {'key':key,'path':path,'state':state,'repeat':False,
+            'activity':f'Review finding {key} ({path}) at {revision[:12]}: {state}. {disposition or summary}'}
 
 
 def data(row):

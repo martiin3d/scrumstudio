@@ -589,6 +589,23 @@ def legacy_run(action, a, path=None, locks=None):
             if not db.in_transaction:db.execute('BEGIN IMMEDIATE')
             import git_completion
             return git_completion.reconcile_pr(db,a,project_row,prefix,activity,now,resolve_dependents)
+        if action=='task_review_findings':
+            writing=a.get('action','list')!='list'
+            if writing:db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT * FROM tasks WHERE id=? AND project=?',(a['id'],project)).fetchone()
+            if not row:raise ValueError('Task not found')
+            import reviews
+            actor=None
+            if writing:
+                actor=actor_user(db,a)
+                if actor['kind']!='human':
+                    if row['owner_id']!=actor['id'] or row['lock_until']<=time.time():
+                        raise ValueError('A live task claim is required to write review findings')
+                    if a.get('state') in ('intentional','false_positive'):
+                        raise ValueError('Only a human can dismiss a finding as intentional or false positive')
+            result=reviews.findings(db,row['id'],a)
+            if 'activity' in result:activity(db,row['id'],actor['id'],'comment',result.pop('activity'))
+            return result
         if action=='git_finalize':
             import git_completion
             return git_completion.finalize(db,a,project_row,prefix,activity,now,resolve_dependents)

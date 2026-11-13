@@ -17,6 +17,7 @@ def read_operation(name,args):
     return (name in READS or (name=='file_locks' and args.get('action')=='list')
             or (name=='agent_interaction' and args.get('action','list') in ('list','get'))
             or (name=='task_attachment' and args.get('action','list') in ('list','get'))
+            or (name=='task_review_findings' and args.get('action','list')=='list')
             or (name=='project_settings' and not set(args)-{'project','actor','measurement_session'}))
 
 

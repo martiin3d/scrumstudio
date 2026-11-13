@@ -14,6 +14,21 @@ class ReviewTest(unittest.TestCase):
     tearDown=test_storage.StorageTest.tearDown
     project=test_storage.StorageTest.project
 
+    def test_findings_deduplicate_and_reopen_only_on_a_new_revision(self):
+        project,_=self.project()
+        task=self.task(project)
+        base=dict(project=project,id=task,actor=self.human,key='loses-selection',path='app.py')
+        record=dict(base,action='record',revision='a'*40,summary='Selection lost after refresh')
+        self.assertFalse(run('task_review_findings',record)['repeat'])
+        self.assertTrue(run('task_review_findings',dict(record,revision='b'*40,summary='Selection lost on the new line'))['repeat'])
+        with self.assertRaisesRegex(ValueError,'live task claim'):
+            run('task_review_findings',dict(record,actor=self.agent))
+        run('task_review_findings',dict(base,action='resolve',revision='b'*40,state='fixed',disposition='Refresh keeps selection'))
+        self.assertEqual(run('task_review_findings',dict(project=project,id=task))['items'],[])
+        self.assertTrue(run('task_review_findings',dict(record,revision='b'*40))['repeat'])
+        self.assertFalse(run('task_review_findings',dict(record,revision='c'*40))['repeat'])
+        self.assertTrue(run('task_get',dict(project=project,id=task))['review']['awaiting_human'])
+
     def task(self,p):
         task=run('task_create',dict(project=p,title='Review the existing artwork',description='Deliver an image and request human review',acceptance_criteria=['Verified deliverable with review references']))['id']
         claim=run('task_claim',dict(project=p,id=task,actor=self.agent))
