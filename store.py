@@ -582,6 +582,13 @@ def legacy_run(action, a, path=None, locks=None):
         if action=='git_reconcile':
             import git_completion
             return git_completion.reconcile(db,a,project_row,prefix,activity,now,resolve_dependents)
+        if action=='task_pull_request':
+            if type(a.get('number')) is not int or not 1<=a['number']<=2147483647:
+                raise ValueError('Supply a valid GitHub PR number')
+            if actor_user(db,a)['kind']!='human':raise ValueError('Only a human can reconcile protected PR delivery')
+            if not db.in_transaction:db.execute('BEGIN IMMEDIATE')
+            import git_completion
+            return git_completion.reconcile_pr(db,a,project_row,prefix,activity,now,resolve_dependents)
         if action=='git_finalize':
             import git_completion
             return git_completion.finalize(db,a,project_row,prefix,activity,now,resolve_dependents)
@@ -636,6 +643,13 @@ def legacy_run(action, a, path=None, locks=None):
                         task['version']=context_tools.digest(task)
                 import task_decisions
                 relevant=task_decisions.context(db,project,task,prefix,a)
+                if project_row['git_merge']=='PR' and task['status'] in ('In Review','Done'):
+                    import git_completion
+                    workspace=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(row))
+                    receipt=git_completion.read_receipt(workspace,task['id'])
+                    if receipt and receipt.get('sha'):
+                        task['pull_request']=receipt.get('pr',{'state':'awaiting_pr','head':receipt['sha'],'base':receipt['target']})
+                        task['version']=context_tools.digest(task)
                 if relevant:
                     task['decision_context']=relevant
                     task['version']=context_tools.digest(task)

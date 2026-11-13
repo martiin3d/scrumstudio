@@ -74,7 +74,7 @@ def plan(db,project,actor,root,tasks,selection,folder,size=None):
     isolated=git_policy['git_mode']=='Worktrees'
     profile=model_routing.profile_model(folder,actor)
     available=model_routing.catalog() if selection['client']=='codex' else None
-    if root['category'].strip().casefold()!='git recovery' and not (isolated and git_policy['git_merge']=='Task') and compatible(root,root):
+    if root['category'].strip().casefold()!='git recovery' and not (isolated and git_policy['git_merge'] in ('Task','PR')) and compatible(root,root):
         # Revisit earlier dependent rows after reserving their prerequisites. The
         # board is priority-ordered, not guaranteed to be topologically ordered.
         changed=True

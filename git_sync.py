@@ -37,7 +37,7 @@ def completion_basis(row):
 
 
 def integrated_completion(settings):
-    return enabled(settings) and settings.get('git_merge') == 'Task'
+    return enabled(settings) and settings.get('git_merge') in ('Task','PR')
 
 def git_version(root='.'):
     try:
@@ -77,7 +77,7 @@ def checkout_lock(root):
 def validate(changed):
     if 'git_pause_blocked' in changed and (type(changed['git_pause_blocked']) not in (bool,int) or changed['git_pause_blocked'] not in (0,1)):raise ValueError('git_pause_blocked must be boolean')
     if 'git_cleanup' in changed and (type(changed['git_cleanup']) not in (bool,int) or changed['git_cleanup'] not in (0,1)):raise ValueError('git_cleanup must be boolean')
-    if 'git_merge' in changed and changed['git_merge'] not in ('Off','Group','Task'):raise ValueError('git_merge must be Off, Group or Task')
+    if 'git_merge' in changed and changed['git_merge'] not in ('Off','Group','Task','PR'):raise ValueError('git_merge must be Off, Group, Task or PR')
     if 'git_mode' in changed and changed['git_mode'] not in ('Off', 'Branches','Worktrees'):
         raise ValueError('git_mode must be Off, Branches or Worktrees')
     if 'git_commit' in changed and changed['git_commit'] not in ('Task', 'Group'):
@@ -124,8 +124,8 @@ def branch_for(settings, task):
     """scrum/<group> for a context group, scrum/<CODE>-<title> otherwise."""
     if task.get('git_branch'):return task['git_branch']
     prefix = settings.get('git_branch_prefix', 'scrum/')
-    if settings.get('git_merge')=='Task':return prefix+task['code'].lower()
-    group = '' if settings.get('git_merge')=='Task' else (task.get('context_group') or '').strip()
+    if settings.get('git_merge') in ('Task','PR'):return prefix+task['code'].lower()
+    group=(task.get('context_group') or '').strip()
     return prefix + (slug(group) if group else task['code'].lower() + '-' + slug(task['title'], 40))
 
 def task_migration_preserved(root,settings,source,tasks):
@@ -174,7 +174,7 @@ def on_claim(root, settings, task):
 
 def refresh_parent(root,settings,task,target,missing,workspace=None):
     """Refresh an idle branch only to the exact tree already accepted by its parent."""
-    if not task.get('allow_parent_refresh') or settings.get('git_merge') not in ('Group','Task'):return None
+    if not task.get('allow_parent_refresh') or settings.get('git_merge') not in ('Group','Task','PR'):return None
     parent=parent_branch(root,target)
     if not parent or parent==target:return None
     before=_git(root,'rev-parse','--verify','refs/heads/'+target)
@@ -198,10 +198,10 @@ def refresh_parent(root,settings,task,target,missing,workspace=None):
         tree=_git(root,'merge-tree','--write-tree',old,tip,timeout=10)
         accepted=_git(root,'rev-parse',tip+'^{tree}')
         if tree.returncode or accepted.returncode:
-            if settings.get('git_merge')=='Task':raise ValueError('Task branch conflicts with its recorded parent; preserve checkpoint and resolve the scoped conflict')
+            if settings.get('git_merge') in ('Task','PR'):raise ValueError('Task branch conflicts with its recorded parent; preserve checkpoint and resolve the scoped conflict')
             return None
         merged_tree=tree.stdout.splitlines()[0]
-        if settings.get('git_merge')!='Task' and merged_tree!=accepted.stdout.strip():return None
+        if settings.get('git_merge') not in ('Task','PR') and merged_tree!=accepted.stdout.strip():return None
         merged=_git(root,'commit-tree',merged_tree,'-p',old,'-p',tip,'-m','Synchronize '+target+' from recorded parent '+parent,timeout=10)
         if merged.returncode:raise ValueError('Could not record verified parent synchronization')
         tip=merged.stdout.strip()
@@ -251,7 +251,7 @@ def _on_claim(root, settings, task):
         return {'branch': target, 'error': 'git unavailable or not a repository'}
     branch, dirty = current
     exists=_git(root,'rev-parse','--verify','--quiet','refs/heads/'+target).returncode==0
-    base=settings.get('git_base_branch') or (integrated_origin(root,branch) if not exists and settings.get('git_merge') in ('Group','Task') else branch)
+    base=settings.get('git_base_branch') or (integrated_origin(root,branch) if not exists and settings.get('git_merge') in ('Group','Task','PR') else branch)
     destination=target if exists else base
     missing=[]
     for dep in task.get('dependencies',[]):
@@ -261,7 +261,7 @@ def _on_claim(root, settings, task):
             missing.append(dependency)
     # Refresh a resumed task even when it has no explicit dependencies. Parked
     # edits are restored afterwards; a genuine conflict remains recoverable.
-    refreshed=refresh_parent(root,settings,task,target,missing) if missing or settings.get('git_merge')=='Task' else None
+    refreshed=refresh_parent(root,settings,task,target,missing) if missing or settings.get('git_merge') in ('Task','PR') else None
     if missing and not refreshed:
         return {'branch':target,'error':'Dependency branch '+missing[0]+' is not integrated into '+destination+'; integrate it before claiming'}
     extra={'refreshed_from':refreshed} if refreshed else {}
@@ -434,7 +434,7 @@ def publish_verified(root,remote,refspec):
         if not result.returncode or attempts>=2 or not transient:return result,attempts
 
 
-def merge_completed(root,settings,source,*,capture_before=False,expected_source=None,expected_parent=None):
+def merge_completed(root,settings,source,*,capture_before=False,expected_source=None,expected_parent=None,verification=None):
     """Merge immutable commits without changing the working tree or index."""
     base=parent_branch(root,source)
     if expected_parent is not None and base!=expected_parent:return {'merged':False,'error':'Recorded origin changed concurrently; agent must re-evaluate'}
@@ -445,7 +445,8 @@ def merge_completed(root,settings,source,*,capture_before=False,expected_source=
     if expected_source is not None and tip!=expected_source:return {'merged':False,'error':'Source changed concurrently; agent must re-evaluate'}
     for attempt in range(3):
         if parent_branch(root,source)!=base:return {'merged':False,'error':'Recorded origin changed concurrently; agent must re-evaluate'}
-        try:report=_merge_completed_once(root,settings,source,base,tip)
+        try:
+            report=_merge_completed_once(root,settings,source,base,tip,verification) if verification else _merge_completed_once(root,settings,source,base,tip)
         except ValueError as error:return {'merged':False,'error':str(error)}
         retry=report.pop('retryable',False)
         if not retry or attempt==2:
@@ -453,13 +454,17 @@ def merge_completed(root,settings,source,*,capture_before=False,expected_source=
             return report
 
 
-def _merge_completed_once(root,settings,source,base,tip):
+def _merge_completed_once(root,settings,source,base,tip,verification=None):
     """Retry only a proven target-ref race, keeping the original source fixed."""
     target='refs/heads/'+base
     current=_git(root,'rev-parse','--verify',target)
     if current.returncode:return {'merged':False,'error':'Source or target branch is missing'}
     before=current.stdout.strip()
     already=is_ancestor(root,tip,before)
+    if verification and not already:
+        import git_completion
+        if git_completion.material_drift(root,verification,before):
+            return {'merged':False,'error':'Target changed verified paths; rerun the affected checks','reverification_required':True}
     trees=_git(root,'worktree','list','--porcelain')
     if trees.returncode:return {'merged':False,'error':'Cannot inspect target worktrees'}
     target_checkout=None
@@ -484,6 +489,8 @@ def _merge_completed_once(root,settings,source,base,tip):
         made=_git(root,'commit-tree',tree.stdout.splitlines()[0],'-p',before,'-p',tip,'-m','Merge '+source+' into '+base,timeout=10)
         if made.returncode:return {'merged':False,'error':'Could not create merge commit: '+made.stderr[-300:]}
         merged=made.stdout.strip()
+    if verification and not already and not git_completion.matches_commit(root,verification['files'],merged):
+        return {'merged':False,'error':'Integration changes verified files; rerun the affected checks','reverification_required':True}
     if already:
         update=None  # No ref/index/worktree mutation, including on dirty targets.
     elif target_checkout:
@@ -539,14 +546,14 @@ def _finish(item):
 
 
 def _finish_locked(item):
+    import git_completion
     root=item['root'];settings=item['settings'];task=item['task']
     report={'branch':branch_for(settings,task)}
     current=state(root)
     if current is None:return dict(report,error='git unavailable or not a repository')
     strict=integrated_completion(settings)
     review_approval=task.get('review',{}).get('required') and task['review'].get('state')=='approved'
-    if strict or review_approval:
-        import git_completion
+    if (strict or review_approval) and settings.get('git_merge')!='PR':
         existing=git_completion.already_integrated(root,settings,task,report['branch'],record=strict)
         if existing:
             report.update(existing)
@@ -574,7 +581,6 @@ def _finish_locked(item):
             report['commit']={'committed':False,'reason':'nothing to commit'}
     commit=report['commit'];policy=settings.get('git_push','Group')
     if strict and not commit.get('error') and (commit.get('committed') or commit.get('reason')=='nothing to commit'):
-        import git_completion
         receipt=git_completion.save_receipt(root,task,report['branch'])
         report['verified_source_sha']=receipt['sha']
     if commit.get('error') or (not commit.get('committed') and commit.get('reason') not in ('nothing to commit','group commit deferred until the context group is complete')):
@@ -603,12 +609,18 @@ def _finish_locked(item):
         except (OSError,subprocess.SubprocessError) as error:
             report['push']={'pushed':False,'error':str(error)[:300]}
     else:report['push']={'pushed':False,'reason':'waiting for the rest of the context group'}
+    if settings.get('git_merge')=='PR':
+        if report.get('push',{}).get('pushed'):
+            report['pull_request']={'state':'awaiting_pr','head':report['verified_source_sha'],'base':receipt['target']}
+        else:
+            report['pull_request']={'state':'publication_pending','error':commit.get('error') or report.get('push',{}).get('error') or 'Verified source publication is pending'}
+        return report
     if settings.get('git_merge') in ('Group','Task') and unit_done:
         if (not commit.get('committed') and commit.get('reason')!='nothing to commit') or (settings.get('git_push')!='Never' and not report.get('push',{}).get('pushed')):
             report['merge']={'merged':False,'error':'Commit or source publication failed; agent review required'}
         elif commit.get('committed') or commit.get('reason')=='nothing to commit':
             try:
-                if strict:report['merge']=merge_completed(root,settings,report['branch'],expected_source=receipt['sha'],expected_parent=receipt['target'])
+                if strict:report['merge']=merge_completed(root,settings,report['branch'],expected_source=receipt['sha'],expected_parent=receipt['target'],verification=receipt)
                 else:report['merge']=(merge_dependency_checkpoint if item.get('dependency_checkpoint') else merge_completed)(root,settings,report['branch'])
             except (OSError,ValueError,subprocess.SubprocessError) as error:report['merge']={'merged':False,'error':str(error)[:300]}
     merged=report.get('merge',{})
@@ -648,7 +660,7 @@ def generated_leftover(root,name):
     return original is not None and updated==original
 
 
-def close_verified_checkout(root,settings,source,target,sha,task):
+def close_verified_checkout(root,settings,source,target,sha,task,*,landed=None):
     """Caller holds checkout lock and has excluded live task/file claims.
 
     Integration/publication is verified by the completion receipt first. This
@@ -660,7 +672,7 @@ def close_verified_checkout(root,settings,source,target,sha,task):
     if not current or current[0]!=source:return {'closed':False,'reason':'Another checkout branch owns the workspace; do not switch it'}
     if parent_branch(root,source)!=target:return {'closed':False,'reason':'Recorded parent changed; preserve checkout'}
     incoming=_git(root,'rev-parse','--verify','refs/heads/'+source)
-    if incoming.returncode or incoming.stdout.strip()!=sha or not is_ancestor(root,sha,'refs/heads/'+target):
+    if incoming.returncode or incoming.stdout.strip()!=sha or not is_ancestor(root,landed or sha,'refs/heads/'+target):
         return {'closed':False,'reason':'Source/parent changed after verified integration'}
     if _git(root,'diff','--cached','--quiet').returncode!=0 or _git(root,'ls-files','--unmerged').stdout.strip():
         return {'closed':False,'reason':'Existing staging or conflicts require scoped reconciliation'}
@@ -754,7 +766,7 @@ def flush(call,jobs,result,external_project=None):
                 if result.get('id')==item['task']['id']:result.update(finalized)
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
         closure_error=outcome.get('checkout',{}).get('reason') if strict and outcome.get('checkout',{}).get('closed') is False else ''
-        if outcome.get('merge',{}).get('error') or closure_error:
+        if (outcome.get('merge',{}).get('error') and not outcome['merge'].get('reverification_required')) or closure_error:
             try:
                 recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description=('Git checkout closure remains pending after verified integration. Preserve actual remaining source/staging; do not repeat implementation or adopt unknown edits. ' if closure_error else '')+'Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+(closure_error or outcome['merge']['error']),acceptance_criteria=[('Canonical checkout is clean on its recorded parent without losing source/staging; existing integration/publication is preserved.' if closure_error else 'Target contains the source outcome, conflicts are resolved and verification is recorded.'),'Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
                 outcome['recovery_task']=recovery

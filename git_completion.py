@@ -2,6 +2,9 @@
 import json
 import os
 import secrets
+import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 import git_sync as git
@@ -13,6 +16,11 @@ class RecoveryIncomplete(ValueError):
 
 def location(root, task):
     return Path(root)/'.scrum'/'local'/'git-completions'/(str(int(task))+'.json')
+
+
+def read_receipt(root,task):
+    path=location(root,task)
+    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
 
 
 def write_receipt(path,data):
@@ -77,10 +85,139 @@ def save_receipt(root, task, branch, pending=False, expected_blobs=None):
     reuse=not pending and expected_blobs is None and prior.get('sha') is None and prior.get('basis')==task['completion_basis'] and 'files' in prior
     files=prior['files'] if reuse else file_blobs(root,task.get('files') or []) if expected_blobs is None else expected_blobs
     data={'basis':task['completion_basis'],'source':branch,'target':target,'sha':None if pending else sha,'files':files,'base':prior['base'] if reuse else sha}
+    anchor=prior.get('target_anchor') if reuse else git._git(root,'rev-parse','--verify','refs/heads/'+target).stdout.strip()
+    if anchor:data['target_anchor']=anchor
     if not pending:
         if not matches_commit(root,files,sha):raise ValueError('Commit differs from verified files; verification intent retained')
         if reuse and recovered_tip(root,data)!=sha:raise ValueError('Commit includes unverified changes; verification intent retained')
     return write_receipt(path,data)
+
+
+def github_pr(root,remote,number):
+    origin=git._git(root,'remote','get-url',remote)
+    match=re.fullmatch(r'(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([\w.-]+/[\w.-]+?)(?:\.git)?',origin.stdout.strip())
+    if origin.returncode or not match:raise ValueError('PR reconciliation requires a configured GitHub remote')
+    gh=shutil.which('gh')
+    if not gh:raise ValueError('Install and authenticate GitHub CLI to reconcile this PR')
+    repository=match[1]
+    fields='number,url,state,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,mergeCommit,statusCheckRollup'
+    result=subprocess.run([gh,'pr','view',str(number),'--repo','github.com/'+repository,'--json',fields],
+                          cwd=root,capture_output=True,text=True,encoding='utf-8',timeout=25,
+                          env={**os.environ,'GH_PROMPT_DISABLED':'1','GH_HOST':'github.com'})
+    if result.returncode:raise ValueError('GitHub CLI could not read the configured pull request')
+    data=json.loads(result.stdout)
+    if data.get('number')!=number or data.get('url')!=f'https://github.com/{repository}/pull/{number}':
+        raise ValueError('Pull request identity does not match the configured remote')
+    return data
+
+
+def pr_check_state(checks):
+    if not checks:return 'unreported'
+    successful={'SUCCESS','NEUTRAL','SKIPPED'}
+    states=[(check.get('conclusion') or check.get('state') or check.get('status') or '').upper() for check in checks]
+    if any(state in {'FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED','STALE','STARTUP_FAILURE'} for state in states):
+        return 'failed'
+    return 'passed' if all(state in successful for state in states) else 'pending'
+
+
+def material_drift(root,receipt,target_tip):
+    anchor=receipt.get('target_anchor')
+    if not anchor or anchor==target_tip:return False
+    if not git.is_ancestor(root,anchor,target_tip):return True
+    for paths in git.path_chunks(list(receipt['files'])):
+        diff=git._git(root,'diff','--quiet',anchor,target_tip,'--',*paths,timeout=15)
+        if diff.returncode:return True
+    return False
+
+
+def reconcile_pr(db,a,project_row,prefix,activity,now,resolve_dependents):
+    """Observe a GitHub PR by number and validate its landing against the sealed source."""
+    import git_worktrees
+    import reviews
+    settings=dict(project_row)
+    if settings.get('git_merge')!='PR':raise ValueError('The project must use PR delivery')
+    row=db.execute("SELECT * FROM tasks WHERE id=? AND project=? AND status IN ('In Review','Done')",(a['id'],settings['id'])).fetchone()
+    if not row:raise ValueError('The task must have a verified PR delivery')
+    if row['lock_until']>time.time():raise ValueError('Wait for the task claim to close before reconciling')
+    root=git_worktrees.workspace(settings['workspace_root'],git_worktrees.identity(row))
+    receipt=read_receipt(root,row['id'])
+    if not receipt or not receipt.get('sha') or receipt['basis']!=git.completion_basis(dict(row)):
+        raise ValueError('Current acceptance has no matching verified source receipt')
+    if row['status']=='Done':
+        recorded=receipt.get('pr') or {}
+        if recorded.get('number')!=a['number']:raise ValueError('Task already completed through another PR')
+        return {'status':'Done','pull_request':recorded}
+    remote=settings['git_remote'];pr=github_pr(root,remote,a['number'])
+    if (pr.get('isCrossRepository') or pr.get('headRefName')!=receipt['source'] or
+        pr.get('baseRefName')!=receipt['target'] or pr.get('headRefOid')!=receipt['sha']):
+        raise ValueError('PR head, verified SHA or recorded destination changed; reverify the task')
+    ci=pr_check_state(pr.get('statusCheckRollup'))
+    status={'number':a['number'],'url':pr['url'],'head':receipt['sha'],'base':receipt['target'],'ci':ci,
+            'state':'draft' if pr.get('isDraft') else pr.get('state','unknown').lower()}
+    def remember():
+        receipt['pr']=status
+        write_receipt(location(root,row['id']),receipt)
+        return {'status':'In Review','pull_request':status}
+    if status['state']!='merged' or ci!='passed':return remember()
+    landed=(pr.get('mergeCommit') or {}).get('oid','')
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}',landed):raise ValueError('GitHub did not report a valid landing commit')
+    with git.checkout_lock(root):
+        target='refs/heads/'+receipt['target'];remote_target='refs/remotes/'+remote+'/'+receipt['target']
+        fetched=git._git(root,'fetch','--quiet','--no-tags',remote,target+':'+remote_target,timeout=git.PUSH_TIMEOUT)
+        if fetched.returncode or not git.is_ancestor(root,landed,remote_target):
+            status['state']='landing_unconfirmed'
+            return remember()
+        parent=git._git(root,'rev-parse','--verify',landed+'^1')
+        actual=git._git(root,'rev-parse','--verify',landed+'^{tree}')
+        anchor=receipt.get('target_anchor')
+        expected=git._git(root,'merge-tree','--write-tree',parent.stdout.strip(),receipt['sha'],timeout=15) if not parent.returncode else None
+        if (not anchor or not expected or expected.returncode or actual.returncode or
+            expected.stdout.strip()!=actual.stdout.strip() or not matches_commit(root,receipt['files'],landed)):
+            status['state']='reverification_required'
+            return remember()
+        if material_drift(root,receipt,parent.stdout.strip()):
+            status['state']='reverification_required'
+            return remember()
+        local=git._git(root,'rev-parse','--verify',target)
+        if local.returncode or not git.is_ancestor(root,local.stdout.strip(),remote_target):
+            status['state']='local_target_diverged'
+            return remember()
+        trees=git._git(root,'worktree','list','--porcelain')
+        if trees.returncode:raise ValueError('Cannot inspect Git worktrees')
+        if not git.is_ancestor(root,landed,target):
+            checked_out=next((block for block in trees.stdout.split('\n\n') if 'branch '+target in block.splitlines()),None)
+            if checked_out:
+                path=next((line[9:] for line in checked_out.splitlines() if line.startswith('worktree ')),None)
+                if not path or Path(path).resolve()!=Path(settings['workspace_root']).resolve() or git.state(path)!=(receipt['target'],[]):
+                    status['state']='local_target_update_pending'
+                    return remember()
+                updated=git._git(path,'merge','--ff-only',remote_target,timeout=20)
+            else:updated=git._git(root,'update-ref',target,remote_target,local.stdout.strip())
+            if updated.returncode:
+                status['state']='local_target_update_pending'
+                return remember()
+        status.update(state='integrated',landing=landed)
+        if reviews.data(row).get('required') and reviews.data(row).get('state')!='approved':
+            status['state']='human_review_pending'
+            return remember()
+        if settings.get('git_mode')=='Branches':
+            live=db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>?',(settings['id'],time.time())).fetchone()
+            reserved=db.execute('SELECT 1 FROM file_locks WHERE project=? AND lock_until>?',(settings['id'],time.time())).fetchone()
+            if live or reserved:
+                status['state']='checkout_pending'
+                return remember()
+            checkout=git.close_verified_checkout(root,settings,receipt['source'],receipt['target'],receipt['sha'],
+                                                 {'code':f"{prefix}-{row['number']}",'files':json.loads(row['files'])},landed=landed)
+            if not checkout.get('closed'):
+                status.update(state='checkout_pending',checkout=checkout)
+                return remember()
+    remember()
+    db.execute("UPDATE tasks SET status='Done',updated=? WHERE id=?",(now(),row['id']))
+    import telemetry
+    telemetry.transition(db,row['id'],'Done',a['actor'])
+    activity(db,row['id'],a['actor'],'comment','Verified PR integrated: '+status['url'])
+    unblocked=resolve_dependents(db,settings['id'],row['id'],prefix,a['actor'])
+    return {'status':'Done','pull_request':status,'unblocked_total':len(unblocked)}
 
 
 def already_integrated(root,settings,task,branch,record=True):
@@ -186,7 +323,7 @@ def finalize(db,a,project_row,prefix,activity,now,resolve_dependents):
 def reconcile(db,a,project_row,prefix,activity,now,resolve_dependents):
     """Called after an actual recovery completes, never by a polling model."""
     if a.get('capability') is not git.FINALIZE_TOKEN:raise ValueError('Native Git reconciliation only')
-    if not git.integrated_completion(dict(project_row)):return {'completed':[]}
+    if project_row['git_merge']!='Task':return {'completed':[]}
     import git_worktrees
     completed=[]
     for row in db.execute("SELECT * FROM tasks WHERE project=? AND status='In Review' AND category!='Git recovery'",(project_row['id'],)).fetchall():

@@ -245,12 +245,14 @@ def operation(db, action, a, project_row, actor_user, activity, now):
             import git_paused
             if git_paused.any_pending(current['workspace_root']):
                 raise ValueError('Restore or reconcile preserved blocked work before changing Git mode or workspace_root')
-        if changed.get('git_merge') in ('Group','Task'):
+        if changed.get('git_merge',current['git_merge'])=='PR' and (changed.get('git_push',current['git_push'])=='Never' or changed.get('git_mode',current['git_mode'])=='Off'):
+            raise ValueError('PR delivery requires branch/worktree Git mode and publication')
+        if changed.get('git_merge') in ('Group','Task','PR'):
             import git_sync
             version=git_sync.git_version(current['workspace_root'] or '.')
             if version and version<git_sync.MERGE_TREE_MIN:
                 raise ValueError(f'git_merge=Group needs git {git_sync.MERGE_TREE_MIN[0]}.{git_sync.MERGE_TREE_MIN[1]}+ on this machine (found {version[0]}.{version[1]})')
-        if 'git_merge' in changed and changed['git_merge']!=current['git_merge'] and 'Task' in (changed['git_merge'],current['git_merge']):
+        if 'git_merge' in changed and changed['git_merge']!=current['git_merge'] and {'Task','PR'}.intersection((changed['git_merge'],current['git_merge'])):
             import git_sync,git_paused
             root=current['workspace_root']
             active=db.execute("SELECT 1 FROM tasks WHERE project=? AND status='In Progress' AND lock_until>?",(project,time.time())).fetchone()
@@ -276,7 +278,7 @@ def operation(db, action, a, project_row, actor_user, activity, now):
                     parent=git_sync.parent_branch(root,source)
                     if not parent or not git_sync.is_ancestor(root,source,'refs/heads/'+parent):
                         tasks=[{'code':f"{prefix}-{item['number']}",'title':item['title'],'context_group':item['context_group']} for item in rows if item['status']!='Cancelled']
-                        preserved=changed['git_merge']=='Task' and git_sync.task_migration_preserved(root,old_policy,source,tasks)
+                        preserved=changed['git_merge'] in ('Task','PR') and git_sync.task_migration_preserved(root,old_policy,source,tasks)
                         if not preserved:raise ValueError('Integrate or preserve existing branch '+source+' before changing task branch policy')
 
         if 'max_active_per_agent' in changed:

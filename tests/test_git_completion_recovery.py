@@ -17,6 +17,60 @@ class CompletionRecoveryTest(unittest.TestCase):
     repo=fixtures.GitAutomationTest.repo
     enable=fixtures.GitAutomationTest.enable
 
+    def test_pr_mode_reconciles_observed_ci_and_squash(self):
+        import subprocess
+        project,root=self.project()
+        def git(*args):
+            return subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
+        git('init','-qb','main')
+        git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid')
+        (root/'a.py').write_text('before')
+        git('add','a.py');git('commit','-qm','Base')
+        self.enable(project,git_merge='PR',git_push='Task',usage_guard=False)
+        task=run('task_create',dict(project=project,title='Protected PR',files=['a.py'],**SPEC))['id']
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent));branch=claim['git']['branch']
+        (root/'a.py').write_text('verified PR')
+        success=subprocess.CompletedProcess([],0,'','')
+        with patch.object(git_sync,'publish_verified',return_value=(success,1)):
+            result=run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Verified PR content'))
+        self.assertEqual(result['completed']['status'],'In Review')
+        self.assertEqual(result['completed']['git']['pull_request']['state'],'awaiting_pr')
+        head=git('rev-parse',branch)
+        git('switch','main');git('merge','--squash',branch);git('commit','-qm','Squash')
+        landed=git('rev-parse','HEAD');git('update-ref','refs/remotes/origin/main',landed)
+        self.assertFalse(git_sync.is_ancestor(root,head,landed))
+        pr={'number':3,'url':'https://github.com/example/project/pull/3','state':'MERGED',
+            'headRefName':branch,'headRefOid':head,'baseRefName':'main',
+            'mergeCommit':{'oid':landed},'statusCheckRollup':[{'conclusion':'FAILURE'}]}
+        request=dict(project=project,id=task,actor=self.human,number=3)
+        native=git_sync._git
+        def observe(root,*args,**kwargs):
+            return success if args[0]=='fetch' else native(root,*args,**kwargs)
+        with patch.object(git_completion,'github_pr',return_value=pr),patch.object(git_sync,'_git',side_effect=observe):
+            self.assertEqual(run('task_pull_request',request)['pull_request']['ci'],'failed')
+            pr['statusCheckRollup']=[{'conclusion':'SUCCESS'}]
+            pr['headRefOid']=landed
+            with self.assertRaisesRegex(ValueError,'verified SHA'):
+                run('task_pull_request',request)
+            pr['headRefOid']=head
+            self.assertEqual(run('task_pull_request',request)['status'],'Done')
+        self.assertEqual(run('task_get',dict(project=project,id=task))['pull_request']['landing'],landed)
+
+    def test_material_base_drift_is_scoped_to_verified_paths(self):
+        import subprocess,tempfile
+        with tempfile.TemporaryDirectory(dir='data') as location:
+            root=Path(location).resolve()
+            def git(*args):
+                return subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
+            git('init','-qb','main')
+            git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid')
+            (root/'a.py').write_text('verified');git('add','.');git('commit','-qm','Base')
+            receipt={'target_anchor':git('rev-parse','HEAD'),'files':{'a.py':None}}
+            (root/'b.py').write_text('unrelated');git('add','.');git('commit','-qm','Unrelated')
+            self.assertFalse(git_completion.material_drift(root,receipt,git('rev-parse','HEAD')))
+            (root/'a.py').write_text('changed');git('commit','-qam','Material')
+            self.assertTrue(git_completion.material_drift(root,receipt,git('rev-parse','HEAD')))
+
     def failed_commit(self,name='a.py'):
         project,root=self.project();git=self.repo(root)
         self.enable(project,git_merge='Task',git_push='Never',usage_guard=False)
