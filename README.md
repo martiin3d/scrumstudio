@@ -101,6 +101,10 @@ The header's **Dark / Light** button switches theme and remembers it in the curr
 
 `task_changes(project,id)` returns the uncommitted edits of a task's planned files straight from git: changed files with +/- counts, which of them were planned, an `unplanned` list for files touched outside the plan, and a unified diff (2 context lines) cut at `max_lines` (default 200, 20..2000) and ~12 KB with `truncated=true` and a hint to narrow with `files=[subset]`. `diff=false` returns only the file list; new files show their first 60 lines; `.scrum/` metadata is hidden. A fresh `task_claim` also reports `dirty_planned`, the planned files that already carried uncommitted edits, so a worker knows which changes predate the current claim (their authorship is unknown) before building on them. The `scrum-work` skill requests this only when needed, reuses inspected diffs, and records only material findings. Local Git computation makes no inference call, but a model reading its output still consumes context. There is no mandatory Before/After essay. The diff endpoint never commits, reverts or judges changes; Git automation is a separate human-enabled policy.
 
+## Agent knowledge
+
+The [agent knowledge map](docs/agents/index.md) points to repository entry points, verification, Git delivery and shared specifications. Agents can open the topic relevant to the current task.
+
 ## Git automation per context group
 
 Off by default. Settings (web **Settings → Git automation** or `project_settings`, human actor): `git_mode` Off|Branches|Worktrees, `git_merge` Off|Group, `git_commit` Task|Group, `git_push` Group|Task|Never, `git_base_branch` (empty = current HEAD, skipping recorded task origins already integrated into their parents), `git_branch_prefix` (`scrum/`), `git_remote` (`origin`). With Branches the server runs git in local code at coordination points, so no model turn is spent on it and Codex/Claude workers behave identically:

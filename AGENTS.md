@@ -2,6 +2,8 @@
 
 For structural codebase exploration, use the installed `codebase-memory` skill when available.
 
+Use the [agent knowledge map](docs/agents/index.md) when the task needs repository-specific guidance. Open the relevant topic on demand. A supervisor-supplied claim already contains the execution scope.
+
 ## Work coordination
 
 Prefer the first-party native `scrum.py` CLI for Scrum coordination; use the `scrum-studio` MCP when explicitly selected. Follow the `scrum-work` skill (it covers start, resume, planning, claims, verification, finish and handoff). The board is **SCRUM**, stored in this checkout's ignored `.scrum/`; find it with `projects` by matching this checkout folder, never a hardcoded ID or path. If none exists, open/create one for this folder through the selected coordination channel.
