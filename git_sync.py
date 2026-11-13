@@ -355,15 +355,39 @@ def _commit(root, settings, task, message):
         if changed.returncode not in (0,1) or untracked.returncode:return {'error':'Could not inspect planned changes'}
         changed_any=changed_any or changed.returncode==1 or bool(untracked.stdout.strip())
     if not changed_any:return {'committed':False,'reason':'nothing to commit'}
-    # NUL pathspec files avoid argv limits and preserve unrelated staged changes.
+    # Hold Git's real index lock while hooks run against a private copy.
+    # Only install the updated index after Git confirms the commit succeeded.
     import tempfile
-    with tempfile.TemporaryDirectory(prefix='scrum-pathspec-') as temporary:
-        manifest=Path(temporary)/'paths'
-        manifest.write_bytes(b'\0'.join(path.encode('utf-8') for path in pathspec)+b'\0')
-        options=['--pathspec-from-file='+str(manifest),'--pathspec-file-nul']
-        add=_git(root,'add','-A',*options,timeout=10)
-        if add.returncode:return {'error':'git add: '+(add.stderr or add.stdout).strip()[:300]}
-        commit=_git(root,'commit','--quiet','--only','-m',message,*options,timeout=10)
+    located=_git(root,'rev-parse','--path-format=absolute','--git-path','index')
+    if located.returncode:return {'error':'Cannot locate the Git index'}
+    index=Path(located.stdout.strip())
+    lock=index.with_name(index.name+'.lock')
+    try:fd=os.open(lock,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    except FileExistsError:return {'error':'Git index is locked; retry after the other operation finishes'}
+    owns_lock=True
+    try:
+        with os.fdopen(fd,'wb') as output, tempfile.TemporaryDirectory(prefix='scrum-commit-',dir=index.parent) as temporary:
+            manifest=Path(temporary)/'paths'
+            private=Path(temporary)/'index'
+            if index.exists():private.write_bytes(index.read_bytes())
+            manifest.write_bytes(b'\0'.join(path.encode('utf-8') for path in pathspec)+b'\0')
+            options=['--pathspec-from-file='+str(manifest),'--pathspec-file-nul']
+            # Recheck under the index lock, including changes staged after the first inspection.
+            for paths in path_chunks(pathspec):
+                staged=_git(root,'diff','--cached','--quiet','--',*paths,index_file=private)
+                if staged.returncode:return {'error':'Planned staging changed or could not be inspected'}
+            add=_git(root,'add','-A',*options,timeout=10,index_file=private)
+            if add.returncode:return {'error':'git add: '+(add.stderr or add.stdout).strip()[:300]}
+            commit=_git(root,'commit','--quiet','--only','-m',message,*options,timeout=10,index_file=private)
+            if not commit.returncode:
+                output.write(private.read_bytes())
+                output.flush()
+                os.fsync(output.fileno())
+        if not commit.returncode:
+            os.replace(lock,index)
+            owns_lock=False
+    finally:
+        if owns_lock:lock.unlink(missing_ok=True)
     if commit.returncode:return {'error':'git commit: '+(commit.stderr or commit.stdout).strip()[:300]}
     sha = _git(root, 'rev-parse', '--short', 'HEAD').stdout.strip()
     stat = _git(root, 'diff', '--shortstat', 'HEAD~1', 'HEAD').stdout.strip()
@@ -394,8 +418,17 @@ def publish_verified(root,remote,refspec):
     """Retry one explicit transport failure with the same immutable refspec."""
     attempts=0
     while True:
-        result=_git(root,'push','--quiet',remote,refspec,timeout=PUSH_TIMEOUT)
         attempts+=1
+        try:
+            result=_git(root,'push','--quiet',remote,refspec,timeout=PUSH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            sha,ref=refspec.split(':',1)
+            try:observed=_git(root,'ls-remote','--refs',remote,ref,timeout=10)
+            except (OSError,subprocess.SubprocessError):observed=None
+            if observed and not observed.returncode and observed.stdout.strip()==sha+'\t'+ref:
+                return subprocess.CompletedProcess([],0,'',''),attempts
+            if attempts<2:continue
+            return subprocess.CompletedProcess([],1,'','Push timed out; remote publication could not be confirmed'),attempts
         transient=re.search(r'Could not resolve host|Failed to connect|Connection (?:reset|timed out)|HTTP (?:500|502|503|504)',result.stderr or '',re.I)
         if not result.returncode or attempts>=2 or not transient:return result,attempts
 
@@ -549,8 +582,22 @@ def _finish_locked(item):
     elif policy=='Task' or unit_done:
         remote=settings.get('git_remote','origin')
         try:
-            push_source=report['verified_source_sha']+':refs/heads/'+report['branch'] if strict else report['branch']
-            result=_git(root,'push','--quiet','-u',remote,push_source,timeout=PUSH_TIMEOUT)
+            source_sha=report.get('verified_source_sha')
+            if source_sha is None:
+                source=_git(root,'rev-parse','--verify','refs/heads/'+report['branch'])
+                if not source.returncode:source_sha=source.stdout.strip()
+            if source_sha:
+                push_source=source_sha+':refs/heads/'+report['branch']
+                result,attempts=publish_verified(root,remote,push_source)
+                report['source_publication_attempts']=attempts
+                if not result.returncode:
+                    # Git cannot infer a local branch from an immutable SHA refspec.
+                    for key,value in (('remote',remote),('merge','refs/heads/'+report['branch'])):
+                        configured=_git(root,'config','--local','branch.'+report['branch']+'.'+key,value)
+                        if configured.returncode:
+                            report['tracking_error']='Published the source; could not configure upstream tracking'
+                            break
+            else:result=subprocess.CompletedProcess([],1,'','Could not resolve the source commit for publication')
             report['push']={'pushed':True,'remote':remote,'branch':report['branch']} if not result.returncode else {'pushed':False,'error':(result.stderr or result.stdout).strip()[-300:] or 'push failed'}
         except (OSError,subprocess.SubprocessError) as error:
             report['push']={'pushed':False,'error':str(error)[:300]}

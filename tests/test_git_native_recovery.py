@@ -34,6 +34,43 @@ class NativeGitRecoveryTest(unittest.TestCase):
         self.git('commit','-qam','verified')
         return self.git('rev-parse','HEAD')
 
+    def test_failed_scoped_commit_preserves_staging_and_can_retry(self):
+        (self.root/'a.txt').write_text('owned\n')
+        (self.root/'b.txt').write_text('human staging\n')
+        self.git('add','b.txt')
+        original=(self.root/'.git/index').read_bytes()
+        run=git_sync._git
+
+        def reject_commit(root,*args,**kwargs):
+            if args[0]=='commit':
+                return subprocess.CompletedProcess(args,1,'','hook rejected commit')
+            return run(root,*args,**kwargs)
+
+        task={'files':['a.txt']}
+        with patch.object(git_sync,'_git',side_effect=reject_commit):
+            self.assertIn('hook rejected',git_sync._commit(self.root,{},task,'owned')['error'])
+        self.assertEqual((self.root/'.git/index').read_bytes(),original)
+        self.assertTrue(git_sync._commit(self.root,{},task,'owned')['committed'])
+        self.assertEqual(self.git('show','HEAD:a.txt'),'owned')
+        self.assertEqual(self.git('diff','--cached','--name-only'),'b.txt')
+
+    def test_verified_publication_reconciles_timeout_and_retries_transport_only(self):
+        sha='1'*40
+        ref='refs/heads/feature'
+        refspec=sha+':'+ref
+        success=subprocess.CompletedProcess([],0,sha+'\t'+ref+'\n','')
+        transient=subprocess.CompletedProcess([],1,'','Could not resolve host')
+        rejected=subprocess.CompletedProcess([],1,'','non-fast-forward')
+        for outcomes,attempts,code in [
+            ([subprocess.TimeoutExpired('git',1),success],1,0),
+            ([transient,success],2,0),
+            ([rejected],1,1),
+        ]:
+            with self.subTest(outcomes=outcomes), patch.object(git_sync,'_git',side_effect=outcomes) as git:
+                result,count=git_sync.publish_verified(self.root,'origin',refspec)
+                self.assertEqual((count,result.returncode),(attempts,code))
+                self.assertEqual([call.args[-1] for call in git.call_args_list if call.args[1]=='push'],[refspec]*attempts)
+
     def test_foreign_git_environment_cannot_redirect_worktree_or_index(self):
         foreign=self.root/'foreign';foreign.mkdir()
         raw=git_sync._git
