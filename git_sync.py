@@ -357,6 +357,7 @@ def _commit(root, settings, task, message):
     if not changed_any:return {'committed':False,'reason':'nothing to commit'}
     # Hold Git's real index lock while hooks run against a private copy.
     # Only install the updated index after Git confirms the commit succeeded.
+    import shutil
     import tempfile
     located=_git(root,'rev-parse','--path-format=absolute','--git-path','index')
     if located.returncode:return {'error':'Cannot locate the Git index'}
@@ -369,7 +370,7 @@ def _commit(root, settings, task, message):
         with os.fdopen(fd,'wb') as output, tempfile.TemporaryDirectory(prefix='scrum-commit-',dir=index.parent) as temporary:
             manifest=Path(temporary)/'paths'
             private=Path(temporary)/'index'
-            if index.exists():private.write_bytes(index.read_bytes())
+            if index.exists():shutil.copy2(index,private)
             manifest.write_bytes(b'\0'.join(path.encode('utf-8') for path in pathspec)+b'\0')
             options=['--pathspec-from-file='+str(manifest),'--pathspec-file-nul']
             # Recheck under the index lock, including changes staged after the first inspection.

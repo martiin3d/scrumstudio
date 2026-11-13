@@ -239,6 +239,26 @@ class WorktreeTest(unittest.TestCase):
         self.assertEqual(git('status','--porcelain'),'')
 
     @NEEDS_MERGE_TREE
+    def test_cleanup_preview_reports_squash_and_retains_ignored_content(self):
+        project,folder,git=self.setup_repo(git_cleanup=True)
+        task=self.task(project,'Squash preview','a.py')
+        claim=run('task_claim',dict(project=project,id=task,actor=self.agent))
+        work=Path(claim['git']['worktree']);branch=claim['git']['branch']
+        (work/'a.py').write_text('completed')
+        _git_sync._git(work,'commit','-qam','change',timeout=10).check_returncode()
+        git('merge','--squash',branch);git('commit','-qm','squashed')
+        (work/'.scrum').mkdir(exist_ok=True);(work/'.scrum/private').write_text('keep')
+        before=git('show-ref')
+        result=run('project_workspaces',dict(project=project,actor=self.human))
+        preview=result['workspaces'][0]['cleanup']
+        self.assertEqual(preview['integration'],'equivalent_content')
+        self.assertIn('local_or_ignored_files',preview['retention_reasons'])
+        self.assertIn('verified_ancestry_required',preview['retention_reasons'])
+        self.assertIn('worker_exit_unconfirmed',preview['retention_reasons'])
+        self.assertEqual(git('show-ref'),before)
+        self.assertEqual((work/'.scrum/private').read_text(),'keep')
+
+    @NEEDS_MERGE_TREE
     def test_cleanup_waits_for_cli_exit_and_reopened_task_gets_parent(self):
         project,folder,git=self.setup_repo(git_merge='Group',git_cleanup=True)
         task=self.task(project,'Cleanup','a.py')

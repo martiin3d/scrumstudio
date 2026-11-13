@@ -518,7 +518,11 @@ def legacy_run(action, a, path=None, locks=None):
                 db.execute('BEGIN IMMEDIATE')
                 if not runtime.control(db,project)['paused']:raise ValueError('Stop the project before archiving workspaces')
                 if db.execute("SELECT 1 FROM tasks WHERE project=? AND lock_until>?",(project,time.time())).fetchone():raise ValueError('Release live task claims before archiving workspaces')
-            result=git_worktrees.archive(project_row['workspace_root'],a.get('confirm',False))
+            workspace_root=project_row['workspace_root'];settings=coord.settings(project_row)
+            def related_workspace_work(source):
+                rows=db.execute('SELECT * FROM tasks WHERE project=?',(project,)).fetchall()
+                return git_worktrees.related_pending(workspace_root,source,[dict(row) for row in rows],settings,prefix)
+            result=git_worktrees.archive(workspace_root,a.get('confirm',False),settings,related_workspace_work)
             for item in result['workspaces'] if result.get('confirmed') else []:
                 for key in item['tasks']:
                     row=db.execute('SELECT * FROM tasks WHERE project=? AND uid=?',(project,key)).fetchone()

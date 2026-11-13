@@ -133,12 +133,48 @@ def save(root,saved):
     finally:Path(temporary).unlink(missing_ok=True)
 
 
-def archive(root,confirm=False):
+def cleanup_preview(root,item,settings,related_work):
+    """Explain retention without modifying refs, the checkout, or its registry."""
+    import git_sync as git
+    import git_paused
+    source=item['branch'];path=item['path'];pending=item.get('cleanup',{})
+    target=pending.get('target') or git.parent_branch(root,source)
+    reasons=[]
+    if not settings.get('git_cleanup'):reasons.append('cleanup_disabled')
+    if not pending.get('worker_exited'):reasons.append('worker_exit_unconfirmed')
+    if related_work is None or related_work(source):reasons.append('related_work_or_unknown')
+    if git_paused.pending(root,source):reasons.append('preserved_unfinished_work')
+    status=git._git(path,'status','--porcelain','--untracked-files=all','--ignored')
+    if status.returncode:reasons.append('status_unavailable')
+    elif status.stdout.strip():reasons.append('local_or_ignored_files')
+    parents=git._git(root,'config','--local','--get-regexp',r'^branch\..*\.scrum-parent$')
+    if parents.returncode not in (0,1):reasons.append('parent_refs_unavailable')
+    elif any(line.split(' ',1)[-1]==source for line in parents.stdout.splitlines()):reasons.append('dependent_branch')
+    source_tip=git._git(root,'rev-parse','--verify','refs/heads/'+source)
+    target_tip=git._git(root,'rev-parse','--verify','refs/heads/'+target) if target else None
+    integration='unknown'
+    if not source_tip.returncode and target_tip and not target_tip.returncode:
+        head=source_tip.stdout.strip();base=target_tip.stdout.strip()
+        if head!=pending.get('source_sha'):reasons.append('verified_source_missing_or_changed')
+        try:
+            if git.is_ancestor(root,head,base):integration='ancestor'
+            else:
+                merged=git._git(root,'merge-tree','--write-tree',base,head,timeout=10)
+                tree=git._git(root,'rev-parse',base+'^{tree}')
+                integration='equivalent_content' if not merged.returncode and not tree.returncode and merged.stdout.strip()==tree.stdout.strip() else 'not_proven'
+        except (ValueError,OSError,subprocess.SubprocessError):
+            pass
+    if integration!='ancestor':reasons.append('verified_ancestry_required')
+    return {'target':target,'integration':integration,'retention_reasons':reasons}
+
+
+def archive(root,confirm=False,settings=None,related_work=None):
     """Detach managed checkouts, preserving every file and all branch refs."""
     import git_sync as git
     if not root:raise ValueError('Project has no registered workspace folder')
     root=Path(root).resolve()
-    with git.checkout_lock(root):
+    from contextlib import nullcontext
+    with git.checkout_lock(root) if confirm else nullcontext():
         saved=entries(root);groups={}
         for key,item in saved.items():
             if item.get('cleaned'):continue
@@ -148,7 +184,13 @@ def archive(root,confirm=False):
             head=git._git(path,'symbolic-ref','--short','HEAD')
             if common.returncode or original.returncode or common.stdout.strip()!=original.stdout.strip() or head.returncode or head.stdout.strip()!=item['branch']:
                 raise ValueError('Workspace repository/branch does not match its registry; preserved for recovery')
-            groups.setdefault(str(path),{'path':str(path),'branch':item['branch'],'tasks':[]})['tasks'].append(key)
+            group=groups.get(str(path))
+            if group is None:
+                group={'path':str(path),'branch':item['branch'],'tasks':[]}
+                if not confirm and settings is not None:
+                    group['cleanup']=cleanup_preview(root,dict(item,path=str(path)),settings,related_work)
+                groups[str(path)]=group
+            group['tasks'].append(key)
         if not confirm:return {'workspaces':list(groups.values()),'confirmed':False}
         reports=[]
         for location,item in groups.items():
