@@ -82,9 +82,58 @@ def startup_task(task):
         'blocked_reason','blocked_reason_kind','evidence','continuity','continuity_stale',
         'preserved_inputs','decision_context','pending_ai_notes','attachment_count',
         'verification_level','verification_reason','review','context_group','context_batch',
-        'specification',
+        'specification','knowledge','workspace_delta',
     )
     return {key:task[key] for key in fields if key in task and task[key] not in (None,'',[],{})}
+
+
+def workspace_inputs(workspace, task):
+    import git_sync
+    from pathlib import Path
+    from project_knowledge import safe_file, source_state
+
+    root=Path(workspace).resolve()
+    git=git_sync._git(root,'rev-parse','--verify','HEAD')
+    head=git.stdout.strip() if not git.returncode else ''
+    branch=git_sync._git(root,'symbolic-ref','--quiet','--short','HEAD').stdout.strip() if head else ''
+    files={}
+    for name in task.get('files',[])[:20]:
+        candidate=root/name
+        path=safe_file(root,name)
+        files[name]=source_state(path) if path else 'unavailable' if candidate.exists() else None
+    return {'branch':branch,'head':head,'checkout':str(root),'files':files,
+            'acceptance':digest(task.get('acceptance_criteria',[])),
+            'evidence':digest(task.get('evidence',''))}
+
+
+def checkpoint_workspace(project_root, workspace, task):
+    from pathlib import Path
+    import subprocess
+    from scrum_cli import atomic
+    if not project_root or not workspace:return
+    try:
+        destination=Path(project_root)/'.scrum/local/task-context'/f"{int(task['id'])}.json"
+        atomic(destination,workspace_inputs(workspace,task))
+    except (OSError,ValueError,subprocess.SubprocessError):
+        return
+
+
+def workspace_delta(project_root, workspace, task):
+    from pathlib import Path
+    import subprocess
+    if not project_root or not workspace or not (task.get('continuity') or task.get('evidence')):return None
+    checkpoint=Path(project_root)/'.scrum/local/task-context'/f"{int(task['id'])}.json"
+    try:
+        before=json.loads(checkpoint.read_text(encoding='utf-8'))
+        current=workspace_inputs(workspace,task)
+    except (OSError,ValueError,subprocess.SubprocessError):
+        return None
+    changed=[key for key in ('branch','head','checkout','acceptance','evidence') if before.get(key)!=current[key]]
+    files=[name for name in sorted(before['files'].keys()|current['files'].keys())
+           if before['files'].get(name,'unobserved')!=current['files'].get(name,'unobserved')]
+    incomplete=bool(task.get('files_page',{}).get('has_more')) or any(value=='unavailable' for value in current['files'].values())
+    return {'changed_inputs':changed,'changed_paths':files[:12],'coverage':'partial' if incomplete or len(files)>12 else 'scoped',
+            'observed_head':current['head'],'evidence_review':bool(changed or files or incomplete)}
 
 def search(db, project, prefix, args):
     limit=args.get('limit',5);after=args.get('after',0)

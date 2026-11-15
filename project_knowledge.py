@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import sqlite3
 import tempfile
 import time
@@ -25,12 +26,16 @@ QUESTIONS = (
     ('constraints', 'Which constraints or existing decisions should the work respect?'),
 )
 STATE = Path('.scrum/local/knowledge-onboarding.json')
+MANIFEST = WIKI/'sources.json'
 MAX_FILE = 128 * 1024
+SPEC_LINE = re.compile(r'^Specification: (docs/agents/[^#\n]+\.md)(?:#([^@\n]+))? @ ([a-f0-9]{64})$',re.M)
 
 
 def safe_file(root, name):
     relative=PurePosixPath(name)
-    if relative.is_absolute() or '..' in relative.parts or any(c in name for c in (':','\\','\x00')):
+    if (relative.is_absolute() or '..' in relative.parts or
+        any(part in ('.git','.scrum','data','node_modules','Library') or part.startswith('.env') for part in relative.parts) or
+        any(c in name for c in (':','\\','\x00'))):
         return None
     path=root/relative
     if any(part.is_symlink() or getattr(part,'is_junction',lambda:False)()
@@ -49,7 +54,8 @@ def digest(value):
 
 
 def source_state(path):
-    return digest(path.read_bytes()) if path else None
+    try:return digest(path.read_bytes()) if path else None
+    except OSError:return None
 
 
 def inventory(root):
@@ -142,6 +148,107 @@ def load_state(root):
     except FileNotFoundError:return {}
 
 
+def source_manifest(root):
+    path=safe_file(root,MANIFEST.as_posix())
+    try:
+        data=json.loads(path.read_bytes()) if path else {}
+        return data if isinstance(data,dict) else {}
+    except (OSError,ValueError):return {}
+
+
+def write_manifest(root,data):
+    from scrum_cli import atomic
+    target=root/MANIFEST
+    if target.resolve()!=target:raise ValueError('Knowledge sources cannot be stored in a linked file')
+    atomic(target,data)
+
+
+def reassess(root, manifest):
+    current=inventory(root)
+    previous={item['path']:item for item in manifest.get('inventory',{}).get('sources',[])}
+    latest={item['path']:item for item in current['sources']}
+    changed=[{'path':path,'change':'added' if path not in previous else 'removed' if path not in latest else 'modified',
+              'pages':[(WIKI/'architecture.md').as_posix()]+([(WIKI/'checks.md').as_posix()] if path=='package.json' or path.startswith('.github/') else [])}
+             for path in sorted(previous.keys()|latest.keys()) if previous.get(path)!=latest.get(path)]
+    recorded=[]
+    for source in manifest.get('references',[]):
+        state=source_state(safe_file(root,source['path']))
+        if state!=source['sha256']:recorded.append({'path':source['path'],'page':source['page'],'change':'modified' if state else 'missing'})
+    old_labels={entry['label'] for entry in previous.values()}
+    capabilities=sorted({entry['label'] for entry in current['sources']}-old_labels-{'Project documentation','Repository instructions'})
+    return {'inventory':current,'changed':changed,'references_changed':recorded,'new_capabilities':capabilities,
+            'plan_id':digest(json.dumps([manifest,current],sort_keys=True).encode())}
+
+
+def knowledge_context(root, task):
+    root=Path(root).resolve()
+    if not safe_file(root,INDEX.as_posix()):return None
+    paths=task.get('files',[])
+    manifest=source_manifest(root)
+    proposed=proposal_topic(task)
+    topics=[]
+    for source in manifest.get('references',[]):
+        scope=source.get('scope') or [source['path']]
+        if any(path==parent or path.startswith(parent.rstrip('/')+'/') for path in paths for parent in scope):
+            page=source['page']
+            if safe_file(root,page) and page not in topics:topics.append(page)
+    if proposed and safe_file(root,proposed):topics.append(proposed)
+    spec=SPEC_LINE.search(task.get('description') or '')
+    if spec and safe_file(root,spec[1]):topics.insert(0,spec[1])
+    if not topics and safe_file(root,(WIKI/'architecture.md').as_posix()):topics.append((WIKI/'architecture.md').as_posix())
+    known={entry['path']:entry['sha256'] for entry in manifest.get('inventory',{}).get('sources',[])}
+    commands=[entry for entry in manifest.get('inventory',{}).get('commands',[])
+              if entry['command']=='npm run test' and
+              source_state(safe_file(root,entry['source']))==known.get(entry['source']) and known.get(entry['source']) and
+              any(path==entry['source'] or Path(path).suffix.lower() in ('.js','.ts','.jsx','.tsx') for path in paths)]
+    return {'index':INDEX.as_posix(),'pages':list(dict.fromkeys(topics))[:3],
+            **({'verification':commands[:1]} if commands else {})}
+
+
+def proposal_topic(task):
+    from wiki_knowledge import proposal_page
+    page=proposal_page({'files':task.get('files',[])})
+    return page.as_posix() if page else None
+
+
+def specification_revision(root, page, section):
+    page=wiki_path(page)
+    path=safe_file(Path(root).resolve(),page.as_posix())
+    if not path:raise ValueError('Specification page does not exist')
+    text=path.read_text(encoding='utf-8-sig')
+    if section:
+        headings=list(re.finditer(r'^(#{1,6})\s+([^\n]+)$',text,re.M))
+        slug=lambda heading:re.sub(r'[^\w -]','',heading.lower().strip()).replace(' ','-')
+        for index,heading in enumerate(headings):
+            if slug(heading[2])!=section:continue
+            following=next((item.start() for item in headings[index+1:] if len(item[1])<=len(heading[1])),len(text))
+            text=text[heading.start():following].rstrip()
+            break
+        else:raise ValueError('Specification section does not exist')
+    return digest(text.encode())
+
+
+def bind_specification(root, description, spec):
+    if not isinstance(spec,dict) or set(spec)-{'page','section'}:raise ValueError('Use a specification page and optional section')
+    page=spec.get('page')
+    section=spec.get('section','')
+    if not isinstance(section,str) or len(section)>100 or (section and not re.fullmatch(r'[\w-]+',section)):
+        raise ValueError('Use the Markdown heading anchor')
+    revision=specification_revision(root,page,section)
+    description=SPEC_LINE.sub('',description).rstrip()
+    return description+f'\n\nSpecification: {page}'+(f'#{section}' if section else '')+f' @ {revision}'
+
+
+def specification_status(root, description):
+    match=SPEC_LINE.search(description or '')
+    if not match:return None
+    page,section,expected=match.groups()
+    try:current=specification_revision(root,page,section)
+    except (ValueError,OSError,UnicodeError):current=None
+    return {'page':page,'section':section,'revision':expected,
+            'state':'missing' if not current else 'current' if current==expected else 'changed'}
+
+
 def write_wiki(root, path, body):
     folder=(root/path).parent
     if folder.resolve()!=folder or not folder.is_relative_to(root/WIKI):
@@ -210,17 +317,67 @@ def operation(db, row, prefix, args):
         path=safe_file(root,relative.as_posix())
         saved=load_state(root)
         return {'pages':pages,'page':name,'body':path.read_text(encoding='utf-8-sig') if path else None,
-                'onboarding':saved.get('phase'),
+                'onboarding':saved.get('phase') or ('applied' if source_manifest(root).get('onboarding') else None),
+                'sources':source_manifest(root).get('references',[]),
                 'proposals':pending_proposals(db,project,prefix,root,saved)}
+    if action=='source':
+        name=args.get('source','')
+        if not isinstance(name,str):raise ValueError('Supply a project source path')
+        sources=source_manifest(root)
+        allowed=set(SOURCES)|{source['path'] for source in sources.get('references',[])+sources.get('inventory',{}).get('sources',[])}
+        path=safe_file(root,name) if name in allowed else None
+        if not path:raise ValueError('Source is unavailable or has not been linked to the wiki')
+        return {'path':name,'body':path.read_text(encoding='utf-8-sig')}
+    if action=='reassess':return reassess(root,source_manifest(root))
     if action=='diagnose':return {'issues':diagnose(root)}
     if action=='status':
         saved=load_state(root)
+        if not saved.get('phase') and source_manifest(root).get('onboarding'):
+            return {'phase':'applied','plan':None}
         plan=saved.get('accepted') if saved.get('phase')=='applying' else (
             review_plan(root,row['name'],saved) if saved.get('inventory') and saved.get('phase')=='draft' else None)
         return {**saved,'questions':dict(QUESTIONS),'plan':plan}
     actor=actor_user(db,args)
     if actor['kind']!='human':raise ValueError('Only a human can change onboarding or review wiki proposals')
     saved=load_state(root)
+    if action in ('ingest','refresh'):
+        manifest=source_manifest(root)
+        if not safe_file(root,INDEX.as_posix()):raise ValueError('Set up the project wiki first')
+        if action=='ingest':
+            name=args.get('source','')
+            source=safe_file(root,name) if isinstance(name,str) else None
+            page=wiki_path(args.get('page'))
+            if not source or not safe_file(root,page.as_posix()):raise ValueError('Use an existing project source and wiki topic')
+            text=args.get('text','')
+            scope=args.get('scope',[])
+            if not isinstance(text,str) or len(text)>1000 or not isinstance(scope,list) or len(scope)>12 or any(
+                not isinstance(path,str) or not path or PurePosixPath(path).is_absolute() or '..' in PurePosixPath(path).parts or '\\' in path for path in scope
+            ):raise ValueError('Use a short note and up to twelve relative paths')
+            entry={'path':name,'page':page.as_posix(),'sha256':source_state(source),'note':text,'scope':scope}
+            refs=[item for item in manifest.get('references',[]) if (item['path'],item['page'])!=(name,page.as_posix())]
+            if len(refs)>=100:raise ValueError('Keep a maximum of 100 linked sources')
+            manifest['references']=refs+[entry]
+            write_manifest(root,manifest)
+            return entry
+        review=reassess(root,manifest)
+        if args.get('plan_id')!=review['plan_id']:raise ValueError('Review the current source changes before refreshing')
+        generated=draft(root,row['name'],review['inventory'],saved.get('answers',{}))
+        updated=[];retained=[]
+        db.execute('BEGIN IMMEDIATE')
+        if db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>?',(project,time.time())).fetchone():
+            raise ValueError('Finish or release active claims before refreshing the wiki')
+        for name in ((WIKI/'architecture.md').as_posix(),(WIKI/'checks.md').as_posix()):
+            path=safe_file(root,name)
+            expected=manifest.get('generated',{}).get(name)
+            if not path or not expected or source_state(path)!=expected:
+                retained.append(name)
+                continue
+            replace_page(path,generated[name])
+            manifest['generated'][name]=source_state(path)
+            updated.append(name)
+        if not retained:manifest['inventory']=review['inventory']
+        write_manifest(root,manifest)
+        return {'updated':updated,'retained_for_review':retained}
     if action in ('publish','dismiss'):
         item=next((item for item in pending_proposals(db,project,prefix,root,saved)
                    if item['proposal_id']==args.get('proposal_id')),None)
@@ -275,8 +432,14 @@ def operation(db, row, prefix, args):
         'key':'first-milestone','title':milestone[:120],'description':milestone+'\n\nProject goal: '+answers['goal']+
         ('\nConstraints: '+answers['constraints'] if answers.get('constraints') else '')+'\n\nProject context: docs/agents/project.md.',
         'acceptance_criteria':[answers['acceptance'][:500]],'scope_size':'Small',
+        **({'specification':{'page':'docs/agents/project.md','section':'first-milestone'}}
+           if plan['existing']['docs/agents/project.md'] is None else {}),
         'scope_reason':'One first milestone with a concrete acceptance check'}]},project)
     db.commit()
+    manifest=source_manifest(root)
+    manifest.update(onboarding=plan['plan_id'],inventory=plan['inventory'],
+                    generated={path:source_state(safe_file(root,path)) for path in plan['pages'] if plan['existing'][path] is None})
+    write_manifest(root,manifest)
     saved={**saved,'phase':'applied','plan_id':plan['plan_id'],'inventory':plan['inventory'],'answers':answers,'tasks':result['items']}
     saved.pop('accepted',None)
     atomic(root/STATE,saved)

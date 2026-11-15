@@ -18,7 +18,7 @@ def read_operation(name,args):
             or (name=='agent_interaction' and args.get('action','list') in ('list','get'))
             or (name=='task_attachment' and args.get('action','list') in ('list','get'))
             or (name=='task_review_findings' and args.get('action','list')=='list')
-            or (name=='project_knowledge' and args.get('action','view') in ('view','diagnose','status'))
+            or (name=='project_knowledge' and args.get('action','view') in ('view','diagnose','status','source','reassess'))
             or (name=='project_settings' and not set(args)-{'project','actor','measurement_session'}))
 
 
@@ -80,7 +80,7 @@ def invoke(name,args):
         task=args.get('id') if name.startswith('task_') or name in ('work_start','work_finish','file_locks') else None
         if name=='task_create':task=body.get('id')
         if name=='agent_interaction':task=args.get('task',body.get('task'))
-        try:overhead.record(args.get('project'),name,len(json.dumps(args,separators=(',',':')).encode()),len(json.dumps(redact(result) if error is None else {'error':type(error).__name__},separators=(',',':')).encode()),(time.perf_counter()-started)*1000,error is not None,session=body.get('measurement_session',args.get('measurement_session')),task=task,actor=body.get('actor',args.get('actor')),channel='cli')
+        try:overhead.record(args.get('project'),name,len(json.dumps(args,separators=(',',':')).encode()),len(json.dumps(redact(result) if error is None else {'error':type(error).__name__},separators=(',',':')).encode()),(time.perf_counter()-started)*1000,error is not None,session=body.get('measurement_session',args.get('measurement_session')),task=task,actor=body.get('actor',args.get('actor')),channel='cli',read_signature=overhead.task_read_signature(name,args,body))
         except Exception:pass
 
 

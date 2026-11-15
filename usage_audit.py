@@ -114,10 +114,12 @@ def audit(db,project,root,start=None,end=None,include_logs=False):
         'unchanged_verification_passes':v['repeat_passes'],
         'unchanged_verification_failures':v['repeat_failures'],
         'verification_limited':v['limited'],
-        'scope':'Recorded successful same-task reads in managed sessions and verification signatures in the selected interval. Read arguments are not recorded. Pagination, changed scope, and recovery may justify repeated reads.',
+        'scope':'Recorded successful same-task reads in managed sessions and verification signatures in the selected interval. Identical versioned reads match the requested page and returned version. Raw read arguments are not retained. Older same-task reads may include changed scope or pagination.',
     }
     if reads and reads['sessions_with_repeated_reads']>=2:
         result['recommendations'].append('Repeated task reads occurred in multiple managed sessions. Check whether the initial claim already supplied the requested fields.')
+    if reads and reads['identical_versioned_reads']:
+        result['recommendations'].append('Identical task pages were fetched for the same version. Review whether the worker can reuse the earlier result.')
     if v['repeat_passes']:result['recommendations'].append('Identical verification inputs passed more than once. Consider receipt reuse where the check and inputs are still valid.')
     if v['repeat_failures']:result['recommendations'].append('Repeated failures with identical recorded inputs: inspect environment and reuse diagnostics before another unchanged launch.')
     if any(any(t['category']=='Git recovery' for t in r['tasks']) for r in runs):result['recommendations'].append('Git recovery executions exist: inspect native checkout diagnostics before spending another model run.')

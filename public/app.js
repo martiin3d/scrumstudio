@@ -335,7 +335,7 @@ function renderWikiText(body,pagePath,pages){
       const link=wikiPath(pagePath,match[2]),label=esc(match[1]);
       if(link?.external)inline+='<a rel="noreferrer" href="'+esc(link.external)+'">'+label+'</a>';
       else if(link&&(pages.includes(link.path)||link.path==='docs/agents/index.md'))inline+='<button class="wiki-link" data-wiki-page="'+esc(link.path)+'" data-wiki-anchor="'+esc(link.anchor)+'">'+label+'</button>';
-      else if(link)inline+=label+' <code>'+esc(link.path)+'</code>';
+      else if(link)inline+='<button class="wiki-link" data-wiki-source="'+esc(link.path)+'">'+label+'</button>';
       else inline+=label;
       last=match.index+match[0].length;
     }
@@ -357,16 +357,47 @@ function renderWiki(){
   const pages=['docs/agents/index.md',...wiki.pages];
   $('#content').innerHTML=`<section class="wiki-layout"><div class="workflow wiki-nav"><h2>Pages</h2>
     ${pages.map(path=>`<button data-wiki-page="${esc(path)}" aria-current="${path===wiki.page?'page':'false'}">${esc(path.split('/').at(-1).replace(/\.md$/,'').replace(/-/g,' '))}</button>`).join('')}
-    <button id="wiki-check">Check links</button><p id="wiki-result" role="status"></p></div>
+    <button id="wiki-check">Check links</button><button id="wiki-reassess">Check sources</button><p id="wiki-result" role="status"></p></div>
     <article class="workflow wiki-body">${wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}
     ${wiki.onboarding!=='applied'?'<button id="wiki-onboarding">Project setup</button>':''}
-    <div id="wiki-onboard-content"></div></article></section>
+    <div id="wiki-onboard-content"></div><div id="wiki-source-content"></div>
+    ${wiki.page!=='docs/agents/index.md'?`<h3>Linked sources</h3>
+    ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}</p>`).join('')}
+    <button id="wiki-ingest">Link a source</button>`:''}</article></section>
     ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}`;
   $('#content').querySelectorAll('[data-wiki-page]').forEach(button=>button.onclick=async()=>{
     wikiPages.set(project,button.dataset.wikiPage);
     await refresh();
     if(button.dataset.wikiAnchor)document.getElementById('wiki-'+decodeURIComponent(button.dataset.wikiAnchor.slice(1)))?.scrollIntoView();
   });
+  $('#content').querySelectorAll('[data-wiki-source]').forEach(button=>button.onclick=async()=>{try{
+    const source=await api('project_knowledge',{project,action:'source',source:button.dataset.wikiSource});
+    $('#wiki-source-content').innerHTML='<h3>'+esc(source.path)+'</h3><pre>'+esc(source.body)+'</pre>';
+    $('#wiki-source-content').scrollIntoView();
+  }catch(e){error(e);}});
+  const ingest=$('#wiki-ingest');
+  if(ingest)ingest.onclick=()=>modal('Link a project source',field('Repository-relative file','source','','required')+
+    field('What does this source explain?','text','','textarea')+field('Related paths, comma-separated','scope',''),
+    async form=>{
+      await api('project_knowledge',{project,actor,action:'ingest',page:wiki.page,source:form.get('source'),
+        text:form.get('text'),scope:String(form.get('scope')).split(',').map(path=>path.trim()).filter(Boolean)});
+      await refresh();
+    },'Link source');
+  $('#wiki-reassess').onclick=async()=>{try{
+    const review=await api('project_knowledge',{project,action:'reassess'});
+    const changed=[...review.changed,...review.references_changed];
+    $('#wiki-source-content').innerHTML='<h3>Source changes</h3>'+
+      (changed.length?'<ul>'+changed.map(item=>'<li>'+esc(item.path)+' · '+esc(item.change)+'</li>').join('')+'</ul>':'<p>No source changes recorded.</p>')+
+      (review.new_capabilities.length?'<p>New stack signals: '+esc(review.new_capabilities.join(', '))+'</p>':'')+
+      (review.changed.length?'<button id="wiki-refresh-sources">Refresh generated pages</button>':'');
+    const apply=$('#wiki-refresh-sources');
+    if(apply)apply.onclick=async()=>{try{
+      const done=await api('project_knowledge',{project,actor,action:'refresh',plan_id:review.plan_id});
+      await refresh();
+      $('#wiki-result').textContent=done.updated.length+' pages refreshed'+
+        (done.retained_for_review.length?' · Review retained pages: '+done.retained_for_review.join(', '):'');
+    }catch(e){error(e);}};
+  }catch(e){error(e);}};
   $('#content').querySelectorAll('[data-wiki-task]').forEach(button=>button.onclick=()=>openTask({id:Number(button.dataset.wikiTask)}).catch(error));
   for(const item of wiki.proposals){
     const update=async action=>{try{

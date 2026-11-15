@@ -25,6 +25,10 @@ def connection(project):
         try:db.execute("ALTER TABLE timed_calls ADD COLUMN channel TEXT NOT NULL DEFAULT 'mcp'")
         except sqlite3.OperationalError:
             if 'channel' not in {r[1] for r in db.execute('PRAGMA table_info(timed_calls)')}:raise
+    if 'read_signature' not in {r[1] for r in db.execute('PRAGMA table_info(timed_calls)')}:
+        try:db.execute("ALTER TABLE timed_calls ADD COLUMN read_signature TEXT")
+        except sqlite3.OperationalError:
+            if 'read_signature' not in {r[1] for r in db.execute('PRAGMA table_info(timed_calls)')}:raise
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_at ON timed_calls(at)')
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_session ON timed_calls(session)')
     db.execute('CREATE TABLE IF NOT EXISTS startup(run_id TEXT PRIMARY KEY,actor INTEGER,at REAL,client TEXT,model TEXT,session TEXT,tasks TEXT,prompt_bytes INTEGER,sections TEXT)')
@@ -72,10 +76,22 @@ def claim_read_repetitions(project,start=None,end=None):
                 GROUP BY c.session,c.task
             """,params).fetchall()
             repeated=[row for row in rows if row['reads']>1]
+            fingerprints=db.execute("""
+                SELECT c.session,c.task,c.read_signature,SUM(c.calls) AS reads
+                FROM timed_calls c
+                WHERE c.channel IN ('cli','mcp') AND c.tool='task_get' AND c.errors=0 AND c.task>0
+                  AND c.read_signature IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM startup s, json_each(s.tasks) task
+                              WHERE s.session=c.session AND s.at<=c.at AND task.value=c.task)
+                """+window+"""
+                GROUP BY c.session,c.task,c.read_signature
+            """,params).fetchall()
             return {
                 'sessions_with_reads':len({row['session'] for row in rows}),
                 'sessions_with_repeated_reads':len({row['session'] for row in repeated}),
                 'repeated_reads':sum(row['reads']-1 for row in repeated),
+                'versioned_reads':sum(row['reads'] for row in fingerprints),
+                'identical_versioned_reads':sum(row['reads']-1 for row in fingerprints),
             }
     except (OSError,ValueError,sqlite3.Error):
         return None
@@ -96,7 +112,16 @@ def start_session(project,actor,mode,existing=None):
         db.close()
 
 
-def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, session=None, task=None, actor=None, channel='mcp'):
+def task_read_signature(operation, args, body):
+    import hashlib
+    if operation!='task_get' or not body.get('version') or body.get('changed') is False:return None
+    fields=('id','version_seen','full','include_cost','include_notes','notes_content','files_after','files_limit',
+            'inputs_after','inputs_limit','decision_files','decisions_after','decisions_limit')
+    shape={key:args[key] for key in fields if key in args}
+    return hashlib.sha256(json.dumps([shape,body['version']],sort_keys=True).encode()).hexdigest()[:24]
+
+
+def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, session=None, task=None, actor=None, channel='mcp', read_signature=None):
     if project is None:
         return
     if channel not in ('mcp','cli','supervisor'):return
@@ -109,7 +134,7 @@ def record(project, tool, request_bytes, response_bytes, elapsed_ms, failed, ses
                 session=session if row and (actor is None or row['actor']==actor) else ''
                 task=task if type(task) is int and task>0 else 0
                 db.execute('INSERT INTO scoped VALUES(?,?,?,1,?,?,?,?) ON CONFLICT(session,task,tool) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,request_bytes=request_bytes+excluded.request_bytes,response_bytes=response_bytes+excluded.response_bytes,elapsed_ms=elapsed_ms+excluded.elapsed_ms',(session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms))
-                db.execute('INSERT INTO timed_calls(at,session,task,tool,calls,errors,request_bytes,response_bytes,elapsed_ms,channel) VALUES(?,?,?,?,1,?,?,?,?,?)',(time.time(),session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms,channel))
+                db.execute('INSERT INTO timed_calls(at,session,task,tool,calls,errors,request_bytes,response_bytes,elapsed_ms,channel,read_signature) VALUES(?,?,?,?,1,?,?,?,?,?,?)',(time.time(),session,task,tool,int(failed),request_bytes,response_bytes,elapsed_ms,channel,read_signature))
         finally:
             db.close()
     except (OSError, ValueError, sqlite3.Error):

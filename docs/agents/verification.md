@@ -36,6 +36,12 @@ Choose **Add project** in Scrum Studio to scan its folder and preview proposed p
 
 In **Wiki → Proposed updates**, open the source task to inspect its evidence. Edit the draft before applying it to the working folder, or dismiss it. Publish the reviewed files through the usual Git flow.
 
+Use **Link a source** to associate an existing repository file with a topic and optional code paths. The source stays in place. **Check sources** compares observed hashes with the versioned `docs/agents/sources.json` and shows affected pages. Refresh updates generated pages that still match their recorded hashes. Review edited pages in place.
+
+A `task_plan` item can include `"specification": {"page": "docs/agents/project.md", "section": "first-milestone"}`. The task records the section and its revision. A changed section is flagged in the claim along with relevant wiki links. When a continuation has a local checkpoint, the claim also identifies observed changes to the checkout, evidence or planned files. Local checkpoints live in the checkout. The wiki, source records and task specification references can travel with the project.
+
+The usage audit distinguishes identical versioned task reads from older same-task counts. It records signatures of the requested page and returned version, without keeping request contents.
+
 Run `python scripts/wiki_doctor.py` to find broken local links, missing Markdown anchors, topic pages absent from the index, and unresolved local Git references. Use the `git:REVISION` destination in a Markdown link when a local commit reference should be checked. The verifier also runs the doctor for changes under this wiki or to `AGENTS.md`.
 
 When finishing a task with a durable decision or a reusable procedure proven by its evidence, use the existing `decisions` field. The optional `wiki_page` names an existing topic such as `docs/agents/git.md`. Scrum can infer a single topic from recognized source files when the page is omitted. Read the drafts with `python scrum.py call project_wiki_proposals --project PATH`. To find the full source task and evidence, use `python scrum.py show --project PATH --task CODE` with the proposal's `source_code`.

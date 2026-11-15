@@ -194,6 +194,8 @@ def handoff(db, project, actor, why, text, now, activity):
         import context_tools
         current=task_dict(db.execute('SELECT * FROM tasks WHERE id=?',(task['id'],)).fetchone(),'')
         db.execute('UPDATE tasks SET continuity=?,continuity_basis=? WHERE id=?',(continuity,context_tools.basis(current),task['id']))
+        if root:
+            context_tools.checkpoint_workspace(root,git_worktrees.inspection_root(root,git_worktrees.identity(task)),current)
         activity(db,task['id'],actor,'comment','Paused: '+why+'. Resume from task continuity and recorded evidence.')
     if tasks:
         db.execute('INSERT INTO project_messages(project,actor,text,created) VALUES(?,?,?,?)',(project,actor,('Paused: '+why+'. Resume task continuity: '+', '.join(str(t['number']) for t in tasks))[:2000],stamp))

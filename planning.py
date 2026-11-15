@@ -42,7 +42,7 @@ def _apply(db,a,project):
     items=a.get('items')
     if not isinstance(items,list) or not 1<=len(items)<=10:
         raise ValueError('Plan needs 1..10 concrete outcomes')
-    allowed={'id','key','title','description','acceptance_criteria','priority','category','files','dependencies','scope_size','scope_reason','model_tier','model_reason','verification_level','verification_reason','context_group','status'}
+    allowed={'id','key','title','description','acceptance_criteria','priority','category','files','dependencies','scope_size','scope_reason','model_tier','model_reason','verification_level','verification_reason','context_group','status','specification'}
     prepared=[];keys={};existing=set()
     for item in items:
         if not isinstance(item,dict) or set(item)-allowed:
@@ -72,6 +72,11 @@ def _apply(db,a,project):
         if not old and initial not in ('TODO','Backlog'):raise ValueError('New tasks start in TODO or Backlog')
         if initial=='Backlog' and actor['kind']!='human':raise ValueError('Only a human can plan tasks in Backlog')
         description=required(item.get('description'),'description',12000)
+        if 'specification' in item:
+            from project_knowledge import bind_specification
+            workspace=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]
+            if not workspace:raise ValueError('A specification needs a project workspace')
+            description=required(bind_specification(workspace,description,item['specification']),'description',12000)
         criteria=acceptance_criteria(item.get('acceptance_criteria'))
         size=item.get('scope_size',old['scope_size'] if old else 'Unknown')
         reason=item.get('scope_reason',old['scope_reason'] if old else '')

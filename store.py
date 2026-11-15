@@ -512,7 +512,7 @@ def legacy_run(action, a, path=None, locks=None):
         prefix = project_prefix(project_row['name'])
         if action=='project_knowledge':
             import project_knowledge
-            if a.get('action','view') in ('view','diagnose','status'):
+            if a.get('action','view') in ('view','diagnose','status','source','reassess'):
                 return project_knowledge.operation(db,project_row,prefix,a)
             if not project_row['workspace_root']:raise ValueError('Project workspace is unavailable')
             return project_knowledge.serialize(Path(project_row['workspace_root']),
@@ -668,6 +668,16 @@ def legacy_run(action, a, path=None, locks=None):
                     if inputs:
                         task['preserved_inputs']=inputs
                         task['version']=context_tools.digest(task)
+                    import project_knowledge
+                    root=project_row['workspace_root']
+                    if root:
+                        workspace=git_worktrees.workspace(root,git_worktrees.identity(row))
+                        knowledge=project_knowledge.knowledge_context(workspace,task)
+                        spec=project_knowledge.specification_status(workspace,task['description'])
+                        delta=context_tools.workspace_delta(root,workspace,task)
+                        for key,value in (('knowledge',knowledge),('specification',spec),('workspace_delta',delta)):
+                            if value:task[key]=value
+                        if knowledge or spec or delta:task['version']=context_tools.digest(task)
                 import task_decisions
                 relevant=task_decisions.context(db,project,task,prefix,a)
                 if project_row['git_merge']=='PR' and task['status'] in ('In Review','Done'):
@@ -1043,6 +1053,9 @@ def legacy_run(action, a, path=None, locks=None):
                 import context_tools
                 db.execute('UPDATE tasks SET continuity=?,continuity_basis=? WHERE id=?',(t['continuity'],context_tools.basis(t),t['id']))
                 activity(db,t['id'],a['actor'],'work','Continuity summary updated: '+t['continuity'] if t['continuity'] else 'Continuity summary cleared.')
+                root=project_row['workspace_root']
+                if root and t['continuity']:
+                    context_tools.checkpoint_workspace(root,git_worktrees.workspace(root,git_worktrees.identity(old)),t)
             state_change=telemetry.transition(db,t['id'],t['status'],a.get('actor'))
             if until>time.time():
                 coord.renew_files(db,t['id'],token,until)

@@ -56,3 +56,43 @@ class ProjectKnowledgeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'sources changed'):
             self.knowledge(project,'apply',plan_id=plan['plan_id'])
         self.assertFalse((root/'docs').exists())
+
+    def test_source_scope_and_spec_revision_reach_the_task(self):
+        from context_tools import startup_task
+        project,root=self.project()
+        (root/'package.json').write_text('{"scripts":{"test":"node --test"}}')
+        plan=self.knowledge(project,'prepare',answers=dict(goal='Goal',milestone='Outcome',acceptance='Observed check'))['plan']
+        self.knowledge(project,'apply',plan_id=plan['plan_id'])
+        (root/'design.md').write_text('Design source\n')
+        (root/'code.js').write_text('first\n')
+        page='docs/agents/project.md'
+        self.knowledge(project,'ingest',source='design.md',page=page,text='Product decisions',scope=['code.js'])
+        task=run('task_plan',dict(project=project,actor=self.human,items=[dict(key='candidate',title='Use specification',
+                 description='Follow the first milestone',acceptance_criteria=['Verification'],files=['code.js'],
+                 specification=dict(page=page,section='first-milestone'))]))['items'][0]
+        lookup=dict(project=project,id=task['id'])
+        claim=startup_task(run('task_get',lookup))
+        self.assertEqual(claim['specification']['state'],'current')
+        self.assertIn(page,claim['knowledge']['pages'])
+        self.assertEqual(claim['knowledge']['verification'][0]['command'],'npm run test')
+        run('task_update',dict(lookup,actor=self.human,continuity='Reuse the previous verified result'))
+        (root/'code.js').write_text('second\n')
+        self.assertEqual(run('task_get',lookup)['workspace_delta']['changed_paths'],['code.js'])
+        spec=root/page
+        spec.write_text(spec.read_text(encoding='utf-8').replace('Outcome','Changed outcome'),encoding='utf-8')
+        self.assertEqual(run('task_get',lookup)['specification']['state'],'changed')
+        (root/'design.md').write_text('Changed design\n')
+        (root/'package.json').write_text('{}')
+        changes=self.knowledge(project,'reassess')
+        self.assertEqual(changes['references_changed'][0]['page'],page)
+        self.assertNotIn('verification',run('task_get',lookup)['knowledge'])
+        refreshed=self.knowledge(project,'refresh',plan_id=changes['plan_id'])
+        self.assertIn('docs/agents/checks.md',refreshed['updated'])
+
+    def test_read_signatures_distinguish_pagination_and_revision_changes(self):
+        from overhead import task_read_signature
+        def signature(version, **args):
+            return task_read_signature('task_get',dict(id=1,**args),{'version':version})
+        self.assertEqual(signature('current'),signature('current'))
+        self.assertNotEqual(signature('current'),signature('current',files_after=20))
+        self.assertNotEqual(signature('current'),signature('new'))
