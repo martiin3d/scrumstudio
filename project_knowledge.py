@@ -25,6 +25,12 @@ QUESTIONS = (
     ('acceptance', 'What would demonstrate that this outcome works?'),
     ('constraints', 'Which constraints or existing decisions should the work respect?'),
 )
+CAPABILITY_GUIDANCE = {
+    'CI':'Link the existing workflow to the verification topic and reuse it for affected tasks.',
+    'Unity':'Confirm the editor version and record the Edit Mode or Play Mode check for the first outcome.',
+    'Node.js':'Confirm which manifest scripts exercise the first outcome.',
+    'Python':'Confirm the environment and test entry point before recording a verification command.',
+}
 STATE = Path('.scrum/local/knowledge-onboarding.json')
 MANIFEST = WIKI/'sources.json'
 MAX_FILE = 128 * 1024
@@ -120,7 +126,25 @@ def answers_from(value):
         raise ValueError('Supply the onboarding answers by question key')
     if any(not isinstance(text,str) or len(text)>1000 for text in value.values()):
         raise ValueError('Each onboarding answer must be at most 1000 characters')
+    if len(value.get('acceptance',''))>500:
+        raise ValueError('Keep the first acceptance check within 500 characters')
     return {key:text.strip() for key,text in value.items()}
+
+
+def questions_for(report):
+    questions=dict(QUESTIONS)
+    if report.get('kind')!='existing':return questions
+    sources=report.get('sources',[])
+    labels=list(dict.fromkeys(item['label'] for item in sources
+                              if item['label'] not in ('Project documentation','Repository instructions')))[:4]
+    if labels:
+        questions['milestone']='Detected '+', '.join(labels)+'. Which existing flow or new behavior should the first milestone deliver?'
+    commands=[item['command'] for item in report.get('commands',[]) if item['command'] in ('npm run test','npm run build')]
+    if commands:
+        questions['acceptance']='The manifest defines '+', '.join(commands)+'. What result or additional check proves the first milestone?'
+    if any(item['path']=='AGENTS.md' for item in sources):
+        questions['constraints']='Repository instructions were found. Are there additional constraints or project decisions to record?'
+    return questions
 
 
 def review_plan(root, name, saved):
@@ -175,8 +199,13 @@ def reassess(root, manifest):
         state=source_state(safe_file(root,source['path']))
         if state!=source['sha256']:recorded.append({'path':source['path'],'page':source['page'],'change':'modified' if state else 'missing'})
     old_labels={entry['label'] for entry in previous.values()}
-    capabilities=sorted({entry['label'] for entry in current['sources']}-old_labels-{'Project documentation','Repository instructions'})
+    observed={entry['label'] for entry in current['sources']}-{'Project documentation','Repository instructions'}
+    choices=manifest.get('capability_decisions',{})
+    capabilities=sorted(observed-old_labels)
     return {'inventory':current,'changed':changed,'references_changed':recorded,'new_capabilities':capabilities,
+            'capability_suggestions':[{'key':key,'reason':CAPABILITY_GUIDANCE.get(key,'Confirm the component and its project-specific verification before using it in a claim.')}
+                                      for key in sorted(observed) if key not in choices],
+            'capability_decisions':choices,
             'plan_id':digest(json.dumps([manifest,current],sort_keys=True).encode())}
 
 
@@ -336,10 +365,22 @@ def operation(db, row, prefix, args):
             return {'phase':'applied','plan':None}
         plan=saved.get('accepted') if saved.get('phase')=='applying' else (
             review_plan(root,row['name'],saved) if saved.get('inventory') and saved.get('phase')=='draft' else None)
-        return {**saved,'questions':dict(QUESTIONS),'plan':plan}
+        return {**saved,'questions':questions_for(saved.get('inventory',{})),'plan':plan}
     actor=actor_user(db,args)
     if actor['kind']!='human':raise ValueError('Only a human can change onboarding or review wiki proposals')
     saved=load_state(root)
+    if action=='capability':
+        if not safe_file(root,INDEX.as_posix()):raise ValueError('Set up the project wiki first')
+        manifest=source_manifest(root)
+        review=reassess(root,manifest)
+        if args.get('plan_id')!=review['plan_id']:raise ValueError('Review the current capability suggestions')
+        key=args.get('capability')
+        decision=args.get('decision')
+        if decision not in ('accepted','deferred') or key not in {item['key'] for item in review['capability_suggestions']}:
+            raise ValueError('Choose an available capability and decide to accept or defer it')
+        manifest.setdefault('capability_decisions',{})[key]=decision
+        write_manifest(root,manifest)
+        return {'capability':key,'decision':decision}
     if action in ('ingest','refresh'):
         manifest=source_manifest(root)
         if not safe_file(root,INDEX.as_posix()):raise ValueError('Set up the project wiki first')
@@ -398,10 +439,11 @@ def operation(db, row, prefix, args):
         replace_page(path,text.rstrip()+'\n\n'+(marker+'\n\n' if marker not in body else '')+body.strip()+'\n')
         return {'published':True,'page':item['page']}
     if action=='prepare':
-        if saved.get('phase') in ('applying','applied'):raise ValueError('This project already has an accepted onboarding plan')
+        if saved.get('phase') in ('applying','applied') or source_manifest(root).get('onboarding'):
+            raise ValueError('This project already has an accepted onboarding plan')
         saved={**saved,'phase':'draft','inventory':inventory(root),'answers':answers_from(args.get('answers',saved.get('answers',{})))}
         atomic(root/STATE,saved)
-        return {'phase':'draft','questions':dict(QUESTIONS),'plan':review_plan(root,row['name'],saved)}
+        return {'phase':'draft','questions':questions_for(saved['inventory']),'plan':review_plan(root,row['name'],saved)}
     if action!='apply':raise ValueError('Unknown project knowledge action')
     if saved.get('phase')=='applied':
         if args.get('plan_id')!=saved['plan_id']:raise ValueError('This project already has an accepted onboarding plan')
@@ -431,7 +473,7 @@ def operation(db, row, prefix, args):
     result=apply_tasks(db,{'project':project,'actor':actor['id'],'items':[{
         'key':'first-milestone','title':milestone[:120],'description':milestone+'\n\nProject goal: '+answers['goal']+
         ('\nConstraints: '+answers['constraints'] if answers.get('constraints') else '')+'\n\nProject context: docs/agents/project.md.',
-        'acceptance_criteria':[answers['acceptance'][:500]],'scope_size':'Small',
+        'acceptance_criteria':[answers['acceptance']],'scope_size':'Small',
         **({'specification':{'page':'docs/agents/project.md','section':'first-milestone'}}
            if plan['existing']['docs/agents/project.md'] is None else {}),
         'scope_reason':'One first milestone with a concrete acceptance check'}]},project)

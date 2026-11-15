@@ -10,6 +10,7 @@ class ProjectKnowledgeTest(unittest.TestCase):
     setUp=StorageTest.setUp
     tearDown=StorageTest.tearDown
     project=StorageTest.project
+    clone=StorageTest.clone
 
     def knowledge(self, project, action, **args):
         return run('project_knowledge',dict(project=project,actor=self.human,action=action,**args))
@@ -96,3 +97,24 @@ class ProjectKnowledgeTest(unittest.TestCase):
         self.assertEqual(signature('current'),signature('current'))
         self.assertNotEqual(signature('current'),signature('current',files_after=20))
         self.assertNotEqual(signature('current'),signature('new'))
+
+    def test_evidence_questions_and_capability_choices_survive_project_import(self):
+        import shutil
+
+        project,root=self.project()
+        (root/'package.json').write_text('{"scripts":{"test":"node --test"}}')
+        prepared=self.knowledge(project,'prepare',answers=dict(goal='Goal',milestone='Milestone',acceptance='Tests pass'))
+        self.assertIn('Node.js',prepared['questions']['milestone'])
+        self.assertIn('npm run test',prepared['questions']['acceptance'])
+        result=self.knowledge(project,'apply',plan_id=prepared['plan']['plan_id'])
+        review=self.knowledge(project,'reassess')
+        self.knowledge(project,'capability',plan_id=review['plan_id'],capability='Node.js',decision='deferred')
+        self.assertEqual(self.knowledge(project,'reassess')['capability_suggestions'],[])
+        run('project_export',dict(project=project))
+        opened,clone_root=self.clone(root)
+        shutil.copytree(root/'docs',clone_root/'docs')
+        other=opened['id']
+        self.assertEqual(self.knowledge(other,'status')['phase'],'applied')
+        self.assertEqual(self.knowledge(other,'reassess')['capability_decisions'],{'Node.js':'deferred'})
+        task=run('task_get',dict(project=other,code=result['tasks'][0]['code']))
+        self.assertEqual(task['specification']['state'],'current')

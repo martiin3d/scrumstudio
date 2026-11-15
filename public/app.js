@@ -389,7 +389,15 @@ function renderWiki(){
     $('#wiki-source-content').innerHTML='<h3>Source changes</h3>'+
       (changed.length?'<ul>'+changed.map(item=>'<li>'+esc(item.path)+' · '+esc(item.change)+'</li>').join('')+'</ul>':'<p>No source changes recorded.</p>')+
       (review.new_capabilities.length?'<p>New stack signals: '+esc(review.new_capabilities.join(', '))+'</p>':'')+
-      (review.changed.length?'<button id="wiki-refresh-sources">Refresh generated pages</button>':'');
+      (review.changed.length?'<button id="wiki-refresh-sources">Refresh generated pages</button>':'')+
+      review.capability_suggestions.map((suggestion,index)=>'<section><h4>'+esc(suggestion.key)+'</h4><p>'+esc(suggestion.reason)+'</p>'+
+        '<button data-capability="'+index+'" data-choice="accepted">Accept</button> <button data-capability="'+index+'" data-choice="deferred">Defer</button></section>').join('')+
+      Object.entries(review.capability_decisions).map(([key,choice])=>'<p>'+esc(key)+' · '+esc(choice)+'</p>').join('');
+    $('#wiki-source-content').querySelectorAll('[data-capability]').forEach(button=>button.onclick=async()=>{try{
+      const suggestion=review.capability_suggestions[Number(button.dataset.capability)];
+      await api('project_knowledge',{project,actor,action:'capability',plan_id:review.plan_id,capability:suggestion.key,decision:button.dataset.choice});
+      $('#wiki-reassess').click();
+    }catch(e){error(e);}});
     const apply=$('#wiki-refresh-sources');
     if(apply)apply.onclick=async()=>{try{
       const done=await api('project_knowledge',{project,actor,action:'refresh',plan_id:review.plan_id});
@@ -427,7 +435,7 @@ async function loadOnboarding(prepare=false){
   const {plan}=data;
   $('#wiki-onboard-content').innerHTML=`<section class="wiki-onboard"><h2>Project setup</h2><p>${plan.inventory.kind==='empty'?'Empty folder':'Existing project'} · ${plan.inventory.sources.length} observed sources</p>
     <details open><summary>Wiki preview</summary>${Object.entries(plan.pages).map(([path,body])=>`<details><summary>${esc(path)} · ${plan.existing[path]?'existing page retained':'new page'}</summary><pre>${esc(body)}</pre></details>`).join('')}</details>
-    <form id="wiki-onboard-answers">${Object.entries(data.questions).map(([key,label])=>`<label class="field">${esc(label)}<textarea name="${esc(key)}" maxlength="1000" ${data.phase==='applying'?'readonly':''}>${esc(plan.answers[key]||'')}</textarea></label>`).join('')}
+    <form id="wiki-onboard-answers">${Object.entries(data.questions).map(([key,label])=>`<label class="field">${esc(label)}<textarea name="${esc(key)}" maxlength="${key==='acceptance'?500:1000}" ${data.phase==='applying'?'readonly':''}>${esc(plan.answers[key]||'')}</textarea></label>`).join('')}
     ${data.phase==='applying'?'':'<button type="submit">Save answers and preview</button>'} <button type="button" class="primary" id="wiki-apply" ${plan.ready?'':'disabled'}>${data.phase==='applying'?'Resume application':'Apply plan'}</button></form><p id="wiki-setup-result" role="status"></p></section>`;
   const form=$('#wiki-onboard-answers');
   form.oninput=()=>{$('#wiki-apply').disabled=true;};
