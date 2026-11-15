@@ -14,6 +14,14 @@ Run the usage audit on demand:
 
 `startup_samples` includes UTF-8 prompt bytes, section sizes for native CLI runs, recorded coordination calls and available provider counters. Compare equivalent work with the same client, model, acceptance and outcome. Check uncached input and calls alongside total input. A smaller initial prompt alone does not measure full-session savings.
 
+## Worker behavior evaluation
+
+Run `python scripts/eval_worker.py --cases` for the new claim, resume and Git recovery scenarios. Use a disposable copy of the same starting fixture for each trial. Run the baseline and candidate with the same model, client and tool configuration, changing only the rules under evaluation. Use the normal Scrum supervisor and quota policy for model runs.
+
+Save each variant as a JSON array. Each trial records `case`, `replicate` (a positive integer), `client`, `model`, `fixture_sha256`, `checks`, `calls` and optional `usage`. Record a boolean for each published check from observed files, verification receipts and task state. Provide the complete tool call list using normalized labels. Use the published redundant labels only when the trace shows the exact condition, for example `show_same_scope` for refetching a scope already supplied in the claim. Copy native provider counters into `usage` when available.
+
+Compare with `python scripts/eval_worker.py --baseline BEFORE.json --candidate AFTER.json`. The report includes per-pair results and calculates cost deltas only for pairs that pass both variants. Missing counters remain unknown.
+
 ## Installation diagnosis
 
 Run `python scripts/setup.py --doctor --client both` to inspect bundled skill drift, duplicate hooks and effective MCP selection. The plan lists the files it would change and shows hashes. Apply that exact plan with `--apply-repair PLAN_ID --client both`. Restore its verified backup with `--restore-repair BACKUP_ID`. MCP selections are reported so they can be corrected through the project's normal settings.
