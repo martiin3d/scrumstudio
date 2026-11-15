@@ -187,6 +187,92 @@ def write_manifest(root,data):
     atomic(target,data)
 
 
+GENERATED_HEADINGS = {
+    (WIKI/'architecture.md').as_posix(): ('Observed sources', 'Top-level entries'),
+    (WIKI/'checks.md').as_posix(): ('Detected commands',),
+}
+
+
+def section_spans(body):
+    headings=[]
+    fence=None
+    for marker in re.finditer(r'^(?:(#{1,6})[ \t]+([^\r\n]+)| {0,3}(`{3,}|~{3,})([^\r\n]*))',body,re.M):
+        delimiter=marker[3]
+        if delimiter:
+            if not fence:
+                fence=delimiter
+            elif delimiter.startswith(fence) and not marker[4].strip():
+                fence=None
+        elif not fence:
+            headings.append(marker)
+    sections={}
+    for i,heading in enumerate(headings):
+        if heading[1]!='##':continue
+        title=heading[2].strip()
+        end=next((other.start() for other in headings[i+1:] if len(other[1])<=2),len(body))
+        end=heading.start()+len(body[heading.start():end].rstrip('\r\n'))
+        sections[title]=None if title in sections else (heading.start(),end)
+    return sections
+
+
+def section_inputs(title, report):
+    if title=='Top-level entries':
+        return {'entries':report['entries']}
+    return {item['path']:item['sha256'] for item in report['sources']
+            if title=='Observed sources' or item['path']=='package.json'}
+
+
+def generated_sections(body, titles, report):
+    spans=section_spans(body)
+    sections={}
+    for title in titles:
+        if not spans.get(title):continue
+        start,end=spans[title]
+        sections[title]={'sha256':digest(body[start:end].replace('\r\n','\n').encode()),
+                         'inputs':section_inputs(title,report)}
+    return sections
+
+
+def section_provenance(root, manifest):
+    recorded=dict(manifest.get('generated_sections',{}))
+    previous=manifest.get('inventory')
+    if not previous:return recorded
+    legacy=draft(root,'',previous,{})
+    for page,titles in GENERATED_HEADINGS.items():
+        original=legacy[page]
+        if page not in recorded and manifest.get('generated',{}).get(page)==digest(original.encode()):
+            recorded[page]=generated_sections(original,titles,previous)
+    return recorded
+
+
+def section_refresh(root, manifest, current):
+    recorded=section_provenance(root,manifest)
+    generated=draft(root,'',current,{})
+    proposals=[]
+    for page in GENERATED_HEADINGS:
+        old=recorded.get(page)
+        if not old:continue
+        path=safe_file(root,page)
+        raw=path.read_bytes() if path else b''
+        try:body=raw.decode('utf-8')
+        except UnicodeDecodeError:body=''
+        spans=section_spans(body)
+        wanted=generated_sections(generated[page],GENERATED_HEADINGS[page],current)
+        draft_spans=section_spans(generated[page])
+        for title,prior in old.items():
+            candidate=wanted.get(title)
+            if candidate==prior:continue
+            span=spans.get(title)
+            current_text=body[slice(*span)] if span else ''
+            observed=digest(current_text.replace('\r\n','\n').encode())
+            replacement=generated[page][slice(*draft_spans[title])] if candidate else ''
+            proposals.append({'page':page,'section':title,'before':current_text,'after':replacement,
+                              'page_sha256':digest(raw) if path else None,'prior':prior,'next':candidate,
+                              'applicable':bool(span and (observed==prior['sha256'] or
+                                                         (candidate and observed==candidate['sha256'])))})
+    return proposals
+
+
 def reassess(root, manifest):
     current=inventory(root)
     previous={item['path']:item for item in manifest.get('inventory',{}).get('sources',[])}
@@ -195,18 +281,22 @@ def reassess(root, manifest):
               'pages':[(WIKI/'architecture.md').as_posix()]+([(WIKI/'checks.md').as_posix()] if path=='package.json' or path.startswith('.github/') else [])}
              for path in sorted(previous.keys()|latest.keys()) if previous.get(path)!=latest.get(path)]
     recorded=[]
+    observed_references=[]
     for source in manifest.get('references',[]):
         state=source_state(safe_file(root,source['path']))
+        observed_references.append(state)
         if state!=source['sha256']:recorded.append({'path':source['path'],'page':source['page'],'change':'modified' if state else 'missing'})
     old_labels={entry['label'] for entry in previous.values()}
     observed={entry['label'] for entry in current['sources']}-{'Project documentation','Repository instructions'}
     choices=manifest.get('capability_decisions',{})
     capabilities=sorted(observed-old_labels)
+    sections=section_refresh(root,manifest,current)
     return {'inventory':current,'changed':changed,'references_changed':recorded,'new_capabilities':capabilities,
+            'sections':sections,
             'capability_suggestions':[{'key':key,'reason':CAPABILITY_GUIDANCE.get(key,'Confirm the component and its project-specific verification before using it in a claim.')}
                                       for key in sorted(observed) if key not in choices],
             'capability_decisions':choices,
-            'plan_id':digest(json.dumps([manifest,current],sort_keys=True).encode())}
+            'plan_id':digest(json.dumps([manifest,current,observed_references,sections],sort_keys=True).encode())}
 
 
 def knowledge_context(root, task):
@@ -402,21 +492,41 @@ def operation(db, row, prefix, args):
             return entry
         review=reassess(root,manifest)
         if args.get('plan_id')!=review['plan_id']:raise ValueError('Review the current source changes before refreshing')
-        generated=draft(root,row['name'],review['inventory'],saved.get('answers',{}))
-        updated=[];retained=[]
         db.execute('BEGIN IMMEDIATE')
         if db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>?',(project,time.time())).fetchone():
             raise ValueError('Finish or release active claims before refreshing the wiki')
-        for name in ((WIKI/'architecture.md').as_posix(),(WIKI/'checks.md').as_posix()):
+        if reassess(root,source_manifest(root))['plan_id']!=review['plan_id']:
+            raise ValueError('Sources or wiki pages changed; review a fresh preview')
+        provenance=section_provenance(root,manifest)
+        updates={}
+        retained=[]
+        for item in review['sections']:
+            if item['applicable']:
+                updates.setdefault(item['page'],[]).append(item)
+            else:
+                retained.append(item['page']+'#'+item['section'])
+        updated=[]
+        for name,items in updates.items():
             path=safe_file(root,name)
-            expected=manifest.get('generated',{}).get(name)
-            if not path or not expected or source_state(path)!=expected:
-                retained.append(name)
-                continue
-            replace_page(path,generated[name])
-            manifest['generated'][name]=source_state(path)
-            updated.append(name)
-        if not retained:manifest['inventory']=review['inventory']
+            raw=path.read_bytes() if path else b''
+            if not path or digest(raw)!=items[0]['page_sha256']:
+                raise ValueError('Wiki page changed; review a fresh preview')
+            body=raw.decode('utf-8')
+            spans=section_spans(body)
+            for item in sorted(items,key=lambda item:spans[item['section']][0],reverse=True):
+                title=item['section']
+                start,end=spans[title]
+                replacement=item['after'].replace('\n','\r\n') if '\r\n' in body[start:end] else item['after']
+                body=body[:start]+replacement+body[end:]
+                if item['next']:
+                    provenance[name][title]=item['next']
+                else:
+                    provenance[name].pop(title)
+            if raw!=body.encode():
+                replace_page(path,body)
+                updated.append(name)
+        manifest['generated_sections']=provenance
+        manifest['inventory']=review['inventory']
         write_manifest(root,manifest)
         return {'updated':updated,'retained_for_review':retained}
     if action in ('publish','dismiss'):
@@ -481,6 +591,10 @@ def operation(db, row, prefix, args):
     manifest=source_manifest(root)
     manifest.update(onboarding=plan['plan_id'],inventory=plan['inventory'],
                     generated={path:source_state(safe_file(root,path)) for path in plan['pages'] if plan['existing'][path] is None})
+    manifest['generated_sections']={
+        page:generated_sections(plan['pages'][page],titles,plan['inventory'])
+        for page,titles in GENERATED_HEADINGS.items() if page in manifest['generated']
+    }
     write_manifest(root,manifest)
     saved={**saved,'phase':'applied','plan_id':plan['plan_id'],'inventory':plan['inventory'],'answers':answers,'tasks':result['items']}
     saved.pop('accepted',None)

@@ -90,6 +90,43 @@ class ProjectKnowledgeTest(unittest.TestCase):
         refreshed=self.knowledge(project,'refresh',plan_id=changes['plan_id'])
         self.assertIn('docs/agents/checks.md',refreshed['updated'])
 
+    def test_section_refresh_preserves_manual_text_and_rejects_stale_preview(self):
+        project,root=self.project()
+        package=root/'package.json'
+        package.write_text('{"scripts":{"test":"node --test"}}',encoding='utf-8')
+        plan=self.knowledge(project,'prepare',answers=dict(goal='Goal',milestone='Outcome',acceptance='Check'))['plan']
+        self.knowledge(project,'apply',plan_id=plan['plan_id'])
+        wiki=root/'docs/agents'
+        page=wiki/'checks.md'
+        original=page.read_bytes()
+        manual=b'\n## Maintainer notes\n\nPreserve this text.\n'
+        page.write_bytes(original+manual)
+        package.write_text('{"scripts":{"lint":"node --check app.js"}}',encoding='utf-8')
+        preview=self.knowledge(project,'reassess')
+        commands=next(item for item in preview['sections'] if item['section']=='Detected commands')
+        self.assertIn('npm run test',commands['before'])
+        self.assertIn('npm run lint',commands['after'])
+        self.assertTrue(commands['applicable'])
+        page.write_bytes(original+manual+b'Intervening edit.\n')
+        with self.assertRaisesRegex(ValueError,'current source changes'):
+            self.knowledge(project,'refresh',plan_id=preview['plan_id'])
+        preview=self.knowledge(project,'reassess')
+        package.write_text('{"scripts":{"build":"node build.js"}}',encoding='utf-8')
+        with self.assertRaisesRegex(ValueError,'current source changes'):
+            self.knowledge(project,'refresh',plan_id=preview['plan_id'])
+        preview=self.knowledge(project,'reassess')
+        self.knowledge(project,'refresh',plan_id=preview['plan_id'])
+        self.assertIn(b'npm run build',page.read_bytes())
+        self.assertTrue(page.read_bytes().endswith(manual+b'Intervening edit.\n'))
+        page.write_bytes(page.read_bytes().replace(b'npm run build',b'custom command'))
+        package.write_text('{}',encoding='utf-8')
+        preview=self.knowledge(project,'reassess')
+        commands=next(item for item in preview['sections'] if item['section']=='Detected commands')
+        self.assertFalse(commands['applicable'])
+        result=self.knowledge(project,'refresh',plan_id=preview['plan_id'])
+        self.assertIn('docs/agents/checks.md#Detected commands',result['retained_for_review'])
+        self.assertIn(b'custom command',page.read_bytes())
+
     def test_read_signatures_distinguish_pagination_and_revision_changes(self):
         from overhead import task_read_signature
         def signature(version, **args):

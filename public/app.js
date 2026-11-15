@@ -389,7 +389,11 @@ function renderWiki(){
     $('#wiki-source-content').innerHTML='<h3>Source changes</h3>'+
       (changed.length?'<ul>'+changed.map(item=>'<li>'+esc(item.path)+' · '+esc(item.change)+'</li>').join('')+'</ul>':'<p>No source changes recorded.</p>')+
       (review.new_capabilities.length?'<p>New stack signals: '+esc(review.new_capabilities.join(', '))+'</p>':'')+
-      (review.changed.length?'<button id="wiki-refresh-sources">Refresh generated pages</button>':'')+
+      (review.sections??[]).map(item=>'<details><summary>'+esc(item.page+' · '+item.section)+
+        (item.applicable?'':' · Manual review required')+'</summary><h4>Current section</h4><pre>'+esc(item.before)+
+        '</pre><h4>Proposed section</h4><pre>'+esc(item.after)+'</pre></details>').join('')+
+      (review.changed.length||(review.sections??[]).some(item=>item.applicable)?
+        '<button id="wiki-refresh-sources">Refresh generated sections</button>':'')+
       review.capability_suggestions.map((suggestion,index)=>'<section><h4>'+esc(suggestion.key)+'</h4><p>'+esc(suggestion.reason)+'</p>'+
         '<button data-capability="'+index+'" data-choice="accepted">Accept</button> <button data-capability="'+index+'" data-choice="deferred">Defer</button></section>').join('')+
       Object.entries(review.capability_decisions).map(([key,choice])=>'<p>'+esc(key)+' · '+esc(choice)+'</p>').join('');
@@ -403,7 +407,7 @@ function renderWiki(){
       const done=await api('project_knowledge',{project,actor,action:'refresh',plan_id:review.plan_id});
       await refresh();
       $('#wiki-result').textContent=done.updated.length+' pages refreshed'+
-        (done.retained_for_review.length?' · Review retained pages: '+done.retained_for_review.join(', '):'');
+        (done.retained_for_review.length?' · Review retained sections: '+done.retained_for_review.join(', '):'');
     }catch(e){error(e);}};
   }catch(e){error(e);}};
   $('#content').querySelectorAll('[data-wiki-task]').forEach(button=>button.onclick=()=>openTask({id:Number(button.dataset.wikiTask)}).catch(error));
