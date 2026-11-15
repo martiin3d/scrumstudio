@@ -46,7 +46,7 @@ def historical_logs(root):
 
 def verification_events(root,start=None,end=None):
     path=Path(root)/'.scrum/local/verification-events.jsonl';rows=[]
-    if not path.is_file() or path.is_symlink():return {'events':0,'executed':0,'reused':0,'failed':0,'repeat_failures':0,'limited':False}
+    if not path.is_file() or path.is_symlink():return {'events':0,'executed':0,'reused':0,'failed':0,'repeat_failures':0,'repeat_passes':0,'limited':False}
     limited=path.stat().st_size>4*1024*1024
     with path.open('rb') as stream:
         if limited:stream.seek(-4*1024*1024,2);stream.readline()
@@ -58,8 +58,11 @@ def verification_events(root,start=None,end=None):
             rows.append(r)
     failed=[r for r in rows if r.get('passed') is False and not r.get('reused')]
     signatures=collections.Counter((r.get('signature'),r.get('kind')) for r in failed if r.get('signature'))
+    passes=collections.Counter(r['signature'] for r in rows
+                               if r.get('passed') is True and not r.get('reused') and isinstance(r.get('signature'),str) and r['signature'])
     return {'events':len(rows),'executed':sum(not r.get('reused',False) for r in rows),'reused':sum(bool(r.get('reused')) for r in rows),
-            'failed':len(failed),'repeat_failures':sum(max(0,n-1) for n in signatures.values()),'limited':limited}
+            'failed':len(failed),'repeat_failures':sum(max(0,n-1) for n in signatures.values()),
+            'repeat_passes':sum(n-1 for n in passes.values()),'limited':limited}
 
 def audit(db,project,root,start=None,end=None,include_logs=False):
     import execution_usage
@@ -105,6 +108,17 @@ def audit(db,project,root,start=None,end=None,include_logs=False):
     measurement=usage_measurement.summary(root)
     if measurement:result['measurement']=measurement
     v=result['verification']
+    reads=overhead.claim_read_repetitions(project,start,end)
+    result['repetitions']={
+        'claim_reads':reads,
+        'unchanged_verification_passes':v['repeat_passes'],
+        'unchanged_verification_failures':v['repeat_failures'],
+        'verification_limited':v['limited'],
+        'scope':'Recorded successful same-task reads in managed sessions and verification signatures in the selected interval. Read arguments are not recorded. Pagination, changed scope, and recovery may justify repeated reads.',
+    }
+    if reads and reads['sessions_with_repeated_reads']>=2:
+        result['recommendations'].append('Repeated task reads occurred in multiple managed sessions. Check whether the initial claim already supplied the requested fields.')
+    if v['repeat_passes']:result['recommendations'].append('Identical verification inputs passed more than once. Consider receipt reuse where the check and inputs are still valid.')
     if v['repeat_failures']:result['recommendations'].append('Repeated failures with identical recorded inputs: inspect environment and reuse diagnostics before another unchanged launch.')
     if any(any(t['category']=='Git recovery' for t in r['tasks']) for r in runs):result['recommendations'].append('Git recovery executions exist: inspect native checkout diagnostics before spending another model run.')
     if include_logs:result['historical_logs']=historical_logs(root)

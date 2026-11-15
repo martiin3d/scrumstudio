@@ -53,6 +53,26 @@ class UsageAuditTest(unittest.TestCase):
         self.assertEqual((result['executed'],result['reused'],result['repeat_failures']),(2,1,1))
         self.assertEqual(usage_audit.verification_events(root,2.5,4)['events'],1)
 
+    def test_repetitions_report_managed_scope_and_exclude_failed_reads(self):
+        import overhead
+        p,root=self.project()
+        for batch in range(2):
+            session=overhead.start_session(p,self.agent,'Light')
+            overhead.record_startup(p,self.agent,str(batch),'codex','fixture',session,[7],50,{})
+            for task,failed in [(7,False),(7,False),(7,True),(8,False),(8,False)]:
+                overhead.record(p,'task_get',10,20,1,failed,session,task,self.agent,channel='cli')
+        for _ in range(3):
+            overhead.record(p,'task_get',10,20,1,False,task=7,channel='cli')
+        events=[dict(at=at,signature='same',passed=True,reused=at==3) for at in (1,2,3)]
+        (root/'.scrum/local/verification-events.jsonl').write_text('\n'.join(map(json.dumps,events)))
+        result=run('coordination_metrics',dict(project=p,include_audit=True))['audit']
+        repeats=result['repetitions']
+        self.assertEqual(repeats['claim_reads']['sessions_with_repeated_reads'],2)
+        self.assertEqual(repeats['claim_reads']['repeated_reads'],2)
+        self.assertEqual(repeats['unchanged_verification_passes'],1)
+        self.assertTrue(any('multiple managed sessions' in note for note in result['recommendations']))
+        self.assertEqual(overhead.claim_read_repetitions(p,0,1)['repeated_reads'],0)
+
 class NativePublicationTest(unittest.TestCase):
     def test_only_transport_failures_retry_same_refspec(self):
         import git_sync

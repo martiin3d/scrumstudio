@@ -28,6 +28,7 @@ def connection(project):
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_at ON timed_calls(at)')
     db.execute('CREATE INDEX IF NOT EXISTS timed_calls_session ON timed_calls(session)')
     db.execute('CREATE TABLE IF NOT EXISTS startup(run_id TEXT PRIMARY KEY,actor INTEGER,at REAL,client TEXT,model TEXT,session TEXT,tasks TEXT,prompt_bytes INTEGER,sections TEXT)')
+    db.execute('CREATE INDEX IF NOT EXISTS startup_session ON startup(session)')
     return db
 
 
@@ -52,6 +53,32 @@ def startup_samples(project,start=None,end=None,limit=30):
             return [dict(row,sections=json.loads(row['sections']),tasks=json.loads(row['tasks'])) for row in rows]
     except (OSError,ValueError,sqlite3.Error):
         return []
+
+
+def claim_read_repetitions(project,start=None,end=None):
+    """Same-task reads observed after a managed startup that already supplied a claim."""
+    from contextlib import closing
+    try:
+        with closing(connection(project)) as db:
+            window='AND c.at BETWEEN ? AND ?' if start is not None else ''
+            params=(start,end) if window else ()
+            rows=db.execute("""
+                SELECT c.session,c.task,SUM(c.calls) AS reads
+                FROM timed_calls c
+                WHERE c.channel IN ('cli','mcp') AND c.tool='task_get' AND c.errors=0 AND c.task>0
+                  AND EXISTS (SELECT 1 FROM startup s, json_each(s.tasks) task
+                              WHERE s.session=c.session AND s.at<=c.at AND task.value=c.task)
+                """+window+"""
+                GROUP BY c.session,c.task
+            """,params).fetchall()
+            repeated=[row for row in rows if row['reads']>1]
+            return {
+                'sessions_with_reads':len({row['session'] for row in rows}),
+                'sessions_with_repeated_reads':len({row['session'] for row in repeated}),
+                'repeated_reads':sum(row['reads']-1 for row in repeated),
+            }
+    except (OSError,ValueError,sqlite3.Error):
+        return None
 
 
 def start_session(project,actor,mode,existing=None):
