@@ -170,6 +170,8 @@ def proposals(db, project, prefix, workspace, args):
         evidence=row['evidence'].strip()
         if not evidence:continue
         items.append({
+            'proposal_id':fingerprint,
+            'page_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
             'page':page.as_posix(),
             'source_task':item['source_task'],
             'source_code':item['source_code'],

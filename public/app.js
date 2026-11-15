@@ -52,6 +52,12 @@ async function refresh(conditional=false){
   const selected=project,selectedPage=page;
   try{
   $('#error').textContent='';
+  if(page==='Wiki'){
+    const data=project?await api('project_knowledge',{project,...(wikiPages.get(project)?{page:wikiPages.get(project)}:{})}):null;
+    if(selected!==project||selectedPage!==page||serial!==refreshSerial)return;
+    state={tasks:[],notes:[],wiki:data};
+    render();return;
+  }
   if(project&&!['Projects','Settings','Chat'].includes(page)){
     const key=`${project}:${page}:${metricDays}:${metricSession}`;
     const result=await api('web_refresh',{project,page,days:metricDays,...(metricSession?{filter_period:metricSession}:{}),...(conditional&&refreshVersions[key]?{version_seen:refreshVersions[key]}:{})});
@@ -89,7 +95,7 @@ function render(){
   $('#task-group').value=view.group;$('#task-sort').value=view.sort;
   $('#task-sort-direction').textContent=view.direction==='asc'?'↑ Ascending':'↓ Descending';
   $('#add').textContent=page==='Board'?'＋ Create task':page==='Notes'?'＋ Add note':`＋ Add ${page.toLowerCase()}`;
-  $('#add').hidden=['AI workflow','Settings','Metrics','Chat','Projects','Agents','Users'].includes(page); if(page==='File locks')$('#add').textContent='＋ Reserve files'; $('#search').hidden=page!=='Board'; $('#category-filter').hidden=page!=='Board';
+  $('#add').hidden=['AI workflow','Settings','Metrics','Chat','Projects','Agents','Users','Wiki'].includes(page); if(page==='File locks')$('#add').textContent='＋ Reserve files'; $('#search').hidden=page!=='Board'; $('#category-filter').hidden=page!=='Board';
   if(!['Projects','Agents'].includes(page))$('#review-count').textContent=state.notes.filter(n=>n.kind==='Review'&&!n.done).length;
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.page===page));
   const selectedCategory=$('#category-filter').value;
@@ -104,6 +110,7 @@ function render(){
   if(page==='Users'){renderUsers();return;}
   if(page==='Projects'){renderProjects();return;}
   if(!project){$('#content').innerHTML='<div class="empty"><div class="eyebrow">A FRESH START</div><h2>Good work starts with a project.</h2><p>Create your first project to bring your tasks and team rituals together.</p><button class="primary" id="empty-project">＋ New project</button></div>';$('#empty-project').onclick=()=>openProject();return;}
+  if(page==='Wiki'){renderWiki();return;}
   if(page==='Agents'){renderAgents();return;}
   if(page==='Chat'){renderChat();return;}
   if(page==='Settings'){renderSettings();return;}
@@ -293,7 +300,117 @@ function openFileReservation(){
   modal('Claim task & reserve files',`<label class="field">Task<select name="task" required><option value="">Choose task</option>${tasks.map(t=>`<option value="${t.id}">${esc(t.code)} · ${esc(t.title)}</option>`).join('')}</select></label>${field('Files (one relative or absolute path per line)','paths','','textarea')}<p>The task and files are claimed together. A conflict leaves the task unchanged.</p>`,async f=>{const id=Number(f.get('task'));const paths=f.get('paths').split('\n').map(p=>p.trim()).filter(Boolean);if(!paths.length)throw Error('Enter at least one file path.');const r=await api('task_claim',{project,id,...credentials(id),files:paths});if(r.claimed===false)throw Error('File conflict: '+r.conflicts.map(c=>c.path).join(', '));claims[`${project}:${id}`]={actor,token:r.token};saveClaims();await refresh();});
 }
 function modal(title,fields,save,saveLabel='Save changes'){$('#editor').classList.remove('task-editor');$('#editor-form button[type=submit]').textContent=saveLabel;$('#dialog-title').textContent=title;$('#fields').innerHTML=fields;$('#form-error').textContent='';editing=save;$('#editor').showModal();}
-function openProject(){modal('Create project',field('Existing project folder (absolute path)','path','','required')+field('Project name','name','','required')+field('Description','description','','textarea'),async f=>{await api('project_create',{path:f.get('path'),name:f.get('name'),description:f.get('description')}).then(r=>project=r.id);await loadProjects();});}
+const wikiPages=new Map();
+
+function openProject(){
+  modal('Add project',field('Project folder (absolute path)','path','','required')+
+    field('Project name','name','','required'),async form=>{
+    const result=await api('project_create',{path:form.get('path'),name:form.get('name')});
+    project=result.id;page='Wiki';await loadProjects();
+    if(actor)await loadOnboarding(true);
+  },'Add project');
+}
+
+function wikiPath(pagePath,target){
+  try{
+    const base=new URL('/'+pagePath,location.origin);
+    const url=new URL(target,base);
+    if(!['http:','https:'].includes(url.protocol))return null;
+    if(/^https?:/i.test(target))return {external:url.href};
+    if(url.origin!==location.origin)return null;
+    return {path:decodeURIComponent(url.pathname.slice(1)),anchor:url.hash};
+  }catch{return null;}
+}
+
+function renderWikiText(body,pagePath,pages){
+  let code=false;
+  const renderLine=line=>{
+    if(/^\s{0,3}(`{3,}|~{3,})/.test(line)){code=!code;return code?'<pre><code>':'</code></pre>';}
+    if(code)return esc(line)+'\n';
+    if(/^\s*<!--.*-->\s*$/.test(line))return '';
+    let inline='',last=0;
+    const links=/\[([^\]]+)\]\(([^\s)]+)\)/g;
+    for(const match of line.matchAll(links)){
+      inline+=esc(line.slice(last,match.index));
+      const link=wikiPath(pagePath,match[2]),label=esc(match[1]);
+      if(link?.external)inline+='<a rel="noreferrer" href="'+esc(link.external)+'">'+label+'</a>';
+      else if(link&&(pages.includes(link.path)||link.path==='docs/agents/index.md'))inline+='<button class="wiki-link" data-wiki-page="'+esc(link.path)+'" data-wiki-anchor="'+esc(link.anchor)+'">'+label+'</button>';
+      else if(link)inline+=label+' <code>'+esc(link.path)+'</code>';
+      else inline+=label;
+      last=match.index+match[0].length;
+    }
+    inline+=esc(line.slice(last));
+    inline=inline.replace(/`([^`]+)`/g,'<code>$1</code>');
+    const heading=line.match(/^(#{1,6})\s+(.*)$/);
+    if(heading){
+      const tag='h'+Math.min(heading[1].length+1,6);
+      const anchor=heading[2].toLowerCase().replace(/[^\p{L}\p{N}_ -]/gu,'').replace(/ /g,'-');
+      return '<'+tag+' id="wiki-'+esc(anchor)+'">'+inline.slice(heading[1].length+1)+'</'+tag+'>';
+    }
+    return line.trim()?'<p>'+inline+'</p>':'';
+  };
+  return body.split(/\r?\n/).map(renderLine).join('')+(code?'</code></pre>':'');
+}
+
+function renderWiki(){
+  const wiki=state.wiki;
+  const pages=['docs/agents/index.md',...wiki.pages];
+  $('#content').innerHTML=`<section class="wiki-layout"><div class="workflow wiki-nav"><h2>Pages</h2>
+    ${pages.map(path=>`<button data-wiki-page="${esc(path)}" aria-current="${path===wiki.page?'page':'false'}">${esc(path.split('/').at(-1).replace(/\.md$/,'').replace(/-/g,' '))}</button>`).join('')}
+    <button id="wiki-check">Check links</button><p id="wiki-result" role="status"></p></div>
+    <article class="workflow wiki-body">${wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}
+    ${wiki.onboarding!=='applied'?'<button id="wiki-onboarding">Project setup</button>':''}
+    <div id="wiki-onboard-content"></div></article></section>
+    ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}`;
+  $('#content').querySelectorAll('[data-wiki-page]').forEach(button=>button.onclick=async()=>{
+    wikiPages.set(project,button.dataset.wikiPage);
+    await refresh();
+    if(button.dataset.wikiAnchor)document.getElementById('wiki-'+decodeURIComponent(button.dataset.wikiAnchor.slice(1)))?.scrollIntoView();
+  });
+  $('#content').querySelectorAll('[data-wiki-task]').forEach(button=>button.onclick=()=>openTask({id:Number(button.dataset.wikiTask)}).catch(error));
+  for(const item of wiki.proposals){
+    const update=async action=>{try{
+      await api('project_knowledge',{project,actor,action,proposal_id:item.proposal_id,page_sha256:item.page_sha256,
+        ...(action==='publish'?{text:$('#content [data-wiki-draft="'+item.proposal_id+'"]').value}:{})});
+      if(action==='publish')wikiPages.set(project,item.page);
+      await refresh();
+    }catch(e){error(e);}};
+    $('#content [data-wiki-publish="'+item.proposal_id+'"]').onclick=()=>update('publish');
+    $('#content [data-wiki-dismiss="'+item.proposal_id+'"]').onclick=()=>update('dismiss');
+  }
+  $('#wiki-check').onclick=async()=>{try{
+    const {issues}=await api('project_knowledge',{project,action:'diagnose'});
+    $('#wiki-result').textContent=issues.length?issues.map(i=>i.path+':'+i.line+' '+i.kind+' '+i.target).join('\n'):'Wiki checks passed.';
+  }catch(e){error(e);}};
+  const setup=$('#wiki-onboarding');if(setup)setup.onclick=()=>loadOnboarding(true).catch(error);
+}
+
+async function loadOnboarding(prepare=false){
+  const selected=project;
+  let data=await api('project_knowledge',{project,action:'status'});
+  if(!data.phase&&prepare){
+    if(!actor)throw Error('Choose a human user to prepare onboarding.');
+    data=await api('project_knowledge',{project,actor,action:'prepare'});
+  }
+  if(project!==selected||page!=='Wiki'||!data.plan)return;
+  const {plan}=data;
+  $('#wiki-onboard-content').innerHTML=`<section class="wiki-onboard"><h2>Project setup</h2><p>${plan.inventory.kind==='empty'?'Empty folder':'Existing project'} · ${plan.inventory.sources.length} observed sources</p>
+    <details open><summary>Wiki preview</summary>${Object.entries(plan.pages).map(([path,body])=>`<details><summary>${esc(path)} · ${plan.existing[path]?'existing page retained':'new page'}</summary><pre>${esc(body)}</pre></details>`).join('')}</details>
+    <form id="wiki-onboard-answers">${Object.entries(data.questions).map(([key,label])=>`<label class="field">${esc(label)}<textarea name="${esc(key)}" maxlength="1000" ${data.phase==='applying'?'readonly':''}>${esc(plan.answers[key]||'')}</textarea></label>`).join('')}
+    ${data.phase==='applying'?'':'<button type="submit">Save answers and preview</button>'} <button type="button" class="primary" id="wiki-apply" ${plan.ready?'':'disabled'}>${data.phase==='applying'?'Resume application':'Apply plan'}</button></form><p id="wiki-setup-result" role="status"></p></section>`;
+  const form=$('#wiki-onboard-answers');
+  form.oninput=()=>{$('#wiki-apply').disabled=true;};
+  form.onsubmit=async e=>{e.preventDefault();try{
+    await api('project_knowledge',{project,actor,action:'prepare',answers:Object.fromEntries(new FormData(form))});
+    await loadOnboarding();
+  }catch(err){$('#wiki-setup-result').textContent=err.message;}};
+  $('#wiki-apply').onclick=async e=>{e.target.disabled=true;try{
+    const accepted=await api('project_knowledge',{project,actor,action:'apply',plan_id:plan.plan_id});
+    await refresh();
+    $('#wiki-result').textContent=accepted.tasks.map(item=>item.code).join(', ')+' · First milestone saved';
+  }catch(err){$('#wiki-setup-result').textContent=err.message;e.target.disabled=false;}};
+}
+
 function readChecklist(){
   return [...document.querySelectorAll('.checklist-row')].map(row=>({text:row.querySelector('[data-item-text]').value.trim(),done:row.querySelector('[data-item-done]').checked}));
 }
@@ -512,8 +629,8 @@ $('#theme-toggle').onclick=()=>{const theme=document.documentElement.dataset.the
 $('#add').onclick=()=>page==='Board'?openTask():page==='File locks'?openFileReservation():openNote();
 $('#close').onclick=$('#cancel').onclick=()=>$('#editor').close();
 $('#editor-form').onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{await editing(new FormData(e.target));$('#editor').close();}catch(e){$('#form-error').textContent=e.message;}finally{b.disabled=false;}};
-window.addEventListener('focus',()=>{if(!$('#editor').open&&!['Settings','Chat','Projects'].includes(page))refresh(true).catch(error);});
-setInterval(()=>{if(document.hidden||$('#editor').open)return;if(page==='Chat')refreshInteractions().catch(error);else if(!['Settings','Projects'].includes(page))refresh(true).catch(error);},15000);
+window.addEventListener('focus',()=>{if(!$('#editor').open&&!['Settings','Chat','Projects','Wiki'].includes(page))refresh(true).catch(error);});
+setInterval(()=>{if(document.hidden||$('#editor').open)return;if(page==='Chat')refreshInteractions().catch(error);else if(!['Settings','Projects','Wiki'].includes(page))refresh(true).catch(error);},15000);
 loadProjects().catch(error);
 
 function renderChat(){

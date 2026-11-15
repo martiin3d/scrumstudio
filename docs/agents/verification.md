@@ -32,6 +32,10 @@ Run `python scripts/setup.py --doctor --client both` to inspect bundled skill dr
 
 ## Wiki maintenance
 
+Choose **Add project** in Scrum Studio to scan its folder and preview proposed pages. Answer the goal, first milestone and acceptance questions before applying the plan. **Wiki → Project setup** reopens a saved preview or an interrupted application. Existing topic files are kept and the index gains links to generated topics.
+
+In **Wiki → Proposed updates**, open the source task to inspect its evidence. Edit the draft before applying it to the working folder, or dismiss it. Publish the reviewed files through the usual Git flow.
+
 Run `python scripts/wiki_doctor.py` to find broken local links, missing Markdown anchors, topic pages absent from the index, and unresolved local Git references. Use the `git:REVISION` destination in a Markdown link when a local commit reference should be checked. The verifier also runs the doctor for changes under this wiki or to `AGENTS.md`.
 
 When finishing a task with a durable decision or a reusable procedure proven by its evidence, use the existing `decisions` field. The optional `wiki_page` names an existing topic such as `docs/agents/git.md`. Scrum can infer a single topic from recognized source files when the page is omitted. Read the drafts with `python scrum.py call project_wiki_proposals --project PATH`. To find the full source task and evidence, use `python scrum.py show --project PATH --task CODE` with the proposal's `source_code`.
