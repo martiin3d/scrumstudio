@@ -26,6 +26,10 @@ Save each variant as a JSON array. Each trial records `case`, `replicate` (a pos
 
 Compare with `python scripts/eval_worker.py --baseline BEFORE.json --candidate AFTER.json`. The report includes per-pair results and calculates cost deltas only for pairs that pass both variants. Missing counters remain unknown.
 
+Prepare matching isolated boards by running `python scripts/eval_worker.py --fixture EMPTY_DIR --prepare CASE` once per variant. The command creates a local Git scenario and its first task, and prints the fixture-specific registry and legacy database paths. Set `SCRUM_REGISTRY` and `SCRUM_DB` to those paths when starting the corresponding isolated Scrum supervisor. Launch it through normal Wakeup and quota handling. Use the same client and model in both variants.
+
+Read the run ID in the fixture's usage audit, then collect one trial with `python scripts/eval_worker.py --fixture DIR --collect RUN_ID`. This reads task state, fixture outputs, scoped coordination and provider counters. For the resume case, supply `--observed FILE.json` with `remaining_check_executed` confirmed from independent verification evidence. The file can also include `verified_redundant_calls` for semantic events that require inspecting the trace. Put the three collected trials for each variant into its comparison array.
+
 ## Installation diagnosis
 
 Run `python scripts/setup.py --doctor --client both` to inspect bundled skill drift, duplicate hooks and effective MCP selection. The plan lists the files it would change and shows hashes. Apply that exact plan with `--apply-repair PLAN_ID --client both`. Restore its verified backup with `--restore-repair BACKUP_ID`. MCP selections are reported so they can be corrected through the project's normal settings.

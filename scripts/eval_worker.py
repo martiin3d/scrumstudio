@@ -1,7 +1,14 @@
 """Compare paired, independently checked Scrum worker trials."""
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+
+ROOT=Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 
 
 CASES = {
@@ -40,7 +47,7 @@ def score(trial, case):
     inputs = count(usage.get('input_tokens'))
     cached = count(usage.get('cached_input_tokens'))
     written = count(usage.get('cache_write_input_tokens'))
-    if trial['client'] == 'claude' and inputs is not None:
+    if trial['client'] == 'claude' and inputs is not None and not trial.get('input_includes_cache'):
         inputs = inputs + cached + written if cached is not None and written is not None else None
     if inputs is not None and cached is not None and cached > inputs:
         raise ValueError('Cached input exceeds total input')
@@ -89,14 +96,157 @@ def compare(baseline, candidate):
             'quality_regressions': sum(item['quality_regression'] for item in comparisons)}
 
 
+def git(root,*args,check=True):
+    return subprocess.run(['git','-C',str(root),*args],text=True,encoding='utf-8',capture_output=True,
+                          timeout=10,check=check)
+
+
+def use_fixture(root):
+    root=root.resolve()
+    local=root/'.scrum-eval'
+    marker=local/'fixture.json'
+    if not marker.is_file() or marker.is_symlink():raise ValueError('Use a prepared evaluation fixture')
+    data=json.loads(marker.read_text(encoding='utf-8'))
+    if data.get('case') not in CASES:raise ValueError('Unknown fixture case')
+    os.environ['SCRUM_REGISTRY']=str(local/'registry.db')
+    os.environ['SCRUM_DB']=str(local/'legacy.db')
+    return data
+
+
+def prepare_fixture(root,case):
+    from store import run
+    root=root.resolve()
+    if not root.is_dir() or any(root.iterdir()):raise ValueError('Prepare in an existing empty directory')
+    local=root/'.scrum-eval'
+    local.mkdir()
+    fixture={'case':case}
+    (local/'fixture.json').write_text(json.dumps(fixture),encoding='utf-8')
+    use_fixture(root)
+    (root/'.gitignore').write_text('.scrum/\n.scrum-eval/\n__pycache__/\n',encoding='utf-8')
+    expected={'new-claim':'assert first() == 42','resume':'assert first() == 42 and second() == 7'}
+    code='def first():\n    return '+('0' if case=='new-claim' else '42')+'\n'
+    if case=='resume':code+='\ndef second():\n    return 0\n'
+    if case=='git-recovery':code='def first():\n    return 0\n'
+    (root/'feature.py').write_text(code,encoding='utf-8')
+    if case!='git-recovery':
+        (root/'verify_fixture.py').write_text('from feature import *\n'+expected[case]+'\n',encoding='utf-8')
+    else:
+        (root/'personal.txt').write_text('base\n',encoding='utf-8')
+    git(root,'init','-qb','main')
+    git(root,'config','user.name','Evaluation fixture')
+    git(root,'config','user.email','fixture@example.invalid')
+    git(root,'add','.')
+    git(root,'commit','-qm','Evaluation fixture base')
+    fixture['base_sha']=git(root,'rev-parse','HEAD').stdout.strip()
+    if case=='git-recovery':
+        git(root,'switch','-qc','verified-source')
+        (root/'feature.py').write_text('def first():\n    return 42\n',encoding='utf-8')
+        git(root,'commit','-qam','Verified source')
+        fixture['verified_sha']=git(root,'rev-parse','HEAD').stdout.strip()
+        git(root,'switch','-q','main')
+        (root/'personal.txt').write_text('unrelated staged content\n',encoding='utf-8')
+        git(root,'add','personal.txt')
+    fixture['fixture_sha256']=hashlib.sha256(json.dumps({
+        'case':case,'scenario':CASES[case],'inputs':{path.name:hashlib.sha256(path.read_bytes()).hexdigest()
+                                                  for path in sorted(root.iterdir()) if path.is_file()},
+    },sort_keys=True).encode()).hexdigest()
+    project=run('project_create',{'path':str(root),'name':'Worker evaluation'})['id']
+    human=run('user_register',{'identity':'human:evaluation','name':'Evaluation reviewer','kind':'human'})['id']
+    description={
+        'new-claim':'Implement first() returning 42. Run python verify_fixture.py and record evidence.',
+        'resume':'first() already returns 42 and its check passed. Implement second() returning 7. Preserve first() and run python verify_fixture.py for the combined result.',
+        'git-recovery':'Integrate the existing verified-source branch into main. Preserve the unrelated staged personal.txt. Do not reimplement the feature.',
+    }[case]
+    task=run('task_create',{'project':project,'actor':human,'title':case,'description':description,
+                           'acceptance_criteria':[description],'files':['feature.py'],
+                           **({'category':'Git recovery'} if case=='git-recovery' else {})})
+    if case=='resume':
+        run('task_update',{'project':project,'actor':human,'id':task['id'],'evidence':'first() returns 42',
+                           'continuity':'First check passed. Implement second() and run the combined check.'})
+    fixture.update(project=project,task=task['id'],task_code=task['code'])
+    (local/'fixture.json').write_text(json.dumps(fixture,indent=2),encoding='utf-8')
+    return {**fixture,'registry':str(local/'registry.db'),'legacy_db':str(local/'legacy.db')}
+
+
+def observe_fixture(root,fixture,task):
+    case=fixture['case']
+    finished=task['status']=='Done' and bool(task.get('evidence'))
+    if case=='git-recovery':
+        landed=git(root,'merge-base','--is-ancestor',fixture['verified_sha'],'refs/heads/main',check=False)
+        staged=git(root,'show',':personal.txt',check=False)
+        return {'verified_source_integrated':landed.returncode==0,
+                'unrelated_staging_preserved':staged.returncode==0 and staged.stdout=='unrelated staged content\n',
+                'verified_finish':finished}
+    # Read the deliverable's AST instead of executing arbitrary worker-authored code.
+    import ast
+    def constant_returns():
+        try:module=ast.parse((root/'feature.py').read_text(encoding='utf-8'))
+        except (OSError,UnicodeError,SyntaxError):return {}
+        return {node.name:node.body[0].value.value for node in module.body
+                if isinstance(node,ast.FunctionDef) and len(node.body)==1 and isinstance(node.body[0],ast.Return)
+                and isinstance(node.body[0].value,ast.Constant) and type(node.body[0].value.value) is int}
+    code=constant_returns()
+    if case=='resume':
+        return {'acceptance_passed':code.get('first')==42 and code.get('second')==7,
+                'prior_evidence_preserved':code.get('first')==42,
+                'remaining_check_executed':False,
+                'verified_finish':finished}
+    changes=git(root,'diff','--name-only',fixture['base_sha'],'--').stdout.splitlines()
+    changes+=git(root,'ls-files','--others','--exclude-standard').stdout.splitlines()
+    return {'acceptance_passed':code.get('first')==42,'only_planned_files_changed':set(changes)<={'feature.py'},
+            'verified_finish':finished}
+
+
+def collect_fixture(root,run_id,replicate,observed):
+    from store import run
+    fixture=use_fixture(root)
+    project=fixture['project']
+    task=run('task_get',{'project':project,'id':fixture['task']})
+    audit=run('coordination_metrics',{'project':project,'include_audit':True})['audit']
+    sample=next((item for item in audit['startup_samples'] if item['run_id']==run_id),None)
+    if not sample or sample['tasks']!=[fixture['task']] or not sample['session']:
+        raise ValueError('Use a recorded, single-task managed run from this fixture')
+    metrics=run('coordination_metrics',{'project':project,'filter_session':sample['session']})
+    labels={'work_start':'start','task_claim':'claim','snapshot':'board_scan'}
+    calls=[labels.get(item['tool'],item['tool']) for item in metrics['channel_tools']
+           if item['channel'] in ('cli','mcp') for _ in range(item['calls'])]
+    checks=observe_fixture(root,fixture,task)
+    if fixture['case']=='resume':
+        if type(observed.get('remaining_check_executed')) is not bool:
+            raise ValueError('Inspect the native verification evidence and record remaining_check_executed')
+        checks['remaining_check_executed']=observed['remaining_check_executed']
+    extra=observed.get('verified_redundant_calls',[])
+    if not isinstance(extra,list) or any(call not in CASES[fixture['case']]['redundant'] or call in labels.values() for call in extra):
+        raise ValueError('Record only additional verified redundant call labels')
+    for label in extra:
+        operation='task_get' if label=='show_same_scope' else None
+        if operation in calls:calls[calls.index(operation)]=label
+        else:calls.append(label)
+    return {'case':fixture['case'],'replicate':replicate,'client':sample['client'],'model':sample['model'],
+            'fixture_sha256':fixture['fixture_sha256'],'checks':checks,'calls':calls,'input_includes_cache':True,
+            'usage':{key:sample.get(key) for key in ('input_tokens','cached_input_tokens','output_tokens')}}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cases', action='store_true')
     parser.add_argument('--baseline', type=Path)
     parser.add_argument('--candidate', type=Path)
+    parser.add_argument('--fixture',type=Path)
+    parser.add_argument('--prepare',choices=sorted(CASES))
+    parser.add_argument('--collect',metavar='RUN_ID')
+    parser.add_argument('--replicate',type=int,default=1)
+    parser.add_argument('--observed',type=Path,help='Independent confirmation of verification and semantic repeated calls')
     args = parser.parse_args()
     if args.cases:
         result = CASES
+    elif args.fixture and (args.prepare or args.collect):
+        try:
+            result=prepare_fixture(args.fixture,args.prepare) if args.prepare else collect_fixture(
+                args.fixture.resolve(),args.collect,args.replicate,
+                json.loads(args.observed.read_text(encoding='utf-8')) if args.observed else {})
+        except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError) as error:
+            parser.error(str(error))
     elif args.baseline and args.candidate:
         try:
             result = compare(*(json.loads(path.read_text(encoding='utf-8')) for path in (args.baseline, args.candidate)))
