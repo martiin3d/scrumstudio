@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
@@ -38,6 +39,7 @@ TARGETS={
     'scripts/verification_receipts.py':['test_unity_verify.py'],
     'scripts/setup.py':['test_setup.py'],
     'scripts/agent_bridge.py':['test_bridge.py'],
+    'scripts/eval_worker.py':['test_eval_worker.py'],
     'scripts/provider_usage.py':['test_bridge.py','test_overhead.py'],
     'scripts/usage_monitor.py':['test_overhead.py'],
 }
@@ -84,9 +86,55 @@ def save_pass(path,key,source):
     os.replace(temporary,path)
 
 
-def plan(files):
+RISK_CHECKS = {
+    'schema': ('Persisted schema or migration changed.', ('test_storage.py', 'test_mcp_protocol.py')),
+    'permissions': ('Authorization, claims, provider approvals, or Stop policy changed.',
+                    ('test_policy.py', 'test_launch.py', 'test_single_worker_files.py')),
+    'git_delivery': ('Git verification, integration, publication, or recovery changed.',
+                     ('test_git_native_recovery.py', 'test_git_completion_recovery.py', 'test_worktrees.py')),
+}
+
+RISK_PATHS = {
+    'schema': {'storage.py'},
+    'permissions': {'runtime.py'},
+    'git_delivery': {'git_sync.py', 'git_completion.py', 'git_worktrees.py', 'git_retained.py', 'git_paused.py'},
+}
+
+RISK_CONTENT = {
+    'schema': re.compile(r'\b(?:CREATE|ALTER|DROP)\s+(?:TABLE|INDEX)\b|\b(?:user_version|schema_version|add_column)\b', re.I),
+    'permissions': re.compile(r'\b(?:actor_user|require_claim|verify_token|lock_until|claim_token|should_stop|usage_guard|approval_policy|agent_approval_mode|sandbox_mode)\b'),
+    'git_delivery': re.compile(r'\b(?:git_finalize|git_reconcile|reconcile_pr|completion_basis|publish_verified|merge_completed|save_receipt|verified_source_sha)\b'),
+}
+
+
+def diff_lines(name, base, root=ROOT):
+    args=['git','--literal-pathspecs','-C',str(root)]
+    try:
+        result=subprocess.run([*args,'diff','--no-ext-diff','--no-textconv','--unified=0',base,'--',name],
+                              capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=10)
+        if result.returncode:return None
+        changed=[line[1:] for line in result.stdout.splitlines()
+                 if line.startswith(('+','-')) and not line.startswith(('+++ ','--- '))]
+        if result.stdout:return changed
+        tracked=subprocess.run([*args,'ls-files','--error-unmatch','--',name],capture_output=True,timeout=5)
+        path=root/name
+        if tracked.returncode and path.is_file():
+            with path.open('rb') as stream:
+                content=stream.read(256*1024+1)
+            if len(content)>256*1024:return None
+            return content.decode('utf-8',errors='replace').splitlines()
+        return []
+    except (OSError,subprocess.SubprocessError):
+        return None
+
+
+def plan(files,base='HEAD'):
+    if not base or base.startswith('-'):
+        raise ValueError('Supply a Git base revision')
     checks=set();notes=[];full=False;js=False
-    for value in files:
+    risk={key:set() for key in RISK_CHECKS}
+    unavailable=[]
+    for value in dict.fromkeys(files):
         path=(ROOT/value).resolve()
         try:name=path.relative_to(ROOT).as_posix()
         except ValueError:raise ValueError('Files must be inside this checkout') from None
@@ -96,17 +144,32 @@ def plan(files):
         elif name.endswith('.md') or name in ('public/style.css','public/index.html'):
             notes.append('Inspect documentation/skill references or the affected visual flow; no model-output matching tests.')
         else:full=True
+        if not name.endswith(('.py','.js','.sql')) or name.startswith('tests/'):continue
+        lines=diff_lines(name,base)
+        if lines is None:unavailable.append(name)
+        for key,pattern in RISK_CONTENT.items():
+            if name in RISK_PATHS[key] or (lines and any(pattern.search(line) for line in lines)):
+                risk[key].add(name)
+    detected=[]
+    for key,(reason,tests) in RISK_CHECKS.items():
+        if risk[key]:
+            checks.update(tests)
+            detected.append({'area':key,'paths':sorted(risk[key]),'reason':reason,'checks':list(tests)})
     return {'tests':['test_*.py'] if full else sorted(checks),'node_syntax':js,'notes':sorted(set(notes)),
+            'risk':detected,'diff_base':base,'diff_unavailable':sorted(set(unavailable)),
             'reason':'Cross-cutting or unmapped change: run full regressions.' if full else 'Targeted checks; expand for new failures, broader impact or unresolved risk.'}
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--files',nargs='+',required=True)
+    parser.add_argument('--base',default='HEAD',help='Compare working files with this Git revision (default HEAD)')
     parser.add_argument('--run',action='store_true')
     parser.add_argument('--verbose',action='store_true',help='Stream unittest details instead of the default local report and compact result')
     parser.add_argument('--reuse',action='store_true',help='Reuse an actual prior pass only for identical sources, runtime and checks; report its original time')
-    args=parser.parse_args();selected=plan(args.files)
+    args=parser.parse_args()
+    try:selected=plan(args.files,args.base)
+    except ValueError as error:parser.error(str(error))
     print(json.dumps(selected),flush=True)
     if not args.run:return
     source=fingerprint()

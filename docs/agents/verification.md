@@ -2,6 +2,8 @@
 
 Run `python scripts/verify.py --files PATH --run --reuse` for the changed behavior. The helper maps files to targeted tests and returns compact evidence. A reused pass must match the checked inputs and keeps its original timestamp. Expand the scope when the change spans contracts or introduces unresolved risks.
 
+Preview the plan by omitting `--run`. The `risk` entries list the changed paths, the reason and checks selected for schema, permissions and Git delivery. Use `--base REF` to include committed changes relative to a known base. Review `diff_unavailable` when Git could not inspect a path. The content rules are signals alongside the existing file-based test selection.
+
 Keep review findings tied to the behavior, path and revision that exposed them. When a revision addresses a finding, verify its outcome and the affected diff. Human approval follows the task review state in [reviews.py](../../reviews.py).
 
 Use `python scrum.py help task_review_findings` for the native findings operation. Record a stable issue key and relative path. The open findings page is enough for the next revision. Resolve a finding with the checked Git SHA and evidence.
@@ -13,6 +15,8 @@ Run the usage audit on demand:
 ```
 
 `startup_samples` includes UTF-8 prompt bytes, section sizes for native CLI runs, recorded coordination calls and available provider counters. Compare equivalent work with the same client, model, acceptance and outcome. Check uncached input and calls alongside total input. A smaller initial prompt alone does not measure full-session savings.
+
+`repetitions` reports recurring reads of already claimed tasks and executed checks with matching verification signatures. Use the counts to find sessions worth inspecting. The same task read can be warranted by pagination, updated scope, or recovery.
 
 ## Worker behavior evaluation
 
