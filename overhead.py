@@ -77,7 +77,10 @@ def claim_read_repetitions(project,start=None,end=None):
             """,params).fetchall()
             repeated=[row for row in rows if row['reads']>1]
             fingerprints=db.execute("""
-                SELECT c.session,c.task,c.read_signature,SUM(c.calls) AS reads
+                SELECT c.session,c.task,c.read_signature,SUM(c.calls) AS reads,MIN(c.at) AS first_at,MAX(c.at) AS last_at,
+                       SUM(SUM(c.calls)) OVER () AS total_reads,
+                       SUM(SUM(c.calls)-1) OVER () AS total_repeats,
+                       SUM(CASE WHEN SUM(c.calls)>1 THEN 1 ELSE 0 END) OVER () AS repeated_groups
                 FROM timed_calls c
                 WHERE c.channel IN ('cli','mcp') AND c.tool='task_get' AND c.errors=0 AND c.task>0
                   AND c.read_signature IS NOT NULL
@@ -85,13 +88,22 @@ def claim_read_repetitions(project,start=None,end=None):
                               WHERE s.session=c.session AND s.at<=c.at AND task.value=c.task)
                 """+window+"""
                 GROUP BY c.session,c.task,c.read_signature
+                ORDER BY reads DESC,last_at DESC,c.session,c.task,c.read_signature
+                LIMIT 12
             """,params).fetchall()
             return {
                 'sessions_with_reads':len({row['session'] for row in rows}),
                 'sessions_with_repeated_reads':len({row['session'] for row in repeated}),
                 'repeated_reads':sum(row['reads']-1 for row in repeated),
-                'versioned_reads':sum(row['reads'] for row in fingerprints),
-                'identical_versioned_reads':sum(row['reads']-1 for row in fingerprints),
+                'versioned_reads':fingerprints[0]['total_reads'] if fingerprints else 0,
+                'identical_versioned_reads':fingerprints[0]['total_repeats'] if fingerprints else 0,
+                'patterns_limited':bool(fingerprints and fingerprints[0]['repeated_groups']>12),
+                'patterns':[{
+                    'kind':'claim_read','observations':row['reads'],
+                    'scope':{'session':row['session'],'task_id':row['task'],'fingerprint':row['read_signature']},
+                    'first_at':row['first_at'],'last_at':row['last_at'],
+                    'action':{'destination':'reuse','text':'Reuse the earlier task page within this session. Read again when the page or version changes.'},
+                } for row in fingerprints if row['reads']>1],
             }
     except (OSError,ValueError,sqlite3.Error):
         return None

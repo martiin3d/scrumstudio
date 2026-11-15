@@ -73,6 +73,43 @@ class UsageAuditTest(unittest.TestCase):
         self.assertTrue(any('multiple managed sessions' in note for note in result['recommendations']))
         self.assertEqual(overhead.claim_read_repetitions(p,0,1)['repeated_reads'],0)
 
+    def test_concrete_actions_require_exact_recorded_repetition(self):
+        import overhead
+        p,root=self.project()
+        session=overhead.start_session(p,self.agent,'Light')
+        overhead.record_startup(p,self.agent,'sample','codex','fixture',session,[7],50,{})
+        for args,version in [({},'v1'),({},'v1'),({'files_after':20},'v1'),({},'v2')]:
+            signature=overhead.task_read_signature('task_get',args,{'version':version})
+            overhead.record(p,'task_get',10,20,1,False,session,7,self.agent,channel='cli',read_signature=signature)
+        events=[
+            {'at':1,'signature':'stable','passed':True},
+            {'at':2,'signature':'stable','passed':True},
+            {'at':3,'signature':'stable','passed':True,'reused':True},
+            {'at':4,'signature':'different inputs','passed':True},
+            {'at':5,'signature':'failure','passed':False,'kind':'missing_report'},
+            {'at':6,'signature':'failure','passed':False,'kind':'missing_report'},
+            {'at':7,'signature':'other failure','passed':False,'kind':'missing_report'},
+            {'at':7,'signature':'other failure','passed':False,'kind':'missing_report'},
+        ]
+        (root/'.scrum/local/verification-events.jsonl').write_text('\n'.join(map(json.dumps,events)))
+        audit=run('coordination_metrics',dict(project=p,include_audit=True))['audit']
+        report=audit['repetitions']
+        self.assertIn('unknown',report['scope'])
+        self.assertEqual(report['claim_reads']['versioned_reads'],4)
+        self.assertEqual(report['claim_reads']['identical_versioned_reads'],1)
+        patterns={item['kind']:item for item in report['patterns']}
+        self.assertEqual(len(report['patterns']),3)
+        read=patterns['claim_read']
+        passed=patterns['verification_pass']
+        failure=patterns['verification_failure']
+        self.assertEqual(read['scope']['task_id'],7)
+        self.assertEqual(read['action']['destination'],'reuse')
+        self.assertEqual(passed['kind'],'verification_pass')
+        self.assertEqual(failure['action']['destination'],'helper')
+        self.assertEqual((failure['first_at'],failure['last_at']),(5,6))
+        self.assertTrue(all(item['observations']==2 for item in report['patterns']))
+        self.assertNotIn('different inputs',json.dumps(report))
+
 class NativePublicationTest(unittest.TestCase):
     def test_only_transport_failures_retry_same_refspec(self):
         import git_sync
