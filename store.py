@@ -510,6 +510,9 @@ def legacy_run(action, a, path=None, locks=None):
         project = int(a['project'])
         project_row = project_exists(db, project)
         prefix = project_prefix(project_row['name'])
+        if action=='project_wiki_proposals':
+            import wiki_knowledge
+            return wiki_knowledge.proposals(db,project,prefix,project_row['workspace_root'],a)
         if action=='project_workspaces':
             if type(a.get('confirm',False)) is not bool:raise ValueError('confirm must be boolean')
             human=actor_user(db,a)

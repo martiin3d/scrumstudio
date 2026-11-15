@@ -93,6 +93,13 @@ def operation(action, a, call):
         # Completion commits before selection. A later selection failure never
         # rolls back verified delivery or asks the worker to complete it again.
         result = {'completed': completed}
+        if completed.get('status')=='Done' and (a.get('decisions') or current.get('decisions')):
+            try:
+                proposals=call('project_wiki_proposals',{'project':project,'id':a['id'],'limit':5})
+                if proposals['items']:
+                    result['wiki_proposals']=[{'page':item['page'],'decision_ref':item['decision_ref']} for item in proposals['items']]
+            except (ValueError,OSError):
+                result['wiki_proposals_unavailable']=True
         if completed.get('integration_pending'):
             result['next']={'integration_pending':True,'ownership_granted':False,'instruction':'Verified source is not fully closed. Do not claim a successor or repeat implementation; native closure/recovery owns the remaining Git step.'}
             return result if a.get('verbose',False) else decision_payload(result)

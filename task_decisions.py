@@ -17,7 +17,7 @@ def validate(items):
     if not isinstance(items,list) or len(items)>5:raise ValueError('At most five concise decisions per task')
     seen=set();result=[]
     for item in items:
-        if not isinstance(item,dict) or set(item)-{'key','decision','reason','files','supersedes'}:raise ValueError('Invalid decision fields')
+        if not isinstance(item,dict) or set(item)-{'key','decision','reason','files','supersedes','wiki_page'}:raise ValueError('Invalid decision fields')
         key=item.get('key','')
         if not isinstance(key,str) or not re.fullmatch('[a-z][a-z0-9._-]{0,63}',key) or key in seen:raise ValueError('Decision key must be unique within task')
         seen.add(key)
@@ -26,7 +26,11 @@ def validate(items):
         supersedes=item.get('supersedes',[])
         if not isinstance(supersedes,list) or len(supersedes)>10 or any(not isinstance(x,str) or not re.fullmatch('[1-9][0-9]*:[a-z][a-z0-9._-]{0,63}',x) for x in supersedes):raise ValueError('Supersedes must reference task-number:key records')
         if len(json.dumps(item,ensure_ascii=False).encode('utf-8'))>5000:raise ValueError('Keep each scoped decision under 5000 bytes')
-        result.append({'key':key,'decision':item['decision'].strip(),'reason':item['reason'].strip(),'files':paths(item.get('files')),'supersedes':list(dict.fromkeys(supersedes))})
+        record={'key':key,'decision':item['decision'].strip(),'reason':item['reason'].strip(),'files':paths(item.get('files')),'supersedes':list(dict.fromkeys(supersedes))}
+        if 'wiki_page' in item:
+            from wiki_knowledge import wiki_path
+            record['wiki_page']=wiki_path(item['wiki_page']).as_posix()
+        result.append(record)
     return result
 
 def records(db,project,prefix):

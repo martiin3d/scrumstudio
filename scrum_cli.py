@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 
-READS={'projects','users','task_get','task_search','task_changes','agent_status','project_metrics','coordination_metrics','session_resume','next_work','workflow_status'}
+READS={'projects','users','task_get','task_search','task_changes','agent_status','project_metrics','coordination_metrics','session_resume','next_work','workflow_status','project_wiki_proposals'}
 ALIASES={'ask':'agent_interaction','show':'task_get','search':'task_search','plan':'task_plan','update':'task_update','claim':'task_claim','release':'task_release','lock':'file_locks','finish':'work_finish','pause':'agent_checkpoint','status':'agent_status','metrics':'coordination_metrics','start':'work_start','projects':'projects'}
 
 

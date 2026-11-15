@@ -26,6 +26,7 @@ PLAN_ITEM['properties']['status']={'type':'string','enum':['TODO','Backlog']}
 
 TOOLS = [
     ('project_workspaces','Human maintenance: preview managed worktrees and cleanup retention reasons, or archive them with confirm=true. Content equivalence is informational. Archiving requires Stop and no live claims, and preserves all files and branch refs.',schema(dict(P,actor=I,confirm=B),['project','actor'])),
+    ('project_wiki_proposals','List reviewable wiki updates from current completed task decisions and evidence. Optionally filter by source task ID. This operation reads proposals without editing files.',schema(dict(P,id=I,after=I,limit=I),['project'])),
     ('mcp_servers','List configured MCP names and save machine-local per-project selection for the next managed run. Human-only update; no server connections or inference. Inherit preserves provider configuration; selected always includes scrum-studio.',schema(dict(P,action={'type':'string','enum':['list','update']},actor=I,client={'type':'string','enum':['codex','claude']},mode={'type':'string','enum':['inherit','selected']},servers={'type':'array','items':S,'maxItems':100}),['project'])),
     ('worker_launch','Supervisor preflight without inference: reserve a ten-minute advisory startup offer for eligible work, or release own offer. Atomic across bridges; respects Stop/quota, dependencies, WIP, task locks and overlapping files. Does not claim work or grant editing ownership. No eligible work means do not launch a model.',schema(dict(P,actor=I,action={'type':'string','enum':['reserve','release']}),['project','actor'])),
     ('task_attachment','Explicit task reference operations: list/add/get/remove. Folder-scoped; mutations require active actor and task lease credentials if locked. Safe generated blob names, allowlisted types, max5MiB each and ten per task. Default responses contain metadata only; get include_content=true explicitly fetches base64. JSON exports omit blobs and report limitations; missing content is explicit. No arbitrary local paths accepted.',schema(dict(P,id=I,action={'type':'string','enum':['list','add','get','remove']},actor=I,token=S,attachment_id=S,name=S,content_base64={'type':'string','maxLength':6990508},include_content=B),['project','id'])),
@@ -104,7 +105,7 @@ for _name,_description,_schema in TOOLS:
 
 
 # Explicit optional correlation; no additional model round trip.
-DECISIONS={'type':'array','maxItems':5,'items':schema({'key':S,'decision':S,'reason':S,'files':F,'supersedes':F},['key','decision','reason','files'])}
+DECISIONS={'type':'array','maxItems':5,'items':schema({'key':S,'decision':S,'reason':S,'files':F,'supersedes':F,'wiki_page':S},['key','decision','reason','files'])}
 for _name,_description,_schema in TOOLS:
     if _name in ('work_finish','task_update'):_schema['properties']['decisions']=DECISIONS
     if _name=='task_get':_schema['properties'].update(decision_files=F,decisions_after=I,decisions_limit=I)

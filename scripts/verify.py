@@ -40,6 +40,8 @@ TARGETS={
     'scripts/setup.py':['test_setup.py'],
     'scripts/agent_bridge.py':['test_bridge.py'],
     'scripts/eval_worker.py':['test_eval_worker.py'],
+    'wiki_knowledge.py':['test_wiki_knowledge.py'],
+    'scripts/wiki_doctor.py':['test_wiki_knowledge.py'],
     'scripts/provider_usage.py':['test_bridge.py','test_overhead.py'],
     'scripts/usage_monitor.py':['test_overhead.py'],
 }
@@ -131,13 +133,15 @@ def diff_lines(name, base, root=ROOT):
 def plan(files,base='HEAD'):
     if not base or base.startswith('-'):
         raise ValueError('Supply a Git base revision')
-    checks=set();notes=[];full=False;js=False
+    checks=set();notes=[];full=False;js=False;wiki=False
     risk={key:set() for key in RISK_CHECKS}
     unavailable=[]
     for value in dict.fromkeys(files):
         path=(ROOT/value).resolve()
         try:name=path.relative_to(ROOT).as_posix()
         except ValueError:raise ValueError('Files must be inside this checkout') from None
+        if name=='AGENTS.md' or (name.startswith('docs/agents/') and name.endswith('.md')):
+            wiki=True
         if name=='public/app.js':js=True;notes.append('Verify the affected web flow in a browser.')
         elif name.startswith('tests/test_') and name.endswith('.py'):checks.add(Path(name).name)
         elif name in TARGETS:checks.update(TARGETS[name])
@@ -155,7 +159,7 @@ def plan(files,base='HEAD'):
         if risk[key]:
             checks.update(tests)
             detected.append({'area':key,'paths':sorted(risk[key]),'reason':reason,'checks':list(tests)})
-    return {'tests':['test_*.py'] if full else sorted(checks),'node_syntax':js,'notes':sorted(set(notes)),
+    return {'tests':['test_*.py'] if full else sorted(checks),'node_syntax':js,'wiki_doctor':wiki,'notes':sorted(set(notes)),
             'risk':detected,'diff_base':base,'diff_unavailable':sorted(set(unavailable)),
             'reason':'Cross-cutting or unmapped change: run full regressions.' if full else 'Targeted checks; expand for new failures, broader impact or unresolved risk.'}
 
@@ -172,6 +176,9 @@ def main():
     except ValueError as error:parser.error(str(error))
     print(json.dumps(selected),flush=True)
     if not args.run:return
+    if selected['wiki_doctor']:
+        check=subprocess.run([sys.executable,str(ROOT/'scripts/wiki_doctor.py')],check=False)
+        if check.returncode:raise SystemExit(check.returncode)
     source=fingerprint()
     key=signature(selected,source)
     cache=ROOT/'data'/'verification-cache'/('check-'+hashlib.sha256(json.dumps([selected['tests'],selected['node_syntax']]).encode()).hexdigest()[:20]+'.json')
