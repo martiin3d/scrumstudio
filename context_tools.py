@@ -121,19 +121,22 @@ def checkpoint_workspace(project_root, workspace, task):
 def workspace_delta(project_root, workspace, task):
     from pathlib import Path
     import subprocess
+    from scripts.verification_receipts import resume_checks
     if not project_root or not workspace or not (task.get('continuity') or task.get('evidence')):return None
+    verification=resume_checks(workspace,task['id'])
     checkpoint=Path(project_root)/'.scrum/local/task-context'/f"{int(task['id'])}.json"
     try:
         before=json.loads(checkpoint.read_text(encoding='utf-8'))
         current=workspace_inputs(workspace,task)
     except (OSError,ValueError,subprocess.SubprocessError):
-        return None
+        return {'verification':verification}
     changed=[key for key in ('branch','head','checkout','acceptance','evidence') if before.get(key)!=current[key]]
     files=[name for name in sorted(before['files'].keys()|current['files'].keys())
            if before['files'].get(name,'unobserved')!=current['files'].get(name,'unobserved')]
     incomplete=bool(task.get('files_page',{}).get('has_more')) or any(value=='unavailable' for value in current['files'].values())
     return {'changed_inputs':changed,'changed_paths':files[:12],'coverage':'partial' if incomplete or len(files)>12 else 'scoped',
-            'observed_head':current['head'],'evidence_review':bool(changed or files or incomplete)}
+            'observed_head':current['head'],'evidence_review':bool(changed or files or incomplete),
+            'verification':verification}
 
 def search(db, project, prefix, args):
     limit=args.get('limit',5);after=args.get('after',0)

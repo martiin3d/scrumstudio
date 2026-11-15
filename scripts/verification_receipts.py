@@ -7,6 +7,97 @@ import tempfile
 import time
 
 
+def check_inputs(workspace, paths, executable, *, tree=None):
+    """Fingerprint only declared inputs, including the tool binary identity."""
+    from project_knowledge import safe_file, source_state
+
+    if not executable:
+        return None
+    try:
+        tool = Path(executable).resolve(strict=True)
+        stamp = tool.stat()
+        inputs = {'tool': [str(tool), stamp.st_size, stamp.st_mtime_ns]}
+        if paths is None:
+            from scripts.verify import fingerprint
+            inputs['tree'] = tree if tree is not None else fingerprint(Path(workspace))
+            return inputs if inputs['tree'] else None
+        if not isinstance(paths, list) or not paths or not all(isinstance(name, str) for name in paths):
+            return None
+        for name in paths:
+            path = safe_file(Path(workspace).resolve(), name)
+            if not path:
+                return None
+            state = source_state(path)
+            if not state:
+                return None
+            inputs[name] = state
+        return inputs
+    except OSError:
+        return None
+
+
+def task_check_path(workspace, task_id):
+    return Path(workspace) / '.scrum/local/task-checks' / f'{int(task_id)}.json'
+
+
+def read_task_checks(workspace, task_id):
+    try:
+        path = task_check_path(workspace, task_id)
+        if path.is_symlink() or path.stat().st_size > 128 * 1024:
+            return {}
+        result = json.loads(path.read_text(encoding='utf-8'))
+        return result if isinstance(result, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def record_task_check(workspace, check, paths, executable, before, after, verified_at):
+    """Store a verified result in the current native claim's local checkout."""
+    from scrum_cli import atomic, context_file, locked
+
+    context = os.getenv('SCRUM_CLI_CONTEXT')
+    if not context:
+        return
+    try:
+        with locked(context):
+            claim = context_file(context).get('current')
+            if not claim:
+                return
+            existing = read_task_checks(workspace, claim['id'])
+            existing.pop(check, None)
+            existing[check] = {
+                'paths': paths, 'executable': executable,
+                'inputs': before if before and before == after else None,
+                'verified_at': verified_at,
+            }
+            atomic(task_check_path(workspace, claim['id']), dict(list(existing.items())[-12:]))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return
+
+
+def resume_checks(workspace, task_id):
+    records = read_task_checks(workspace, task_id)
+    if not records:
+        return [{'status': 'unknown', 'reason': 'No scoped verification receipts in this checkout.'}]
+    checks = []
+    for name, receipt in list(records.items())[-12:]:
+        result = {'check': name, 'status': 'unknown'}
+        if not isinstance(receipt, dict) or not receipt.get('inputs'):
+            result['reason'] = 'Receipt input coverage is incomplete.'
+        else:
+            current = check_inputs(workspace, receipt.get('paths'), receipt.get('executable'))
+            if current is None:
+                result['reason'] = 'A covered input or its tool is unavailable.'
+            elif current != receipt['inputs']:
+                result.update(status='changed', reason='Recorded verification inputs changed.')
+            elif type(receipt.get('verified_at')) in (int, float):
+                result.update(status='reusable', result='passed', verified_at=receipt['verified_at'])
+            else:
+                result['reason'] = 'The receipt has no verification timestamp.'
+        checks.append(result)
+    return checks
+
+
 def local_root(project):
     project=Path(project).resolve()
     for root in (project,project.parent):

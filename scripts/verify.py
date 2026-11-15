@@ -37,6 +37,7 @@ TARGETS={
     'context_tools.py':['test_context_tools.py','test_efficiency.py','test_workflow.py'],
     'scripts/unity_verify.py':['test_unity_verify.py'],
     'scripts/verification_receipts.py':['test_unity_verify.py'],
+    'scripts/verify.py':['test_context_tools.py','test_work_checks.py'],
     'scripts/setup.py':['test_setup.py'],
     'scripts/agent_bridge.py':['test_bridge.py'],
     'scripts/eval_worker.py':['test_eval_worker.py'],
@@ -179,16 +180,27 @@ def main():
     if selected['wiki_doctor']:
         check=subprocess.run([sys.executable,str(ROOT/'scripts/wiki_doctor.py')],check=False)
         if check.returncode:raise SystemExit(check.returncode)
+    sys.path.insert(0,str(ROOT))
     source=fingerprint()
     key=signature(selected,source)
+    import verification_receipts as receipts
+    native_context=os.getenv('SCRUM_CLI_CONTEXT')
+    checks={}
+    if native_context and selected['tests']:
+        label='Python: '+', '.join(selected['tests'])
+        checks[label]=(None,sys.executable,receipts.check_inputs(ROOT,None,sys.executable,tree=source) if source else None)
+    if native_context and selected['node_syntax']:
+        node=shutil.which('node')
+        checks['JavaScript syntax']=(['public/app.js'],node,receipts.check_inputs(ROOT,['public/app.js'],node))
     cache=ROOT/'data'/'verification-cache'/('check-'+hashlib.sha256(json.dumps([selected['tests'],selected['node_syntax']]).encode()).hexdigest()[:20]+'.json')
     cached=read_cached(cache,key) if args.reuse and source else None
     if cached:
-        import verification_receipts as receipts
+        for label,(paths,executable,inputs) in checks.items():
+            receipts.record_task_check(ROOT,label,paths,executable,inputs,inputs,cached['verified_at'])
         receipts.event(ROOT,key,{'passed':True,'kind':'passed','reused':True},0)
         print(json.dumps({'reused':True,'original_verified_at':cached['verified_at'],'source':source,'checks':selected['tests'],'node_syntax':selected['node_syntax'],'evidence':'Reused prior passing checks for identical source tree, runtime and selected tests; original timestamp retained.'}),flush=True)
         return
-    os.chdir(ROOT);sys.path.insert(0,str(ROOT/'tests'));sys.path.insert(0,str(ROOT))
+    os.chdir(ROOT);sys.path.insert(0,str(ROOT/'tests'))
     suite=unittest.TestSuite()
     for pattern in selected['tests']:
         suite.addTests(unittest.defaultTestLoader.discover(str(ROOT/'tests'),pattern=pattern))
@@ -207,13 +219,20 @@ def main():
             print(json.dumps({'report':str(report),'executed':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),**({'failure_excerpt':detail[-8000:]} if not result.wasSuccessful() else {})}),flush=True)
         executed=result.testsRun
         passed=result.wasSuccessful() and executed>0
+    python_passed=passed
+    node_passed=False
     if selected['node_syntax']:
-        passed=subprocess.run(['node','--check','public/app.js'],check=False).returncode==0 and passed
-    if passed and source and (selected['tests'] or selected['node_syntax']) and fingerprint()==source:
+        node_passed=subprocess.run(['node','--check','public/app.js'],check=False).returncode==0
+        passed=node_passed and passed
+    final_source=fingerprint() if source and (passed or checks) else None
+    for label,(paths,executable,inputs) in checks.items():
+        verified=python_passed if paths is None else node_passed
+        after=receipts.check_inputs(ROOT,paths,executable,tree=final_source) if verified and (paths or final_source) else None
+        receipts.record_task_check(ROOT,label,paths,executable,inputs,after,time.time())
+    if passed and source and (selected['tests'] or selected['node_syntax']) and final_source==source:
         try:save_pass(cache,key,source)
         except OSError:print('Verification passed; cache unavailable.',file=sys.stderr)
     if selected['tests'] or selected['node_syntax']:
-        import verification_receipts as receipts
         receipts.event(ROOT,key if source else None,{'passed':passed,'kind':'passed' if passed else 'check_failure','reused':False,'executed':executed},time.monotonic()-started)
     print(json.dumps({'passed':passed,'reused':False,'tests_selected':selected['tests'],'evidence':'Selected checks passed.' if passed else 'Selected checks failed; inspect the concrete failure above.'}),flush=True)
     raise SystemExit(0 if passed else 1)

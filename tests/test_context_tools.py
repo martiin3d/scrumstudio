@@ -1,4 +1,8 @@
 import unittest
+from pathlib import Path
+import sys
+import tempfile
+from unittest.mock import patch
 import test_app
 import test_storage
 from store import run
@@ -7,6 +11,35 @@ from store import run
 class ContextTest(unittest.TestCase):
     setUp=test_app.WorkflowTest.setUp
     tearDown=test_app.WorkflowTest.tearDown
+
+    def test_resume_checks_compare_only_their_covered_inputs(self):
+        from context_tools import checkpoint_workspace, workspace_delta
+        from scrum_cli import atomic
+        from scripts.verification_receipts import check_inputs, record_task_check
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = root / 'claim.json'
+            atomic(context, {'schema': 1, 'current': {'id': 1}})
+            task = {'id': 1, 'continuity': 'Next: run integration.', 'files': ['a.py', 'b.py']}
+            for name in task['files']:
+                (root / name).write_text('initial', encoding='utf-8')
+            checkpoint_workspace(root, root, task)
+            self.assertEqual(workspace_delta(root, root, task)['verification'][0]['status'], 'unknown')
+            with patch.dict('os.environ', {'SCRUM_CLI_CONTEXT': str(context)}):
+                for name in task['files']:
+                    inputs = check_inputs(root, [name], sys.executable)
+                    record_task_check(root, name, [name], sys.executable, inputs, inputs, 123.0)
+                record_task_check(root, 'missing', ['absent'], sys.executable, None, None, 124.0)
+            (root / 'a.py').write_text('changed', encoding='utf-8')
+            delta = workspace_delta(root, root, task)
+            checks = {item['check']: item for item in delta['verification']}
+            self.assertEqual(delta['changed_paths'], ['a.py'])
+            self.assertEqual(checks['a.py']['status'], 'changed')
+            self.assertEqual(checks['b.py'], {'check': 'b.py', 'status': 'reusable', 'result': 'passed', 'verified_at': 123.0})
+            self.assertEqual(checks['missing']['status'], 'unknown')
+            self.assertIn('reason', checks['missing'])
+            self.assertNotIn('a.py', str(workspace_delta(root, root, dict(task, id=2))))
 
     def test_default_search_is_small_but_cursor_preserves_all_results(self):
         ids=[self.task('Scoped outcome '+str(i)) for i in range(12)]
