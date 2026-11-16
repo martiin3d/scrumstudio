@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import unittest
 from unittest.mock import patch,Mock
 import tempfile
@@ -109,6 +110,60 @@ class UsageAuditTest(unittest.TestCase):
         self.assertEqual((failure['first_at'],failure['last_at']),(5,6))
         self.assertTrue(all(item['observations']==2 for item in report['patterns']))
         self.assertNotIn('different inputs',json.dumps(report))
+
+    def test_exact_delivery_revert_links_evidence_and_creates_one_proposal(self):
+        import git_completion
+        project,root=self.project()
+        def git(*args):
+            return subprocess.run(['git','-C',str(root),*args],text=True,encoding='utf-8',
+                                  capture_output=True,check=True).stdout.strip()
+        git('init','-qb','main')
+        git('config','user.name','Revert audit')
+        git('config','user.email','fixture@example.invalid')
+        for name in ('one.txt','two.txt'):
+            (root/name).write_text('base\n',encoding='utf-8')
+        git('add','one.txt','two.txt')
+        git('commit','-qm','Base')
+        def deliver(title,names):
+            task=run('task_create',dict(project=project,title=title,description=title,files=names,
+                                        acceptance_criteria=['Checked']))
+            for name in names:
+                (root/name).write_text('delivered\n',encoding='utf-8')
+            git('add',*names)
+            git('commit','-qm',task['code']+': '+title)
+            sha=git('rev-parse','HEAD')
+            claim=run('task_claim',dict(project=project,id=task['id'],actor=self.agent))
+            run('work_finish',dict(project=project,id=task['id'],actor=self.agent,token=claim['token'],
+                                   evidence='Focused check passed.'))
+            path=git_completion.location(root,task['id'])
+            git_completion.write_receipt(path,{'sha':sha,'target':'main','files':{
+                name:git('rev-parse',sha+':'+name) for name in names}})
+            return task,sha
+        task,delivery=deliver('First verified delivery',['one.txt'])
+        git('revert','--no-edit',delivery)
+        reverted=git('rev-parse','HEAD')
+        partial,partial_sha=deliver('Second verified delivery',['one.txt','two.txt'])
+        (root/'one.txt').write_text('base\n',encoding='utf-8')
+        git('add','one.txt')
+        git('commit','-qm','Partial reversal','-m',f'This reverts commit {partial_sha}.')
+        report=run('coordination_metrics',dict(project=project,include_audit=True))['audit']
+        patterns=[item for item in report['repetitions']['patterns'] if item['kind']=='git_revert']
+        self.assertEqual(len(patterns),1)
+        pattern=patterns[0]
+        self.assertEqual(pattern['scope']['task_id'],task['id'])
+        self.assertEqual(pattern['scope']['delivery_sha'],delivery)
+        self.assertEqual(pattern['scope']['revert_sha'],reverted)
+        self.assertEqual(pattern['verification_evidence'],'Focused check passed.')
+        self.assertNotIn(partial['code'],json.dumps(pattern))
+        args=dict(project=project,actor=self.human,proposal_id=pattern['pattern_id'])
+        proposal=run('project_knowledge',dict(args,action='learning_propose'))
+        self.assertEqual(proposal['scope'],pattern['scope'])
+        self.assertEqual(proposal['evidence']['verification_evidence'],pattern['verification_evidence'])
+        self.assertEqual(proposal,run('project_knowledge',dict(args,action='learning_propose')))
+        reviewed=run('project_knowledge',dict(args,action='learning_review',decision='dismissed'))
+        self.assertEqual(reviewed,run('project_knowledge',dict(args,action='learning_propose')))
+        self.assertEqual(run('task_get',dict(project=project,id=task['id']))['status'],'Done')
+        self.assertFalse((root/'docs').exists())
 
 class NativePublicationTest(unittest.TestCase):
     def test_only_transport_failures_retry_same_refspec(self):

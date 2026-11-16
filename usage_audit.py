@@ -110,6 +110,8 @@ def verification_events(root,start=None,end=None,*,pattern_id=None):
 
 def audit(db,project,root,start=None,end=None,include_logs=False):
     import execution_usage
+    import git_revert_evidence
+    from store import project_prefix
     execution_usage.ensure(db)
     query='SELECT payload,recorded_at FROM cli_execution_usage WHERE project=?';params=[project]
     if start is not None:query+=' AND recorded_at>=? AND recorded_at<=?';params += [start,end]
@@ -160,15 +162,17 @@ def audit(db,project,root,start=None,end=None,include_logs=False):
     if measurement:result['measurement']=measurement
     v=result['verification']
     reads=overhead.claim_read_repetitions(project,start,end)
+    prefix=project_prefix(db.execute('SELECT name FROM projects WHERE id=?',(project,)).fetchone()['name'])
+    reverts=git_revert_evidence.patterns(db,project,prefix,root,start,end)
     read_counts={key:value for key,value in reads.items() if key not in ('patterns','patterns_limited')} if reads is not None else None
     result['repetitions']={
         'claim_reads':read_counts,
         'unchanged_verification_passes':v['repeat_passes'],
         'unchanged_verification_failures':v['repeat_failures'],
         'verification_limited':v['limited'],
-        'patterns':(reads or {}).get('patterns',[])+v['patterns'],
-        'patterns_limited':bool((reads or {}).get('patterns_limited') or v['patterns_limited'] or v['limited']),
-        'scope':'Recorded successful same-task reads in managed sessions and verification signatures in the selected interval. Identical versioned reads match the requested page and returned version. Raw read arguments are not retained. Older same-task reads may include changed scope or pagination. Unrecorded behavior is unknown.',
+        'patterns':(reads or {}).get('patterns',[])+v['patterns']+reverts['patterns'],
+        'patterns_limited':bool((reads or {}).get('patterns_limited') or v['patterns_limited'] or v['limited'] or reverts['limited']),
+        'scope':'Recorded task reads, verification signatures, and exact Git reversals of recorded deliveries in the selected interval. Identical reads match the requested page and returned version. Raw read arguments are not retained. Unrecorded behavior is unknown.',
     }
     result['verification']={key:value for key,value in v.items() if key not in ('patterns','patterns_limited')}
     if reads and reads['sessions_with_repeated_reads']>=2:

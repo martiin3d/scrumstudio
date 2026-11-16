@@ -223,13 +223,17 @@ function renderMetrics(){
         <details><summary>Bytes by section</summary><ul>${a.startup_samples.filter(row=>row.budget).map(row=>`<li>
           ${count(row.prompt_bytes)} / ${count(row.budget.limit_bytes)} bytes · ${esc(Object.entries(row.sections).map(([key,value])=>key+' '+value).join(', '))}
           ${row.budget.deferred.length?' · deferred '+esc(row.budget.deferred.join(', ')):''}</li>`).join('')}</ul></details>`);
-      if(a.repetitions?.patterns?.length)target.insertAdjacentHTML('beforeend',`<details><summary>Confirmed repetition patterns</summary>
+      if(a.repetitions?.patterns?.length)target.insertAdjacentHTML('beforeend',`<details><summary>Confirmed patterns and delivery reverts</summary>
         <p>${esc(a.repetitions.scope)} ${a.repetitions.patterns_limited?'Showing a bounded subset.':''}</p>
         ${a.repetitions.patterns.map(item=>`<article class="activity-entry" ${item.pattern_id?`id="audit-pattern-${esc(item.pattern_id)}"`:''}><strong>${esc((item.failure_kind||item.kind).replaceAll('_',' '))}</strong>
-          <p>${count(item.observations)} observations · ${esc(item.scope.task_id?'Task ID '+item.scope.task_id:item.scope.workspace)} · ${esc(item.scope.fingerprint.slice(0,12))}</p>
+          <p>${item.kind==='git_revert'?'Exact content reversal':count(item.observations)+' observations'} · ${esc(item.scope.task_id?'Task ID '+item.scope.task_id:item.scope.workspace)} · ${esc(item.scope.fingerprint.slice(0,12))}</p>
           <p>${esc(new Date(item.first_at*1000).toLocaleString())} – ${esc(new Date(item.last_at*1000).toLocaleString())}</p>
+          ${item.kind==='git_revert'?`<p><button type="button" data-audit-revert-task="${item.scope.task_id}">Open ${esc(item.scope.task_code)}</button>
+            · Delivery <code>${esc(item.scope.delivery_sha)}</code> · Revert <code>${esc(item.scope.revert_sha)}</code></p>
+            <p>${esc(item.verification_evidence)}</p>`:''}
           <p>${esc(item.action.text)}</p>
-          ${actor&&item.kind==='verification_failure'?`<button type="button" data-propose-learning="${esc(item.pattern_id)}">Review as learning proposal</button>`:''}</article>`).join('')}</details>`);
+          ${actor&&['verification_failure','git_revert'].includes(item.kind)?`<button type="button" data-propose-learning="${esc(item.pattern_id)}">Review as learning proposal</button>`:''}</article>`).join('')}</details>`);
+      target.querySelectorAll('[data-audit-revert-task]').forEach(button=>button.onclick=()=>openTask({id:Number(button.dataset.auditRevertTask)}).catch(error));
       target.querySelectorAll('[data-propose-learning]').forEach(button=>button.onclick=async()=>{
         button.disabled=true;
         try{
@@ -392,8 +396,11 @@ function renderLearning(list){
     <summary>${esc(readable(item.failure_kind))} · ${esc(item.status)}</summary>
     <p><strong>${esc(readable(item.recommendation.destination))}</strong> · ${esc(item.recommendation.text)}</p>
     <div id="learning-evidence-${esc(item.proposal_id)}"><p>${esc(item.scope.workspace)} · ${esc(item.scope.fingerprint.slice(0,12))}
-      · ${item.evidence.observations} observations</p>
+      · ${item.scope.revert_sha?'Exact content reversal':item.evidence.observations+' observations'}</p>
       <p>${esc(new Date(item.evidence.first_at*1000).toLocaleString())} – ${esc(new Date(item.evidence.last_at*1000).toLocaleString())}</p>
+      ${item.scope.revert_sha?`<p><button type="button" data-learning-task="${item.scope.task_id}">Open ${esc(item.scope.task_code)}</button>
+        · Delivery <code>${esc(item.scope.delivery_sha)}</code> · Revert <code>${esc(item.scope.revert_sha)}</code></p>
+        <p>${esc(item.evidence.verification_evidence)}</p>`:''}
       <button type="button" data-learning-evidence="${esc(item.evidence.pattern_id)}">Open usage audit</button>
     </div>
     ${item.status==='pending'&&actor?`<button data-learning-review="${esc(item.proposal_id)}" data-choice="accepted">Accept for follow-up</button>
@@ -412,6 +419,7 @@ function renderLearning(list){
     page='Metrics';
     await refresh();
   });
+  section.querySelectorAll('[data-learning-task]').forEach(button=>button.onclick=()=>openTask({id:Number(button.dataset.learningTask)}).catch(error));
   const older=$('#older-learning');
   if(older)older.onclick=async()=>{try{
     const next=await api('project_knowledge',{project,action:'learning',after:list.next_after});

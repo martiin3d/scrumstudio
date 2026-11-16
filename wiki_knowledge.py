@@ -217,27 +217,31 @@ def learning_page(state, after=0):
     return {'items':visible,'has_more':after+len(visible)<len(records),'next_after':after+len(visible)}
 
 
-def learning_update(root, state, args, actor):
+def learning_update(root, state, args, actor, db, project, prefix):
     """Promote confirmed local evidence without modifying the source or policy."""
     from usage_audit import verification_events
+    import git_revert_evidence
 
     key=args.get('proposal_id')
     if not isinstance(key,str) or not re.fullmatch(r'[a-f0-9]{24}',key):
-        raise ValueError('Select a confirmed verification failure from the usage audit')
+        raise ValueError('Select a confirmed verification failure or delivery revert from the usage audit')
     entries=state.setdefault('learning',[])
     existing=next((item for item in entries if item['proposal_id']==key),None)
     if args['action']=='learning_propose':
         if existing:
             return existing
         matches=verification_events(root,pattern_id=key)['patterns']
-        if not matches or matches[0]['kind']!='verification_failure':
-            raise ValueError('No confirmed verification failure remains in the recorded evidence')
+        if not matches:
+            matches=git_revert_evidence.patterns(db,project,prefix,root,pattern_id=key)['patterns']
+        if not matches or matches[0]['kind'] not in ('verification_failure','git_revert'):
+            raise ValueError('No confirmed verification failure or delivery revert remains in the recorded evidence')
         pattern=matches[0]
         record={
             'proposal_id':key,'status':'pending','created_at':time.time(),'created_by':actor,
             'failure_kind':pattern['failure_kind'],'scope':pattern['scope'],'recommendation':pattern['action'],
             'evidence':{field:pattern[field] for field in ('pattern_id','observations','first_at','last_at')},
         }
+        if pattern['kind']=='git_revert':record['evidence']['verification_evidence']=pattern['verification_evidence']
         entries.append(record)
         return record
     decision=args.get('decision')

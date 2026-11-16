@@ -671,7 +671,7 @@ def operation(db, row, prefix, args):
     if actor['kind']!='human':raise ValueError('Only a human can change onboarding or review wiki proposals')
     saved=load_state(root)
     if action in ('learning_propose','learning_review'):
-        item=learning_update(root,saved,args,actor['id'])
+        item=learning_update(root,saved,args,actor['id'],db,project,prefix)
         atomic(root/STATE,saved)
         return item
     if action=='source_publish':
