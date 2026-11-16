@@ -847,7 +847,9 @@ function bindWorkerReadiness(profiles,sessions){
   if(!workers.size)return;
   panel.innerHTML=`<h3>Worker readiness</h3><label>Worker <select id="readiness-worker">
     ${[...workers.values()].map(item=>`<option value="${item.actor}">${esc(item.name)} · ${esc(item.client)}</option>`).join('')}
-    </select></label> <button type="button" id="check-worker-readiness">Check next task</button><div id="worker-readiness-report" aria-live="polite"></div>`;
+    </select></label> <button type="button" id="check-worker-readiness">Check next task</button><div id="worker-readiness-report" aria-live="polite"></div>
+    <h4>Codebase Memory</h4><label>Files to check <input id="graph-check-paths" placeholder="Repository-relative paths, comma-separated"></label>
+    <button type="button" id="check-graph-readiness">Check graph CLI</button><div id="graph-readiness-report" aria-live="polite"></div>`;
   const picker=$('#readiness-worker'),button=$('#check-worker-readiness'),content=$('#worker-readiness-report');
   if(workers.has(Number(readinessSelection)))picker.value=readinessSelection;
   const key=()=>JSON.stringify([project,Number(picker.value),workers.get(Number(picker.value)).client]);
@@ -870,6 +872,19 @@ function bindWorkerReadiness(profiles,sessions){
       if(workerReadinessCache.size>12)workerReadinessCache.delete(workerReadinessCache.keys().next().value);
       if(selected===project&&content.isConnected&&key()===cacheKey)render(report.changed?report:cached);
     }catch(e){if(content.isConnected)content.textContent=e.message;}finally{button.disabled=false;}
+  };
+  $('#check-graph-readiness').onclick=async event=>{
+    const control=event.currentTarget,target=$('#graph-readiness-report'),selected=project;
+    const task=workerReadinessCache.get(key())?.task;
+    const paths=$('#graph-check-paths').value.split(',').map(value=>value.trim()).filter(Boolean);
+    control.disabled=true;
+    target.textContent='Checking the local CLI…';
+    try{
+      const report=await api('graph_readiness',{project:selected,...(task?{id:task.id}:{}),...(paths.length?{paths}:{})});
+      if(selected!==project||!target.isConnected)return;
+      target.innerHTML=`${report.indexed_project?'<p>Index: '+esc(report.indexed_project)+'</p>':''}<ul>${report.checks.map(check=>`<li><strong>${esc(check.key)} · ${esc(check.state)}</strong> ${esc(check.detail)}</li>`).join('')}
+        ${report.paths.map(item=>`<li>${esc(item.path)} · ${esc(item.status)} · ${esc(item.freshness)}</li>`).join('')}</ul><p>${esc(report.fallback)}</p>`;
+    }catch(e){if(target.isConnected)target.textContent=e.message;}finally{control.disabled=false;}
   };
 }
 function renderAgents(){

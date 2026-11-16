@@ -510,6 +510,18 @@ def legacy_run(action, a, path=None, locks=None):
         project = int(a['project'])
         project_row = project_exists(db, project)
         prefix = project_prefix(project_row['name'])
+        if action=='graph_readiness':
+            import project_knowledge
+            root=project_row['workspace_root']
+            workspace=root
+            task={}
+            if 'id' in a:
+                selected=db.execute('SELECT * FROM tasks WHERE project=? AND id=?',(project,a['id'])).fetchone()
+                if not selected:raise ValueError('Task not found in this project')
+                task=task_dict(selected,prefix)
+                try:workspace=git_worktrees.workspace(root,git_worktrees.identity(selected))
+                except (OSError,ValueError):workspace=None
+            return project_knowledge.graph_readiness(root,workspace,task,a)
         if action=='project_knowledge':
             import project_knowledge
             if a.get('action','view') in ('view','diagnose','status','source','reassess','learning','specification_impact','source_draft'):

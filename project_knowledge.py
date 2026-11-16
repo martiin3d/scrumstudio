@@ -528,6 +528,16 @@ def worker_readiness(root, workspace, task, args, channel, stop='', unavailable=
     return {'changed':True,'version':version,**report}
 
 
+def graph_readiness(root, workspace, task, args):
+    from mcp_selection import graph_diagnostic
+
+    if not root or not workspace or not Path(workspace).is_dir():
+        return {'checks':[{'key':'workspace','state':'unknown','detail':'The requested checkout is unavailable.'}],
+                'paths':[],'fallback':'Open the recorded worktree before inspecting source.'}
+    requested=args.get('paths') or [name for name in task.get('files',[]) if safe_file(Path(workspace),name)][:6]
+    return graph_diagnostic(workspace,requested)
+
+
 def write_wiki(root, path, body):
     folder=(root/path).parent
     if folder.resolve()!=folder or not folder.is_relative_to(root/WIKI):

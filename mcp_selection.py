@@ -2,8 +2,11 @@
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
-from pathlib import Path
+import time
+from pathlib import Path, PurePosixPath
 
 CLIENTS=('codex','claude')
 REQUIRED='scrum-studio'
@@ -143,7 +146,6 @@ def effective(client,folder,home=None):
 
 
 def worker_readiness(client, folder, channel):
-    import shutil
     from scripts.cli_runtime import codex_executable
 
     if client not in CLIENTS:
@@ -172,6 +174,89 @@ def worker_readiness(client, folder, channel):
         checks.append({'key':'tools','state':state,'detail':detail,
                        **({} if state=='ready' else {'next':'Update MCP selection in Settings and check again.'})})
     return {'coordination':channel,'effective_specialists':tools['effective_specialists'],'checks':checks}
+
+
+def graph_diagnostic(folder, paths=()):
+    """Probe the local CLI on request. Do not create or repair an index."""
+    if not isinstance(paths,(list,tuple)) or len(paths)>6 or any(not isinstance(path,str) or not path or len(path)>512 or
+                                PurePosixPath(path).as_posix()!=path or PurePosixPath(path).is_absolute() or
+                                path=='.' or '..' in PurePosixPath(path).parts or any(c in path for c in '\\:\x00')
+                                for path in paths):
+        raise ValueError('Use at most six repository-relative file paths')
+    requested=list(dict.fromkeys(paths))
+    checks=[]
+    result={'checks':checks,'paths':[],
+            'fallback':'Use rg and bounded source reads for unavailable or insufficient graph results.'}
+
+    def add(key,state,detail):
+        checks.append({'key':key,'state':state,'detail':detail})
+
+    executable=shutil.which('codebase-memory-mcp')
+    add('executable','ready' if executable else 'missing',
+        'Codebase Memory CLI was found on PATH.' if executable else 'Install the Codebase Memory CLI or add it to PATH.')
+    if not executable:return result
+    folder=Path(folder).resolve()
+    deadline=time.monotonic()+18
+
+    def query(tool,*flags,payload=None):
+        timeout=deadline-time.monotonic()
+        if timeout<=0:raise TimeoutError
+        run=subprocess.run([executable,'cli','--quiet',tool,*flags],cwd=folder,
+                           input=json.dumps(payload) if payload is not None else '',
+                           text=True,encoding='utf-8',errors='replace',capture_output=True,
+                           timeout=timeout,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+        if run.returncode:
+            raise RuntimeError('The local coordination endpoint is inaccessible.' if 'endpoint' in run.stderr.lower()
+                               else 'The CLI command failed. Check its installation and local permissions.')
+        output=json.loads(run.stdout)
+        if not isinstance(output,dict) or output.get('error'):
+            raise ValueError('Invalid graph diagnostic response')
+        return output
+
+    found=None
+    complete=False
+    try:
+        for offset in (0,50,100):
+            page=query('list_projects','--format','json','--limit','50','--offset',str(offset))
+            found=next((row for row in page['projects'] if Path(row['root_path']).resolve()==folder),None)
+            complete=not page.get('has_more')
+            if found or complete:break
+    except (subprocess.TimeoutExpired,TimeoutError):
+        add('endpoint','unknown','The local CLI exceeded the diagnostic time limit.')
+        return result
+    except RuntimeError as error:
+        add('endpoint','blocked',str(error))
+        return result
+    except (OSError,ValueError,KeyError,TypeError):
+        add('endpoint','unknown','The local CLI response could not be verified.')
+        return result
+    add('endpoint','ready','The local CLI replied.')
+    if not found:
+        add('index','missing' if complete else 'unknown',
+            'No index matches this checkout. Index it explicitly if structural queries are needed.' if complete
+            else 'No match was found within the bounded list of local indexes.')
+        return result
+    add('index','ready','A local index matches this exact checkout.')
+    result['indexed_project']=found['name']
+    if not requested:
+        add('coverage','unknown','Supply file paths to check coverage.')
+        return result
+    try:
+        coverage=query('check_index_coverage',payload={'project':found['name'],'paths':requested,'format':'json'})
+        rows={row['requested_path']:row for row in coverage['paths']}
+    except (OSError,RuntimeError,ValueError,KeyError,TypeError,subprocess.TimeoutExpired,TimeoutError):
+        add('coverage','unknown','Coverage could not be confirmed within the diagnostic limits.')
+        return result
+    result['paths']=[{'path':path,'status':rows.get(path,{}).get('status','unknown'),
+                      'freshness':rows.get(path,{}).get('freshness','unknown')} for path in requested]
+    fresh={'fresh','current','unchanged'}
+    states={row['freshness'] for row in result['paths']}
+    healthy=all(row['status']=='no_recorded_issue' for row in result['paths'])
+    state='ready' if healthy and states<=fresh else 'partial' if not healthy else 'stale'
+    add('coverage',state,
+        'No issue was recorded for the requested files. Coverage is best-effort.' if state=='ready'
+        else 'At least one file has incomplete, stale or unverified coverage. Read its source.')
+    return result
 
 def codex_options(folder):
     configured,names=selected('codex',folder)

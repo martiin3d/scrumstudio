@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+import json
+from unittest.mock import Mock, patch
 
 from store import run
 from test_storage import StorageTest
@@ -14,6 +15,34 @@ class ProjectKnowledgeTest(unittest.TestCase):
 
     def knowledge(self, project, action, **args):
         return run('project_knowledge',dict(project=project,actor=self.human,action=action,**args))
+
+    def test_graph_probe_uses_the_matching_checkout_and_is_bounded(self):
+        project,root=self.project()
+        args={'project':project,'paths':['store.py','workflow.py']}
+        def response(body):
+            return Mock(returncode=0,stderr='',stdout=json.dumps(body))
+        backend='mcp_selection.subprocess.run'
+        with patch('mcp_selection.shutil.which',return_value=None),patch(backend) as process:
+            self.assertEqual(run('graph_readiness',args)['checks'][0]['state'],'missing')
+            process.assert_not_called()
+        with patch('mcp_selection.shutil.which',return_value='cbm'),patch(backend,return_value=Mock(returncode=1,stderr='endpoint')) as process:
+            self.assertEqual(run('graph_readiness',args)['checks'][1]['state'],'blocked')
+            process.assert_called_once()
+        with patch('mcp_selection.shutil.which',return_value='cbm'),patch(backend,return_value=response({'projects':[]})):
+            self.assertEqual(run('graph_readiness',args)['checks'][-1]['state'],'missing')
+        with patch('mcp_selection.shutil.which',return_value='cbm'),patch(backend,side_effect=[
+            response({'projects':[{'root_path':str(root.parent),'name':'wrong'},{'root_path':str(root),'name':'right'}]}),
+            response({'paths':[{'requested_path':'store.py','status':'no_recorded_issue','freshness':'fresh'},
+                               {'requested_path':'workflow.py','status':'no_recorded_issue','freshness':'metadata_changed'}]}),
+        ]) as process:
+            report=run('graph_readiness',args)
+            payload=json.loads(process.call_args.kwargs['input'])
+        self.assertEqual(report['indexed_project'],'right')
+        self.assertEqual(report['checks'][-1]['state'],'stale')
+        self.assertEqual(payload,{'project':'right','paths':['store.py','workflow.py'],'format':'json'})
+        self.assertIn('rg',report['fallback'])
+        with self.assertRaisesRegex(ValueError,'repository-relative'):
+            run('graph_readiness',dict(args,paths=['../secret']))
 
     def test_worker_readiness_is_read_only_and_refreshes_changed_inputs(self):
         import mcp_selection
