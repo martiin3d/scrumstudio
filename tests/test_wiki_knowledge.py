@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 import tempfile
@@ -42,6 +43,47 @@ class WikiProposalTest(unittest.TestCase):
     setUp=StorageTest.setUp
     tearDown=StorageTest.tearDown
     project=StorageTest.project
+
+    def test_confirmed_failure_becomes_one_reviewable_learning_record(self):
+        project,root=self.project()
+        wiki=root/wiki_knowledge.WIKI
+        wiki.mkdir(parents=True)
+        index=wiki/'index.md'
+        index.write_text('# Project knowledge\n',encoding='utf-8')
+        task=run('task_create',dict(project=project,title='Unrelated work',description='Keep this task',
+                                    acceptance_criteria=['No change']))
+        evidence=root/'.scrum/local/verification-events.jsonl'
+        events=[
+            {'at':1,'signature':'matching inputs','passed':False,'kind':'missing_report'},
+            {'at':2,'signature':'matching inputs','passed':False,'kind':'missing_report'},
+            {'at':3,'signature':'different inputs','passed':False,'kind':'missing_report'},
+        ]
+        evidence.write_text('\n'.join(map(json.dumps,events)),encoding='utf-8')
+        audit=run('coordination_metrics',dict(project=project,include_audit=True))['audit']
+        pattern=audit['repetitions']['patterns'][0]
+        args={'project':project,'proposal_id':pattern['pattern_id']}
+        with self.assertRaisesRegex(ValueError,'Only a human'):
+            run('project_knowledge',dict(args,actor=self.agent,action='learning_propose'))
+        with self.assertRaisesRegex(ValueError,'No confirmed'):
+            run('project_knowledge',dict(args,actor=self.human,action='learning_propose',proposal_id='0'*24))
+        pending=run('project_knowledge',dict(args,actor=self.human,action='learning_propose'))
+        self.assertEqual(pending['status'],'pending')
+        self.assertEqual(pending['recommendation']['destination'],'helper')
+        self.assertEqual(pending['evidence']['pattern_id'],pattern['pattern_id'])
+        self.assertEqual(pending['scope'],pattern['scope'])
+        self.assertEqual(pending,run('project_knowledge',dict(args,actor=self.human,action='learning_propose')))
+        self.assertEqual(evidence.read_text(encoding='utf-8'),'\n'.join(map(json.dumps,events)))
+        evidence.write_text('',encoding='utf-8')
+        accepted=run('project_knowledge',dict(args,actor=self.human,action='learning_review',decision='accepted'))
+        self.assertEqual(accepted['evidence'],pending['evidence'])
+        self.assertEqual(accepted['status'],'accepted')
+        self.assertEqual(accepted,run('project_knowledge',dict(args,actor=self.human,action='learning_propose')))
+        with self.assertRaisesRegex(ValueError,'already been reviewed'):
+            run('project_knowledge',dict(args,actor=self.human,action='learning_review',decision='dismissed'))
+        self.assertEqual(run('project_knowledge',dict(project=project,action='learning'))['items'],[accepted])
+        self.assertEqual(run('project_knowledge',dict(project=project,action='view'))['learning']['items'],[accepted])
+        self.assertEqual(run('task_get',dict(project=project,id=task['id']))['status'],task['status'])
+        self.assertEqual(index.read_text(encoding='utf-8'),'# Project knowledge\n')
 
     def test_work_finish_suggests_once_and_keeps_evidence_in_the_source_task(self):
         project,root=self.project()

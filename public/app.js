@@ -4,6 +4,7 @@ const tones = ['#8795a5','#97a39a','#629bd0','#d79d67','#a88fc7','#70a587','#a49
 let metricSession='', metricBySession=false;
 let metricDays=30, showDeletedUsers=false;
 const metricsAuditCache=new Map();
+let auditPatternFocus=null;
 let lastControlSignal=null;
 const taskSortFields=['updated','code','title','status','priority','owner','context','batch','model'];
 const taskGroupFields=['none','status','priority','owner','context','batch','category'];
@@ -217,17 +218,35 @@ function renderMetrics(){
       target.innerHTML=`<p>Audit snapshot: ${esc(new Date(a.generated_at*1000).toLocaleString())}. ${esc(a.scope)} Known runs: ${r.known_runs}/${r.runs}. Totals below include known counters only.</p><div class="metric-kpis"><article><span>Input - includes cache</span><strong>${count(t.input_tokens)}</strong></article><article><span>Cached input</span><strong>${count(t.cached_input_tokens)}</strong></article><article><span>Uncached input</span><strong>${count(t.uncached_input_tokens)}</strong></article><article><span>Output</span><strong>${count(t.output_tokens)}</strong></article></div><p>Verification events: ${v.events}; executed: ${v.executed}; reused passes: ${v.reused}; failures: ${v.failed}; repeated failure signatures: ${v.repeat_failures}. ${v.limited?'Partial retained event history.':''}</p><div class="lock-table-wrap"><table class="lock-table"><thead><tr><th>Tasks (shared run)</th><th>Model requested</th><th>Input</th><th>Cached</th><th>Output</th></tr></thead><tbody>${a.top_runs.map(row=>`<tr><td>${esc(row.tasks.map(t=>t.title).join(' / ')||'Unattributed')}</td><td>${esc(row.model||'Provider default')}</td><td>${count(row.input_tokens)}</td><td>${count(row.cached_input_tokens)}</td><td>${count(row.output_tokens)}</td></tr>`).join('')}</tbody></table></div><details><summary>Historical Codex logs - lifetime, overlapping totals</summary><p>${esc(h.scope)} Known runs: ${h.known_runs}/${h.runs}. ${h.limited?'Scan bounded: partial coverage.':''}</p><p>Input ${count(h.known_totals.input_tokens)}; cached ${count(h.known_totals.cached_input_tokens)}; output ${count(h.known_totals.output_tokens)}. Never add these to recorded totals above.</p></details><ul>${[...a.limits,...a.recommendations].map(x=>`<li>${esc(x)}</li>`).join('')}</ul><button type="button" id="download-usage-audit">Download audit JSON</button>`;
       if(a.repetitions?.patterns?.length)target.insertAdjacentHTML('beforeend',`<details><summary>Confirmed repetition patterns</summary>
         <p>${esc(a.repetitions.scope)} ${a.repetitions.patterns_limited?'Showing a bounded subset.':''}</p>
-        ${a.repetitions.patterns.map(item=>`<article class="activity-entry"><strong>${esc((item.failure_kind||item.kind).replaceAll('_',' '))}</strong>
+        ${a.repetitions.patterns.map(item=>`<article class="activity-entry" ${item.pattern_id?`id="audit-pattern-${esc(item.pattern_id)}"`:''}><strong>${esc((item.failure_kind||item.kind).replaceAll('_',' '))}</strong>
           <p>${count(item.observations)} observations · ${esc(item.scope.task_id?'Task ID '+item.scope.task_id:item.scope.workspace)} · ${esc(item.scope.fingerprint.slice(0,12))}</p>
           <p>${esc(new Date(item.first_at*1000).toLocaleString())} – ${esc(new Date(item.last_at*1000).toLocaleString())}</p>
-          <p>${esc(item.action.text)}</p></article>`).join('')}</details>`);
+          <p>${esc(item.action.text)}</p>
+          ${actor&&item.kind==='verification_failure'?`<button type="button" data-propose-learning="${esc(item.pattern_id)}">Review as learning proposal</button>`:''}</article>`).join('')}</details>`);
+      target.querySelectorAll('[data-propose-learning]').forEach(button=>button.onclick=async()=>{
+        button.disabled=true;
+        try{
+          const item=await api('project_knowledge',{project:selected,actor,action:'learning_propose',proposal_id:button.dataset.proposeLearning});
+          if(project!==selected||page!=='Metrics')return;
+          page='Wiki';
+          await refresh();
+          const proposal=document.getElementById('learning-'+item.proposal_id);
+          if(proposal){proposal.open=true;proposal.scrollIntoView();}
+        }catch(e){error(e);}finally{button.disabled=false;}
+      });
+      if(auditPatternFocus){
+        const observation=document.getElementById('audit-pattern-'+auditPatternFocus);
+        if(observation){observation.closest('details').open=true;observation.scrollIntoView();}
+        auditPatternFocus=null;
+      }
       if(a.live_executions?.length)target.insertAdjacentHTML('beforeend',`<h3>Last local run observations - overlapping counters</h3><p>On-demand snapshots, not OS process detection. Never add to completed totals. Missing live tokens stay unknown. Providers may omit tool events; these are observed events, not a complete action count.</p>${a.live_executions.map(row=>`<p>Initial task scope ${esc((row.tasks||[]).join(', '))}: ${count(row.tools)} reported completed tool events; ${count(row.elapsed_seconds)} seconds; output ${count(row.output_tokens)}; ${row.active?'last observed active':'ended'} at ${esc(new Date(row.observed_at*1000).toLocaleString())}; ${row.advisory?.length?'cost advisory reached':'below advisory thresholds'}${row.limited?' (partial event coverage)':''}.</p>`).join('')}`);
       if(a.measurement){const m=a.measurement;target.insertAdjacentHTML('beforeend',`<h3>Measured work interval</h3><p>${esc(m.status)} from ${esc(new Date(m.started_at*1000).toLocaleString())}. Baseline account use: session ${count(m.baseline_usage?.session_used_percent)}%, weekly ${count(m.baseline_usage?.weekly_used_percent)}%. Comparable account change: session ${count(m.account_delta_percentage_points?.session)} percentage points; weekly ${count(m.account_delta_percentage_points?.weekly)}. ${esc(m.quota_scope)}</p><p>Reported completed executions: ${count(m.recorded_interval?.known_runs)}/${count(m.recorded_interval?.runs)}; completed tasks: ${count(m.flow?.completed_tasks)}. ${esc(m.basis)} Local report: ${esc(m.report)}</p>`);}
       $('#download-usage-audit').onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(a,null,2)],{type:'application/json'}));const link=document.createElement('a');link.href=url;link.download='scrum-local-usage-audit.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
     }catch(e){target.textContent=e.message;}finally{button.disabled=false;}
   };
   $('#load-usage-audit').onclick=()=>loadAudit(false);
-  if(metricsAuditCache.has(auditKey))loadAudit(true);
+  if(auditPatternFocus)loadAudit(false);
+  else if(metricsAuditCache.has(auditKey))loadAudit(true);
   $('#metric-days').onchange=()=>{const value=$('#metric-days').value;metricBySession=value==='session';const choices=state.coordination?.periods||[];metricSession=metricBySession?((choices.find(s=>s.kind==='quota')||choices.find(s=>s.kind==='wakeup')||choices.find(s=>s.ended))?.id||''):'';if(!metricBySession)metricDays=Number(value);refresh().catch(error);};
 }
 function mountTiming(t){
@@ -358,6 +377,41 @@ function renderWikiText(body,pagePath,pages){
   return body.split(/\r?\n/).map(renderLine).join('')+(code?'</code></pre>':'');
 }
 
+function renderLearning(list){
+  const section=$('#wiki-learning');
+  if(!section||!list?.items.length)return;
+  const readable=value=>value.replaceAll('_',' ');
+  section.innerHTML=`<h2>Learning proposals</h2>${list.items.map(item=>`<details id="learning-${esc(item.proposal_id)}">
+    <summary>${esc(readable(item.failure_kind))} · ${esc(item.status)}</summary>
+    <p><strong>${esc(readable(item.recommendation.destination))}</strong> · ${esc(item.recommendation.text)}</p>
+    <div id="learning-evidence-${esc(item.proposal_id)}"><p>${esc(item.scope.workspace)} · ${esc(item.scope.fingerprint.slice(0,12))}
+      · ${item.evidence.observations} observations</p>
+      <p>${esc(new Date(item.evidence.first_at*1000).toLocaleString())} – ${esc(new Date(item.evidence.last_at*1000).toLocaleString())}</p>
+      <button type="button" data-learning-evidence="${esc(item.evidence.pattern_id)}">Open usage audit</button>
+    </div>
+    ${item.status==='pending'&&actor?`<button data-learning-review="${esc(item.proposal_id)}" data-choice="accepted">Accept for follow-up</button>
+      <button data-learning-review="${esc(item.proposal_id)}" data-choice="dismissed">Dismiss</button>`:''}
+    ${item.reviewed_at?`<p>Reviewed ${esc(new Date(item.reviewed_at*1000).toLocaleString())}</p>`:''}</details>`).join('')}
+    ${list.has_more?'<button type="button" id="older-learning">Show older proposals</button>':''}`;
+  section.querySelectorAll('[data-learning-review]').forEach(button=>button.onclick=async()=>{try{
+    const item=await api('project_knowledge',{project,actor,action:'learning_review',
+      proposal_id:button.dataset.learningReview,decision:button.dataset.choice});
+    renderLearning({...list,items:list.items.map(old=>old.proposal_id===item.proposal_id?item:old)});
+    const reviewed=document.getElementById('learning-'+item.proposal_id);
+    if(reviewed)reviewed.open=true;
+  }catch(e){error(e);}});
+  section.querySelectorAll('[data-learning-evidence]').forEach(button=>button.onclick=async()=>{
+    auditPatternFocus=button.dataset.learningEvidence;
+    page='Metrics';
+    await refresh();
+  });
+  const older=$('#older-learning');
+  if(older)older.onclick=async()=>{try{
+    const next=await api('project_knowledge',{project,action:'learning',after:list.next_after});
+    const items=new Map([...list.items,...next.items].map(item=>[item.proposal_id,item]));
+    renderLearning({...next,items:[...items.values()]});
+  }catch(e){error(e);}};
+}
 function renderWiki(){
   const wiki=state.wiki;
   const pages=['docs/agents/index.md',...wiki.pages];
@@ -370,7 +424,9 @@ function renderWiki(){
     ${wiki.page!=='docs/agents/index.md'?`<h3>Linked sources</h3>
     ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}</p>`).join('')}
     <button id="wiki-ingest">Link a source</button>`:''}</article></section>
-    ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}`;
+    ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}
+    ${wiki.learning?.items.length?'<section class="workflow wiki-proposals" id="wiki-learning"></section>':''}`;
+  renderLearning(wiki.learning);
   $('#content').querySelectorAll('[data-wiki-page]').forEach(button=>button.onclick=async()=>{
     wikiPages.set(project,button.dataset.wikiPage);
     await refresh();

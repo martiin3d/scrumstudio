@@ -9,7 +9,7 @@ import tempfile
 import time
 from urllib.parse import quote
 
-from wiki_knowledge import INDEX, WIKI, diagnose, proposals, wiki_file, wiki_path
+from wiki_knowledge import INDEX, WIKI, diagnose, learning_page, learning_update, proposals, wiki_file, wiki_path
 
 
 SOURCES = {
@@ -438,7 +438,10 @@ def operation(db, row, prefix, args):
         return {'pages':pages,'page':name,'body':path.read_text(encoding='utf-8-sig') if path else None,
                 'onboarding':saved.get('phase') or ('applied' if source_manifest(root).get('onboarding') else None),
                 'sources':source_manifest(root).get('references',[]),
-                'proposals':pending_proposals(db,project,prefix,root,saved)}
+                'proposals':pending_proposals(db,project,prefix,root,saved),
+                'learning':learning_page(saved)}
+    if action=='learning':
+        return learning_page(load_state(root),args.get('after',0))
     if action=='source':
         name=args.get('source','')
         if not isinstance(name,str):raise ValueError('Supply a project source path')
@@ -459,6 +462,10 @@ def operation(db, row, prefix, args):
     actor=actor_user(db,args)
     if actor['kind']!='human':raise ValueError('Only a human can change onboarding or review wiki proposals')
     saved=load_state(root)
+    if action in ('learning_propose','learning_review'):
+        item=learning_update(root,saved,args,actor['id'])
+        atomic(root/STATE,saved)
+        return item
     if action=='capability':
         if not safe_file(root,INDEX.as_posix()):raise ValueError('Set up the project wiki first')
         manifest=source_manifest(root)
