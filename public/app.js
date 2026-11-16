@@ -422,7 +422,8 @@ function renderWiki(){
     ${wiki.onboarding!=='applied'?'<button id="wiki-onboarding">Project setup</button>':''}
     <div id="wiki-onboard-content"></div><div id="wiki-source-content"></div><div id="wiki-spec-impact-content"></div>
     ${wiki.page!=='docs/agents/index.md'?`<h3>Linked sources</h3>
-    ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}</p>`).join('')}
+    ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}
+      ${actor?`<button data-source-summary="${esc(item.path)}">${item.summary?'Review summary':'Draft summary'}</button>`:''}</p>`).join('')}
     <button id="wiki-ingest">Link a source</button>`:''}</article></section>
     ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}
     ${wiki.learning?.items.length?'<section class="workflow wiki-proposals" id="wiki-learning"></section>':''}`;
@@ -457,6 +458,22 @@ function renderWiki(){
     $('#wiki-source-content').innerHTML='<h3>'+esc(source.path)+'</h3><pre>'+esc(source.body)+'</pre>';
     $('#wiki-source-content').scrollIntoView();
   }catch(e){error(e);}});
+  const openSourceDraft=async(source,topic)=>{
+    const draft=await api('project_knowledge',{project,action:'source_draft',source,page:topic});
+    modal('Review source summary',
+      '<p>'+esc(draft.path)+' · '+esc(draft.section)+'</p><p>Revision <code>'+esc(draft.source_sha256)+'</code></p>'+
+      (draft.accepted?'<details><summary>Current accepted text</summary><pre>'+esc(draft.accepted)+'</pre></details>':'')+
+      field('Reviewed summary','text',draft.draft,'textarea'),
+      async form=>{
+        const result=await api('project_knowledge',{project,actor,action:'source_publish',source,page:topic,
+          plan_id:draft.plan_id,text:form.get('text')});
+        wikiPages.set(project,result.page);
+        await refresh();
+      },'Publish summary');
+  };
+  $('#content').querySelectorAll('[data-source-summary]').forEach(button=>button.onclick=()=>{
+    openSourceDraft(button.dataset.sourceSummary,wiki.page).catch(error);
+  });
   const ingest=$('#wiki-ingest');
   if(ingest)ingest.onclick=()=>modal('Link a project source',field('Repository-relative file','source','','required')+
     field('What does this source explain?','text','','textarea')+field('Related paths, comma-separated','scope',''),
@@ -468,8 +485,10 @@ function renderWiki(){
   $('#wiki-reassess').onclick=async()=>{try{
     const review=await api('project_knowledge',{project,action:'reassess'});
     const changed=[...review.changed,...review.references_changed];
+    const linked=review.references_changed.filter(item=>item.section&&item.change!=='missing');
     $('#wiki-source-content').innerHTML='<h3>Source changes</h3>'+
       (changed.length?'<ul>'+changed.map(item=>'<li>'+esc(item.path)+' · '+esc(item.change)+'</li>').join('')+'</ul>':'<p>No source changes recorded.</p>')+
+      linked.map((item,index)=>'<p>'+esc(item.section)+' · <button data-revise-summary="'+index+'">Review changed summary</button></p>').join('')+
       (review.new_capabilities.length?'<p>New stack signals: '+esc(review.new_capabilities.join(', '))+'</p>':'')+
       (review.sections??[]).map(item=>'<details><summary>'+esc(item.page+' · '+item.section)+
         (item.applicable?'':' · Manual review required')+'</summary><h4>Current section</h4><pre>'+esc(item.before)+
@@ -479,6 +498,10 @@ function renderWiki(){
       review.capability_suggestions.map((suggestion,index)=>'<section><h4>'+esc(suggestion.key)+'</h4><p>'+esc(suggestion.reason)+'</p>'+
         '<button data-capability="'+index+'" data-choice="accepted">Accept</button> <button data-capability="'+index+'" data-choice="deferred">Defer</button></section>').join('')+
       Object.entries(review.capability_decisions).map(([key,choice])=>'<p>'+esc(key)+' · '+esc(choice)+'</p>').join('');
+    $('#wiki-source-content').querySelectorAll('[data-revise-summary]').forEach(button=>button.onclick=()=>{
+      const item=linked[Number(button.dataset.reviseSummary)];
+      openSourceDraft(item.path,item.page).catch(error);
+    });
     $('#wiki-source-content').querySelectorAll('[data-capability]').forEach(button=>button.onclick=async()=>{try{
       const suggestion=review.capability_suggestions[Number(button.dataset.capability)];
       await api('project_knowledge',{project,actor,action:'capability',plan_id:review.plan_id,capability:suggestion.key,decision:button.dataset.choice});

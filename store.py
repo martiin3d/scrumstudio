@@ -512,7 +512,7 @@ def legacy_run(action, a, path=None, locks=None):
         prefix = project_prefix(project_row['name'])
         if action=='project_knowledge':
             import project_knowledge
-            if a.get('action','view') in ('view','diagnose','status','source','reassess','learning','specification_impact'):
+            if a.get('action','view') in ('view','diagnose','status','source','reassess','learning','specification_impact','source_draft'):
                 return project_knowledge.operation(db,project_row,prefix,a)
             if not project_row['workspace_root']:raise ValueError('Project workspace is unavailable')
             return project_knowledge.serialize(Path(project_row['workspace_root']),

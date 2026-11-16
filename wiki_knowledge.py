@@ -13,6 +13,29 @@ LINK = re.compile(r'\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s()]+))(?=\s|\))|^\s{0,3
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
 
 
+def source_excerpt(text):
+    """Create a short editable extract from the source's introductory prose."""
+    paragraphs=[]
+    fence=None
+    for line in text.splitlines():
+        marker=FENCE.match(line)
+        if marker:
+            delim=marker[1]
+            if not fence:fence=delim
+            elif delim.startswith(fence) and not line[marker.end():].strip():fence=None
+            continue
+        stripped=line.strip()
+        if fence or not stripped or stripped.startswith(('#','<!--','---','|')):
+            continue
+        paragraphs.append(stripped)
+        if sum(len(item)+1 for item in paragraphs)>700:break
+    draft='\n'.join(paragraphs)
+    if len(draft)>700:
+        cut=draft[:697].rsplit(None,1)[0]
+        draft=cut+'…'
+    return draft
+
+
 def wiki_path(value):
     if not isinstance(value, str) or len(value)>240 or any(c in value for c in ('\\',':','\x00')):
         raise ValueError('Use a relative Markdown page under docs/agents')

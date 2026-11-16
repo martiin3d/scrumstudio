@@ -9,7 +9,7 @@ import tempfile
 import time
 from urllib.parse import quote
 
-from wiki_knowledge import INDEX, WIKI, diagnose, learning_page, learning_update, proposals, wiki_file, wiki_path
+from wiki_knowledge import INDEX, WIKI, diagnose, learning_page, learning_update, proposals, source_excerpt, wiki_file, wiki_path
 
 
 SOURCES = {
@@ -285,7 +285,9 @@ def reassess(root, manifest):
     for source in manifest.get('references',[]):
         state=source_state(safe_file(root,source['path']))
         observed_references.append(state)
-        if state!=source['sha256']:recorded.append({'path':source['path'],'page':source['page'],'change':'modified' if state else 'missing'})
+        if state!=source['sha256']:
+            recorded.append({'path':source['path'],'page':source['page'],'change':'modified' if state else 'missing',
+                             **({'section':source['summary']['section']} if source.get('summary') else {})})
     old_labels={entry['label'] for entry in previous.values()}
     observed={entry['label'] for entry in current['sources']}-{'Project documentation','Repository instructions'}
     choices=manifest.get('capability_decisions',{})
@@ -494,6 +496,40 @@ def pending_proposals(db,project,prefix,root,state):
     return result[:25]
 
 
+def source_summary(root, manifest, name, page):
+    page=wiki_path(page).as_posix()
+    entry=next((item for item in manifest.get('references',[]) if item['path']==name and item['page']==page),None)
+    if not entry:
+        raise ValueError('Link the source to this topic first')
+    if not isinstance(name,str) or len(name)>240 or any(char in name for char in '\r\n<>'):
+        raise ValueError('Use a short repository-relative source path')
+    source=safe_file(root,name)
+    target=safe_file(root,page)
+    if not source or not target or source.samefile(target):
+        raise ValueError('Use separate readable source and topic files')
+    try:
+        source_bytes=source.read_bytes()
+        target_bytes=target.read_bytes()
+        text=source_bytes.decode('utf-8-sig')
+        body=target_bytes.decode('utf-8')
+    except (OSError,UnicodeError) as error:
+        raise ValueError('The source and topic must be readable UTF-8 text') from error
+    section='Summary of '+name
+    marker='scrum-source:'+digest(f'{page}\0{name}'.encode())[:24]
+    start='<!-- '+marker+' -->'
+    end='<!-- /'+marker+' -->'
+    opened=body.count(start)
+    closed=body.count(end)
+    if opened!=closed or opened>1 or (opened and body.index(end)<=body.index(start)):
+        raise ValueError('The source summary markers changed. Repair the topic before reviewing this source.')
+    span=(body.index(start),body.index(end)+len(end)) if opened else None
+    scope={'path':name,'page':page,'section':section,'source_sha256':digest(source_bytes),
+           'page_sha256':digest(target_bytes)}
+    review={**scope,'plan_id':digest(json.dumps([scope,entry],sort_keys=True).encode()),
+            'draft':source_excerpt(text),'accepted':body[slice(*span)] if span else None}
+    return review,entry,target,body,span,start,end
+
+
 def operation(db, row, prefix, args):
     from store import actor_user
     from planning import apply as apply_tasks
@@ -518,6 +554,8 @@ def operation(db, row, prefix, args):
         return learning_page(load_state(root),args.get('after',0))
     if action=='specification_impact':
         return specification_impact(db,project,prefix,root,args)
+    if action=='source_draft':
+        return source_summary(root,source_manifest(root),args.get('source'),args.get('page'))[0]
     if action=='source':
         name=args.get('source','')
         if not isinstance(name,str):raise ValueError('Supply a project source path')
@@ -542,6 +580,33 @@ def operation(db, row, prefix, args):
         item=learning_update(root,saved,args,actor['id'])
         atomic(root/STATE,saved)
         return item
+    if action=='source_publish':
+        manifest=source_manifest(root)
+        review,entry,path,body,span,start,end=source_summary(root,manifest,args.get('source'),args.get('page'))
+        if args.get('plan_id')!=review['plan_id']:
+            raise ValueError('Source or wiki topic changed. Open a fresh draft before publishing.')
+        text=args.get('text')
+        if not isinstance(text,str) or not text.strip() or len(text)>1500 or 'scrum-source:' in text:
+            raise ValueError('Supply a reviewed summary of at most 1500 characters')
+        db.execute('BEGIN IMMEDIATE')
+        if db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>?',(project,time.time())).fetchone():
+            raise ValueError('Finish or release active claims before editing the wiki from the web')
+        if source_summary(root,source_manifest(root),review['path'],review['page'])[0]['plan_id']!=review['plan_id']:
+            raise ValueError('Source or wiki topic changed. Open a fresh draft before publishing.')
+        link=os.path.relpath(review['path'],PurePosixPath(review['page']).parent).replace(os.sep,'/')
+        reviewed=text.strip().replace('\r\n','\n').replace('\r','\n')
+        block=f"{start}\n\n## {review['section']}\n\n{reviewed}\n\n[Source]({quote(link)}) · Revision `{review['source_sha256']}`\n\n{end}"
+        if '\r\n' in body:block=block.replace('\n','\r\n')
+        if span:
+            updated=body[:span[0]]+block+body[span[1]:]
+        else:
+            newline='\r\n' if '\r\n' in body else '\n'
+            updated=body+newline*2+block+newline
+        replace_page(path,updated)
+        entry['sha256']=review['source_sha256']
+        entry['summary']={'section':review['section']}
+        write_manifest(root,manifest)
+        return {'published':True,'page':review['page'],'section':review['section'],'source_sha256':entry['sha256']}
     if action=='capability':
         if not safe_file(root,INDEX.as_posix()):raise ValueError('Set up the project wiki first')
         manifest=source_manifest(root)
@@ -567,7 +632,9 @@ def operation(db, row, prefix, args):
             if not isinstance(text,str) or len(text)>1000 or not isinstance(scope,list) or len(scope)>12 or any(
                 not isinstance(path,str) or not path or PurePosixPath(path).is_absolute() or '..' in PurePosixPath(path).parts or '\\' in path for path in scope
             ):raise ValueError('Use a short note and up to twelve relative paths')
-            entry={'path':name,'page':page.as_posix(),'sha256':source_state(source),'note':text,'scope':scope}
+            previous=next((item for item in manifest.get('references',[]) if (item['path'],item['page'])==(name,page.as_posix())),{})
+            entry={**previous,'path':name,'page':page.as_posix(),'note':text,'scope':scope}
+            entry.setdefault('sha256',source_state(source))
             refs=[item for item in manifest.get('references',[]) if (item['path'],item['page'])!=(name,page.as_posix())]
             if len(refs)>=100:raise ValueError('Keep a maximum of 100 linked sources')
             manifest['references']=refs+[entry]

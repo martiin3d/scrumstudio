@@ -157,6 +157,45 @@ class ProjectKnowledgeTest(unittest.TestCase):
         self.assertIn('docs/agents/checks.md#Detected commands',result['retained_for_review'])
         self.assertIn(b'custom command',page.read_bytes())
 
+    def test_source_summaries_are_reviewed_independently_and_bound_to_original_bytes(self):
+        project,root=self.project()
+        page='docs/agents/topic.md'
+        topic=root/page
+        topic.parent.mkdir(parents=True)
+        (topic.parent/'index.md').write_text('[Topic](topic.md)\n',encoding='utf-8')
+        topic.write_bytes(b'# Topic\r\n\r\nManual introduction.\r\n')
+        runbook=root/'deployment.md'
+        reference=root/'design.md'
+        reference.write_text('Design reference.\n',encoding='utf-8')
+        runbook.write_text('# Runbook\n\nDeploy the signed release.\n',encoding='utf-8')
+        for source in (runbook,reference):
+            self.knowledge(project,'ingest',source=source.name,page=page)
+            preview=self.knowledge(project,'source_draft',source=source.name,page=page)
+            self.assertIsNone(preview['accepted'])
+            self.assertEqual(preview['path'],source.name)
+            self.knowledge(project,'source_publish',source=source.name,page=page,plan_id=preview['plan_id'],
+                           text='Reviewed '+source.stem+'.')
+        edited='# Runbook\n\nDeploy with a canary first.\n'
+        runbook.write_text(edited,encoding='utf-8')
+        stale=self.knowledge(project,'reassess')['references_changed']
+        self.assertEqual(stale,[{'path':'deployment.md','page':page,'change':'modified','section':'Summary of deployment.md'}])
+        preview=self.knowledge(project,'source_draft',source=runbook.name,page=page)
+        self.assertIn('Reviewed deployment.',preview['accepted'])
+        self.assertIn('canary first',preview['draft'])
+        topic.write_bytes(topic.read_bytes()+b'\r\nUnrelated tail.\r\n')
+        with self.assertRaisesRegex(ValueError,'changed'):
+            self.knowledge(project,'source_publish',source=runbook.name,page=page,plan_id=preview['plan_id'],text='Reviewed canary.')
+        preview=self.knowledge(project,'source_draft',source=runbook.name,page=page)
+        self.knowledge(project,'source_publish',source=runbook.name,page=page,plan_id=preview['plan_id'],text='Reviewed canary.')
+        body=topic.read_bytes()
+        self.assertIn(b'Manual introduction.\r\n',body)
+        self.assertIn(b'Reviewed design.\r\n',body)
+        self.assertIn(b'Unrelated tail.\r\n',body)
+        self.assertEqual(body.count(b'Reviewed canary.'),1)
+        self.assertIn(preview['source_sha256'].encode(),body)
+        self.assertEqual(runbook.read_text(encoding='utf-8'),edited)
+        self.assertEqual(self.knowledge(project,'reassess')['references_changed'],[])
+
     def test_read_signatures_distinguish_pagination_and_revision_changes(self):
         from overhead import task_read_signature
         def signature(version, **args):
