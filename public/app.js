@@ -417,16 +417,36 @@ function renderWiki(){
   const pages=['docs/agents/index.md',...wiki.pages];
   $('#content').innerHTML=`<section class="wiki-layout"><div class="workflow wiki-nav"><h2>Pages</h2>
     ${pages.map(path=>`<button data-wiki-page="${esc(path)}" aria-current="${path===wiki.page?'page':'false'}">${esc(path.split('/').at(-1).replace(/\.md$/,'').replace(/-/g,' '))}</button>`).join('')}
-    <button id="wiki-check">Check links</button><button id="wiki-reassess">Check sources</button><p id="wiki-result" role="status"></p></div>
+    <button id="wiki-check">Check links</button><button id="wiki-reassess">Check sources</button><button id="wiki-spec-impact">Specification impact</button><p id="wiki-result" role="status"></p></div>
     <article class="workflow wiki-body">${wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}
     ${wiki.onboarding!=='applied'?'<button id="wiki-onboarding">Project setup</button>':''}
-    <div id="wiki-onboard-content"></div><div id="wiki-source-content"></div>
+    <div id="wiki-onboard-content"></div><div id="wiki-source-content"></div><div id="wiki-spec-impact-content"></div>
     ${wiki.page!=='docs/agents/index.md'?`<h3>Linked sources</h3>
     ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}</p>`).join('')}
     <button id="wiki-ingest">Link a source</button>`:''}</article></section>
     ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}
     ${wiki.learning?.items.length?'<section class="workflow wiki-proposals" id="wiki-learning"></section>':''}`;
   renderLearning(wiki.learning);
+  const showImpact=async(after=0)=>{
+    try{
+      const current=project;
+      const content=$('#wiki-spec-impact-content');
+      const report=await api('project_knowledge',{project:current,action:'specification_impact',after,
+        ...(wiki.page==='docs/agents/index.md'?{}:{page:wiki.page})});
+      if(current!==project||!content.isConnected)return;
+      content.querySelector('#wiki-impact-more')?.remove();
+      const groups=report.groups.map(group=>`<article><h4>${esc(group.page)}${group.section?' #'+esc(group.section):''} · ${esc(group.state)}</h4>
+        <ul>${group.tasks.map(item=>`<li><button type="button" data-impact-task="${item.id}">${esc(item.code)} · ${esc(item.title)}</button>
+          · ${esc(item.evidence.state.replaceAll('_',' '))}<p>${esc(item.evidence.reason)}</p></li>`).join('')}</ul></article>`).join('');
+      const more=report.has_more?'<button id="wiki-impact-more">Show more affected tasks</button>':'';
+      if(after)content.insertAdjacentHTML('beforeend',groups+more);
+      else content.innerHTML='<h3>Specification impact</h3>'+(groups||'<p>No affected tasks found.</p>')+more;
+      content.querySelectorAll('[data-impact-task]').forEach(button=>button.onclick=()=>openTask({id:Number(button.dataset.impactTask)}).catch(error));
+      const next=content.querySelector('#wiki-impact-more');
+      if(next)next.onclick=()=>showImpact(report.next_after);
+    }catch(e){error(e);}
+  };
+  $('#wiki-spec-impact').onclick=()=>showImpact();
   $('#content').querySelectorAll('[data-wiki-page]').forEach(button=>button.onclick=async()=>{
     wikiPages.set(project,button.dataset.wikiPage);
     await refresh();

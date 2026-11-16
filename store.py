@@ -512,7 +512,7 @@ def legacy_run(action, a, path=None, locks=None):
         prefix = project_prefix(project_row['name'])
         if action=='project_knowledge':
             import project_knowledge
-            if a.get('action','view') in ('view','diagnose','status','source','reassess','learning'):
+            if a.get('action','view') in ('view','diagnose','status','source','reassess','learning','specification_impact'):
                 return project_knowledge.operation(db,project_row,prefix,a)
             if not project_row['workspace_root']:raise ValueError('Project workspace is unavailable')
             return project_knowledge.serialize(Path(project_row['workspace_root']),
@@ -1045,6 +1045,11 @@ def legacy_run(action, a, path=None, locks=None):
             db.execute('UPDATE tasks SET category=? WHERE id=?', (t['category'], t['id']))
             db.execute('UPDATE tasks SET acceptance_criteria=? WHERE id=?',(json.dumps(t['acceptance_criteria']),t['id']))
             db.execute('UPDATE tasks SET files=?,evidence=? WHERE id=?',(json.dumps(t['files']),t['evidence'],t['id']))
+            if 'evidence' in a and t['evidence']!=old['evidence'] and project_row['workspace_root']:
+                import project_knowledge
+                root=project_row['workspace_root']
+                if project_knowledge.SPEC_LINE.search(t['description']):
+                    project_knowledge.record_specification_evidence(root,git_worktrees.workspace(root,git_worktrees.identity(old)),t)
             db.execute('UPDATE tasks SET cancel_reason=? WHERE id=?',(t['cancel_reason'],t['id']))
             db.execute('UPDATE tasks SET scope_size=?,scope_reason=? WHERE id=?',(t['scope_size'],t['scope_reason'],t['id']))
             if any(t[k]!=old[k] for k in ('scope_size','scope_reason')):

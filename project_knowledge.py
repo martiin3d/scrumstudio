@@ -368,6 +368,80 @@ def specification_status(root, description):
             'state':'missing' if not current else 'current' if current==expected else 'changed'}
 
 
+def specification_evidence_path(root, task_id):
+    return Path(root)/'.scrum/local/specification-evidence'/f'{int(task_id)}.json'
+
+
+def record_specification_evidence(root, workspace, task):
+    from scrum_cli import atomic
+
+    if not root or not workspace or not task.get('evidence') or not SPEC_LINE.search(task['description']):
+        return
+    specification=specification_status(workspace,task['description'])
+    if specification['state']=='current':
+        try:
+            atomic(specification_evidence_path(root,task['id']),{
+                'specification':{key:specification[key] for key in ('page','section','revision')},
+                'evidence_sha256':digest(task['evidence'].encode()),
+                'recorded_at':time.time(),
+            })
+        except OSError:
+            pass
+
+
+def specification_evidence(root, task, scope):
+    if task['evidence']:
+        try:
+            path=specification_evidence_path(root,task['id'])
+            record=json.loads(path.read_text(encoding='utf-8')) if path.stat().st_size<=4096 else {}
+        except (OSError,ValueError):
+            record={}
+        if (isinstance(record,dict) and record.get('specification')==scope and
+            record.get('evidence_sha256')==digest(task['evidence'].encode()) and record.get('recorded_at')):
+            return {'state':'requires_review','recorded_at':record['recorded_at'],
+                    'reason':'Verification was recorded against this affected specification revision.'}
+    return {'state':'unknown','reason':'No verification scope is recorded for this task, evidence and revision.'}
+
+
+def specification_impact(db, project, prefix, root, args):
+    page=args.get('page')
+    if page is not None:page=wiki_path(page).as_posix()
+    section=args.get('section')
+    if section is not None and (not page or not isinstance(section,str) or len(section)>100 or
+                                (section and not re.fullmatch(r'[\w-]+',section))):
+        raise ValueError('Use a specification page and a valid heading anchor')
+    after=args.get('after',0)
+    limit=args.get('limit',15)
+    if type(after) is not int or after<0 or type(limit) is not int or not 1<=limit<=25:
+        raise ValueError('Use a nonnegative cursor and a limit from 1 to 25')
+    selector=f'Specification: {page}' if page else 'Specification: docs/agents/'
+    groups={}
+    revisions={}
+    count=0
+    for task in db.execute('SELECT id,number,title,status,description,evidence FROM tasks '
+                           'WHERE project=? AND id>? AND instr(description,?)>0 ORDER BY id',(project,after,selector)):
+        match=SPEC_LINE.search(task['description'])
+        if not match:continue
+        path,heading,pinned=match.groups()
+        if (page and path!=page) or (section is not None and (heading or '')!=section):continue
+        key=(path,heading)
+        if key not in revisions:
+            try:revisions[key]=specification_revision(root,path,heading)
+            except (ValueError,OSError,UnicodeError):revisions[key]=None
+        current=revisions[key]
+        if pinned==current:continue
+        if count==limit:
+            return {'groups':list(groups.values()),'has_more':True,'next_after':after}
+        group=groups.setdefault(key,{'page':path,'section':heading or '',
+                                     'state':'changed' if current else 'missing','current_revision':current,'tasks':[]})
+        scope={'page':path,'section':heading,'revision':pinned}
+        group['tasks'].append({'id':task['id'],'code':f"{prefix}-{task['number']}",'title':task['title'],
+                               'status':task['status'],'revision':pinned,'evidence':specification_evidence(root,task,scope)})
+        count+=1
+        after=task['id']
+    return {'groups':list(groups.values()),'has_more':False,'next_after':after}
+
+
 def write_wiki(root, path, body):
     folder=(root/path).parent
     if folder.resolve()!=folder or not folder.is_relative_to(root/WIKI):
@@ -442,6 +516,8 @@ def operation(db, row, prefix, args):
                 'learning':learning_page(saved)}
     if action=='learning':
         return learning_page(load_state(root),args.get('after',0))
+    if action=='specification_impact':
+        return specification_impact(db,project,prefix,root,args)
     if action=='source':
         name=args.get('source','')
         if not isinstance(name,str):raise ValueError('Supply a project source path')

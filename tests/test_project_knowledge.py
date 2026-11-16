@@ -15,6 +15,36 @@ class ProjectKnowledgeTest(unittest.TestCase):
     def knowledge(self, project, action, **args):
         return run('project_knowledge',dict(project=project,actor=self.human,action=action,**args))
 
+    def test_specification_impact_is_section_scoped_and_paginated(self):
+        project,root=self.project()
+        relative='docs/agents/contract.md'
+        path=root/relative
+        path.parent.mkdir(parents=True)
+        path.write_text('# Contract\n\n## Scope\n\nOld rule\n\n## Other\n\nUnchanged\n',encoding='utf-8')
+        def task(key,section):
+            return run('task_plan',dict(project=project,actor=self.human,items=[dict(
+                key=key,title=key,description='Implement '+key,acceptance_criteria=['Verified'],
+                specification=dict(page=relative,section=section))]))['items'][0]
+        verified=task('scoped-check','scope')
+        run('task_update',dict(project=project,id=verified['id'],actor=self.human,evidence='Original test passed.'))
+        untouched=task('other-work','other')
+        self.assertEqual(self.knowledge(project,'specification_impact')['groups'],[])
+        path.write_text('# Contract\n\n## Scope\n\nNew rule\n\n## Other\n\nUnchanged\n',encoding='utf-8')
+        legacy=task('missing-heading-check','scope')
+        path.write_text('# Contract\n\n## Other\n\nUnchanged\n',encoding='utf-8')
+        run('task_update',dict(project=project,id=legacy['id'],actor=self.human,evidence='No recorded scope.'))
+        first=self.knowledge(project,'specification_impact',page=relative,section='scope',limit=1)
+        self.assertTrue(first['has_more'])
+        group=first['groups'][0]
+        self.assertEqual(group['state'],'missing')
+        self.assertEqual(group['tasks'][0]['id'],verified['id'])
+        self.assertEqual(group['tasks'][0]['evidence']['state'],'requires_review')
+        second=self.knowledge(project,'specification_impact',page=relative,after=first['next_after'],limit=1)
+        self.assertFalse(second['has_more'])
+        self.assertEqual(second['groups'][0]['tasks'][0]['evidence']['state'],'unknown')
+        self.assertEqual(second['groups'][0]['tasks'][0]['id'],legacy['id'])
+        self.assertNotIn(untouched['code'],str(first)+str(second))
+
     def test_empty_folder_persists_answers_and_applies_once(self):
         project,root=self.project()
         first=self.knowledge(project,'prepare')['plan']
