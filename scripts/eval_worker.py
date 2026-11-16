@@ -2,7 +2,9 @@
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -36,6 +38,43 @@ def count(value):
     return value
 
 
+def elapsed(value):
+    if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
+        raise ValueError('Elapsed seconds must be finite, nonnegative or null')
+    return value
+
+
+def capture_layer(kind, name, workflow, controls, loaded):
+    """Fingerprint the exact bytes handed to the worker, with no prompt text in reports."""
+    if kind not in ('rule', 'skill') or not re.fullmatch(r'[a-z0-9][a-z0-9._:-]{0,79}', name):
+        raise ValueError('Name one rule or skill')
+    if not isinstance(workflow, str) or not workflow.strip() or len(workflow) > 120:
+        raise ValueError('Identify the workflow used for both runs')
+    if not {'launch', 'verification'} <= controls.keys() or not all(
+        isinstance(key, str) and isinstance(value, bytes) for key, value in controls.items()
+    ):
+        raise ValueError('Supply the fixed launch and verification inputs')
+    fixed = {key: hashlib.sha256(value).hexdigest() for key, value in controls.items()}
+    return {'kind': kind, 'name': name, 'workflow': workflow, 'controls': fixed,
+            'loaded_sha256': hashlib.sha256(loaded).hexdigest() if loaded is not None else None}
+
+
+def validate_layer(value):
+    if not isinstance(value, dict) or set(value) != {'kind', 'name', 'workflow', 'controls', 'loaded_sha256'}:
+        raise ValueError('Supply the measured rule or skill launch manifest')
+    capture_layer(value['kind'], value['name'], value['workflow'], {'launch': b'', 'verification': b''}, None)
+    controls = value['controls']
+    if not isinstance(controls, dict) or not {'launch', 'verification'} <= controls.keys() or not all(
+        isinstance(key, str) and isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest)
+        for key, digest in controls.items()
+    ):
+        raise ValueError('Invalid fixed input fingerprints')
+    revision = value['loaded_sha256']
+    if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r'[a-f0-9]{64}', revision)):
+        raise ValueError('Invalid loaded revision fingerprint')
+    return value
+
+
 def score(trial, case):
     checks = trial['checks']
     if set(checks) != set(case['checks']) or any(type(value) is not bool for value in checks.values()):
@@ -62,7 +101,7 @@ def score(trial, case):
     }
 
 
-def compare(baseline, candidate):
+def compare(baseline, candidate, *, behavioral=False):
     def index(rows):
         result = {}
         for row in rows:
@@ -75,9 +114,10 @@ def compare(baseline, candidate):
     before, after = index(baseline), index(candidate)
     if not before or before.keys() != after.keys():
         raise ValueError('Baseline and candidate must have identical case/replicate pairs')
-    if {case for case, _ in before} != set(CASES):
+    if not behavioral and {case for case, _ in before} != set(CASES):
         raise ValueError('Run every published evaluation case')
     comparisons = []
+    experiment = None
     for key, old in sorted(before.items()):
         new = after[key]
         for field in ('client', 'model', 'fixture_sha256'):
@@ -86,14 +126,42 @@ def compare(baseline, candidate):
         if old['client'] not in ('codex', 'claude'):
             raise ValueError('Use Codex or Claude provider counters')
         left, right = (score(row, CASES[key[0]]) for row in (old, new))
+        if behavioral:
+            layers = [validate_layer(row.get('layer')) for row in (old, new)]
+            metadata = [{k: v for k, v in layer.items() if k != 'loaded_sha256'} for layer in layers]
+            revisions = [layer['loaded_sha256'] for layer in layers]
+            if metadata[0] != metadata[1] or revisions[0] == revisions[1]:
+                raise ValueError('Change one named rule or skill and keep the workflow and other inputs fixed')
+            identity = (metadata[0]['kind'], metadata[0]['name'], metadata[0]['workflow'], *revisions)
+            if experiment is not None and experiment != identity:
+                raise ValueError('Compare the same rule or skill revisions in every pair')
+            experiment = identity
+            for result, row, layer in zip((left, right), (old, new), layers):
+                result.update(layer=layer, tool_actions=count(row.get('tool_actions')), seconds=elapsed(row.get('seconds')))
+        metrics = ('calls', 'redundant_calls', 'input_tokens', 'uncached_input_tokens', 'output_tokens')
+        if behavioral:metrics += ('tool_actions', 'seconds')
         delta = {name: right[name] - left[name] if left[name] is not None and right[name] is not None else None
-                 for name in ('calls', 'redundant_calls', 'input_tokens', 'uncached_input_tokens', 'output_tokens')}
+                 for name in metrics}
         comparable = left['passed'] and right['passed']
         comparisons.append({'case': key[0], 'replicate': key[1], 'baseline': left, 'candidate': right,
                             'quality_regression': left['passed'] and not right['passed'],
                             'matched_success': comparable, 'candidate_minus_baseline': delta if comparable else None})
-    return {'comparisons': comparisons, 'matched_successes': sum(item['matched_success'] for item in comparisons),
-            'quality_regressions': sum(item['quality_regression'] for item in comparisons)}
+    report = {'comparisons': comparisons, 'matched_successes': sum(item['matched_success'] for item in comparisons),
+              'quality_regressions': sum(item['quality_regression'] for item in comparisons)}
+    if behavioral:
+        changes = [pair['candidate_minus_baseline']['uncached_input_tokens'] for pair in comparisons
+                   if pair['matched_success']]
+        if report['quality_regressions']:
+            advice = ('keep_baseline', 'A verified control passed where the candidate failed.')
+        elif len(changes) < 2 or len(changes) != len(comparisons) or any(value is None for value in changes):
+            advice = ('collect_more', 'Need at least two passing matched pairs with known uncached input.')
+        elif all(value < 0 for value in changes):
+            advice = ('remove' if experiment[-1] is None else 'keep_candidate',
+                      'All measured pairs passed with lower uncached input.')
+        else:
+            advice = ('trim_or_retest', 'Measure a narrower variant or gather more evidence on mixed costs.')
+        report['recommendation'] = dict(zip(('action', 'reason'), advice))
+    return report
 
 
 def git(root,*args,check=True):
@@ -222,9 +290,13 @@ def collect_fixture(root,run_id,replicate,observed):
         operation='task_get' if label=='show_same_scope' else None
         if operation in calls:calls[calls.index(operation)]=label
         else:calls.append(label)
-    return {'case':fixture['case'],'replicate':replicate,'client':sample['client'],'model':sample['model'],
+    trial={'case':fixture['case'],'replicate':replicate,'client':sample['client'],'model':sample['model'],
             'fixture_sha256':fixture['fixture_sha256'],'checks':checks,'calls':calls,'input_includes_cache':True,
             'usage':{key:sample.get(key) for key in ('input_tokens','cached_input_tokens','output_tokens')}}
+    if 'layer' in observed:
+        trial.update(layer=validate_layer(observed['layer']),tool_actions=count(observed.get('tool_actions')),
+                     seconds=elapsed(observed.get('seconds')))
+    return trial
 
 
 def main():
@@ -232,6 +304,7 @@ def main():
     parser.add_argument('--cases', action='store_true')
     parser.add_argument('--baseline', type=Path)
     parser.add_argument('--candidate', type=Path)
+    parser.add_argument('--behavioral', action='store_true', help='Compare one measured rule or skill change')
     parser.add_argument('--fixture',type=Path)
     parser.add_argument('--prepare',choices=sorted(CASES))
     parser.add_argument('--collect',metavar='RUN_ID')
@@ -249,7 +322,8 @@ def main():
             parser.error(str(error))
     elif args.baseline and args.candidate:
         try:
-            result = compare(*(json.loads(path.read_text(encoding='utf-8')) for path in (args.baseline, args.candidate)))
+            result = compare(*(json.loads(path.read_text(encoding='utf-8')) for path in (args.baseline, args.candidate)),
+                             behavioral=args.behavioral)
         except (OSError, ValueError, KeyError, TypeError) as error:
             parser.error(str(error))
     else:

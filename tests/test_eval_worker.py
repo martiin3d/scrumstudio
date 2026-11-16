@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 from unittest.mock import patch
 
-from scripts.eval_worker import CASES, compare
+from scripts.eval_worker import CASES, capture_layer, compare
 
 
 def trials():
@@ -57,3 +57,34 @@ class WorkerEvaluationTest(unittest.TestCase):
         after[0]['model'] = 'different'
         with self.assertRaisesRegex(ValueError, 'mismatched model'):
             compare(before, after)
+
+    def test_behavioral_comparison_checks_manifests_and_reports_single_case(self):
+        fixed={'launch':b'fixed workflow', 'verification':b'exact check'}
+        before, after = trials()[:2], trials()[:2]
+        for variant, layer in ((before,b'long rule'), (after,b'short rule')):
+            for row in variant:
+                row['layer']=capture_layer('rule','scope','native-cli',fixed,layer)
+                row['seconds']=3.5
+                row['tool_actions']=3
+        after[0]['usage']['input_tokens']=85
+        after[1]['usage']['input_tokens']=80
+        report=compare(before,after,behavioral=True)
+        self.assertEqual(report['recommendation']['action'],'keep_candidate')
+        self.assertEqual(report['comparisons'][0]['candidate_minus_baseline']['seconds'],0)
+        self.assertEqual(compare(before[:1],after[:1],behavioral=True)['recommendation']['action'],'collect_more')
+        after[0]['layer']=capture_layer('rule','scope','native-cli',fixed | {'verification':b'changed check'},b'short rule')
+        with self.assertRaisesRegex(ValueError,'other inputs fixed'):
+            compare(before,after,behavioral=True)
+
+    def test_behavioral_unknown_costs_and_failed_acceptance_remain_explicit(self):
+        fixed={'launch':b'fixed', 'verification':b'fixed'}
+        before, after = trials()[:1], trials()[:1]
+        before[0]['layer']=capture_layer('skill','playwright','native-cli',fixed,None)
+        after[0]['layer']=capture_layer('skill','playwright','native-cli',fixed,b'loaded skill bytes')
+        after[0]['usage']={}
+        report=compare(before,after,behavioral=True)
+        self.assertIsNone(report['comparisons'][0]['candidate_minus_baseline']['uncached_input_tokens'])
+        after[0]['checks']['verified_finish']=False
+        report=compare(before,after,behavioral=True)
+        self.assertIsNone(report['comparisons'][0]['candidate_minus_baseline'])
+        self.assertEqual(report['recommendation']['action'],'keep_baseline')
