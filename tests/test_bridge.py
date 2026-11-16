@@ -101,6 +101,49 @@ class BridgeTest(unittest.TestCase):
         self.assertIn(task['acceptance_criteria'][0],prompt)
         self.assertEqual(sections['_budget']['overflow_bytes'],len(prompt.encode('utf-8'))-4096)
 
+    def test_native_light_prompt_carries_scope_policy_and_verified_finish(self):
+        task={'id':7,'code':'FIX-7','version':'fixture-version','status':'In Progress',
+              'description':'Modify only app.py.','acceptance_criteria':['Run the check.'],
+              'checklist':[{'text':'Check the result','done':False}],'files':['app.py']}
+        started={'task':task,'workflow':'Light','file_lock_mode':'checkout','token':'private-claim'}
+        policy={'execution_instructions':'Project rule.'}
+        sections={}
+        light=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{},policy,started,'Role rule.',sections)
+        self.assertEqual(sections['_budget']['renderer'],'light')
+        self.assertEqual(light.count('Run the check.'),1)
+        for text in ('app.py','Check the result','finish --task FIX-7 --evidence TEXT',
+                     'Stop and permissions','--paths','Project rule.','Role rule.'):
+            self.assertIn(text,light)
+        self.assertNotIn('fixture-version',light)
+        self.assertNotIn('private-claim',light)
+        standard=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{},policy,started|{'workflow':'Standard'},'Role rule.',sections)
+        self.assertEqual(sections['_budget']['renderer'],'standard')
+        self.assertLess(len(light.encode()),len(standard.encode()))
+
+    def test_native_light_prompt_retains_full_contract_for_exceptions(self):
+        task={'code':'FIX-7','files':['app.py'],'acceptance_criteria':['Run the check.']}
+        started={'task':task,'workflow':'Light'}
+        exceptions=(
+            ({},{},{'task':task|{'continuity':'Continue from the previous result.'}}),
+            ({},{},{'task':task|{'category':'Git recovery'}}),
+            ({},{},{'task':task|{'verification_level':'full'}}),
+            ({},{},{'task':task|{'review':{'open':True}}}),
+            ({},{},{'task':task|{'acceptance_criteria':[]}}),
+            ({},{},{'dirty_planned':['app.py']}),
+            ({},{},{'git':{'worktree':'other checkout'}}),
+            ({'batch':[{'code':'FIX-7'}]},{},{}),
+            ({},{'agent_followup_tasks':True},{}),
+            ({},{'autonomy_mode':'Autonomous'},{}),
+        )
+        for offer,policy,extra in exceptions:
+            with self.subTest(offer=offer,policy=policy,extra=extra):
+                sections={}
+                prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',offer,policy,started|extra,sections=sections)
+                self.assertEqual(sections['_budget']['renderer'],'standard')
+                self.assertIn('SCRUM_CLI_CONTEXT',prompt)
+                if extra.get('task',{}).get('continuity'):
+                    self.assertIn('Continue from the previous result.',prompt)
+
     def test_cli_command_disables_only_scrum_and_keeps_specialist_selection(self):
         with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=['-c','mcp_servers.unity.enabled=true']):
             cmd=agent_bridge.command('codex',Path('.'),'scope',coordination_channel='cli')
@@ -331,6 +374,16 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn('git_recovery',result)
         rpc.call.return_value={'claim_deferred':'Git branch preparation failed: Dependency branch not integrated'}
         self.assertIn('Dependency branch',agent_bridge.preclaim(rpc,1,9,'codex',70,{})['git_recovery'])
+
+    def test_preclaim_passes_effective_workflow_to_renderer(self):
+        rpc=Mock()
+        rpc.call.return_value={'workflow':{'configured':'Auto','effective':'Light'},
+                               'task':{'code':'FIX-70','files':['app.py'],'acceptance_criteria':['Run checks.']},
+                               'claim':{'claimed':True,'token':'private','file_lock_mode':'checkout'}}
+        started=agent_bridge.preclaim(rpc,1,9,'codex',70,{})
+        self.assertEqual(started['workflow'],'Light')
+        self.assertTrue(agent_bridge.light_launch({}, {},started))
+        rpc.call.assert_called_once()
 
     def test_standard_preclaim_uses_explicit_claim_after_clean_ownership_review(self):
         deferred={'checkpoint':{'should_stop':False},'claim_deferred':'Standard workflow required: Standard selected by project policy','own_file_locks':{'has_more':False},'measurement_session':'fixture'}

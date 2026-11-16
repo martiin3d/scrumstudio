@@ -233,37 +233,69 @@ def file_scope_guidance(started):
 STARTUP_BUDGET_BYTES=4096
 
 
+def light_launch(offer,policy,started):
+    task=started['task']
+    deferred=('continuity','continuity_stale','evidence','workspace_delta','review','preserved_inputs',
+              'decision_context','pending_ai_notes','attachment_count','specification','approved_wiki_changes',
+              'blocked_reason','dependencies','files_page','context_batch')
+    git=started.get('git') or {}
+    return (started.get('workflow')=='Light' and not (offer.get('batch') or policy.get('agent_followup_tasks'))
+            and policy.get('autonomy_mode','Standard')=='Standard'
+            and task.get('category')!='Git recovery' and task.get('verification_level')!='full'
+            and bool(task.get('files') and task.get('acceptance_criteria'))
+            and not any(task.get(key) for key in deferred)
+            and not (started.get('dirty_planned') or git.get('worktree') or git.get('error') or git.get('refreshed_from')))
+
+
 def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections=None):
     import shlex
     from scrum_cli import redact
     from context_tools import startup_task
     cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
-    rules=(
-        f'Use scrum-work for project {project}, actor {actor}, in {folder}. '
-        'The supervisor claimed the task below. Resume its continuity and reuse valid checks. '
-        'Use the native CLI with inherited SCRUM_CLI_CONTEXT. Keep that context private. '
-        'Start/claim and quota checks are handled by the supervisor. Respect Stop and permissions. '
-        'Read scrum-work references/cli.md for commands, evidence and recovery when needed. '
-        'Use codebase-memory for structural queries with coverage/source fallback. '
-        f'CLI: {cli} finish --task CODE --evidence TEXT. Finish only verified acceptance.'
-    )
-    if started.get('file_lock_mode')=='checkout':
-        rules+=' Checkout exclusivity: do not call file_locks/lock. Declare additional_files at finish (--paths).'
-    else:
-        rules+=' Reserve newly discovered output paths with CLI lock before editing.'
-    if policy.get('agent_followup_tasks'):
-        rules+=' For a discovered prerequisite use plan with defer_task=current ID. PLAN_REJECTED rolled back. Exit on deferred=true.'
-    if offer.get('batch'):
-        rules+=' Finish each task separately. Continue only with the fresh next.claim and next.task. Exit when the batch ends or the next claim fails.'
-    else:
-        rules+=' Finish closes the session. Exit so the supervisor can select the next task.'
     task=started['task']
-    if task.get('category')=='Git recovery':
-        rules+=' Git recovery: preserve staging and unrelated work, follow recorded parents, and reuse retained verification. Verify conflict-resolution edits. Never force push.'
+    light=light_launch(offer,policy,started)
+    if light:
+        rules=(
+            'The supervisor already claimed this task in the current checkout. Work within the supplied scope. '
+            'Inspect the relevant files, make the change, and run the acceptance checks. '
+            'Reuse a passing check while its inputs match. Respect Stop and permissions. '
+            'The native CLI uses your inherited private context. '
+            f'Finish verified work with {cli} finish --task {task["code"]} --evidence TEXT, then exit. '
+            'Open scrum-work references only for exceptions or missing information.'
+        )
+        if started.get('file_lock_mode')=='checkout':
+            rules+=' Declare extra output files at finish with --paths.'
+        else:
+            rules+=' Reserve any extra output files with CLI lock before editing.'
+    else:
+        rules=(
+            f'Use scrum-work for project {project}, actor {actor}, in {folder}. '
+            'The supervisor claimed the task below. Resume its continuity and reuse valid checks. '
+            'Use the native CLI with inherited SCRUM_CLI_CONTEXT. Keep that context private. '
+            'Start/claim and quota checks are handled by the supervisor. Respect Stop and permissions. '
+            'Read scrum-work references/cli.md for commands, evidence and recovery when needed. '
+            'Use codebase-memory for structural queries with coverage/source fallback. '
+            f'CLI: {cli} finish --task CODE --evidence TEXT. Finish only verified acceptance.'
+        )
+        if started.get('file_lock_mode')=='checkout':
+            rules+=' Checkout exclusivity: do not call file_locks/lock. Declare additional_files at finish (--paths).'
+        else:
+            rules+=' Reserve newly discovered output paths with CLI lock before editing.'
+        if policy.get('agent_followup_tasks'):
+            rules+=' For a discovered prerequisite use plan with defer_task=current ID. PLAN_REJECTED rolled back. Exit on deferred=true.'
+        if offer.get('batch'):
+            rules+=' Finish each task separately. Continue only with the fresh next.claim and next.task. Exit when the batch ends or the next claim fails.'
+        else:
+            rules+=' Finish closes the session. Exit so the supervisor can select the next task.'
+        if task.get('category')=='Git recovery':
+            rules+=' Git recovery: preserve staging and unrelated work, follow recorded parents, and reuse retained verification. Verify conflict-resolution edits. Never force push.'
     diagnostics={key:started[key] for key in ('dirty_planned','file_lock_mode') if started.get(key)}
     git=started.get('git') or {}
     diagnostics.update({key:git[key] for key in ('branch','parent','worktree','error','refreshed_from') if git.get(key)})
     claim=redact(startup_task(task))
+    if light:
+        for field in ('id','version','status','category'):
+            claim.pop(field,None)
     def serialize_claim():
         return 'Claim: '+json.dumps(claim,ensure_ascii=False,separators=(',',':'))
     parts={
@@ -292,7 +324,8 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         sections.update({name:len(value.encode('utf-8')) for name,value in parts.items() if value})
         actual=len(prompt.encode('utf-8'))
         sections['_budget']={'limit_bytes':STARTUP_BUDGET_BYTES,'initial_bytes':initial_bytes,
-                             'deferred':deferred,'overflow_bytes':max(0,actual-STARTUP_BUDGET_BYTES)}
+                             'deferred':deferred,'overflow_bytes':max(0,actual-STARTUP_BUDGET_BYTES),
+                             'renderer':'light' if light else 'standard'}
     return prompt
 
 
@@ -407,7 +440,9 @@ def preclaim(rpc,project,actor,client,task,observed):
         branch_reason=('Checkout branch '+str(busy.get('current_branch','unknown'))+' cannot switch to '+str(busy.get('wanted','task branch'))+': '+str(busy.get('reason') or 'uncommitted work must be preserved')) if busy else ''
         reason=result.get('claim_deferred') or claim.get('reason') or branch_reason or 'Task ownership was not granted; inspect dependencies, file reservations and workflow policy'
         return {'should_stop':True,'reason':str(reason)[:500],**({'git_recovery':str(reason)[:1000]} if 'Git branch preparation failed:' in str(reason) else {})}
-    return {'task':result['task'],'token':claim['token'],'measurement_session':result.get('measurement_session'),**{k:claim[k] for k in ('dirty_planned','git','file_lock_mode') if k in claim}}
+    return {'task':result['task'],'token':claim['token'],'measurement_session':result.get('measurement_session'),
+            'workflow':(result.get('workflow') or {}).get('effective'),
+            **{k:claim[k] for k in ('dirty_planned','git','file_lock_mode') if k in claim}}
 
 def preclaimed_prompt(started):
     task=started['task']
@@ -775,9 +810,11 @@ def main():
                         chat_event(rpc,args.project,actor,f'{args.client} worker {args.worker}: Wakeup held: '+started['reason'])
                         time.sleep(2)
                         continue
-                    if started.get('task'):
-                        prompt=execution_prompt(args.project,folder,actor,args.client,offer,policy,role,automatic,bool(recovery_id))+preclaimed_prompt(started)
-                    if started.get('task',{}).get('category')=='Git recovery':
+                    channel=policy.get('coordination_channel','cli')
+                    prompt_sections={}
+                    if channel=='cli':
+                        prompt=cli_prompt(args.project,folder,actor,args.client,offer,policy,started,role,prompt_sections)
+                    elif started['task'].get('category')=='Git recovery':
                         prompt=(f'Use scrum-work for the existing scoped Git recovery in project {args.project}, actor {actor}. '
                             'The supervisor already claimed it. Preserve unrelated work and staging, honor recorded branch parents, '
                             'never force push or discard work. Read existing native Git reports and retained verification first; '
@@ -786,9 +823,8 @@ def main():
                             'For an unresolved concrete constraint save precise continuity; an unidentified owner alone is not a blocker. '
                             'Respect Stop/quota/reservations and real permission review. '
                             f'Python: {worker_python()}; MCP fallback: {ROOT / "scripts/mcp_client.py"}. '+preclaimed_prompt(started))
-                    channel=policy.get('coordination_channel','cli')
-                    prompt_sections={}
-                    if channel=='cli':prompt=cli_prompt(args.project,folder,actor,args.client,offer,policy,started,role,prompt_sections)
+                    else:
+                        prompt=execution_prompt(args.project,folder,actor,args.client,offer,policy,role,automatic,bool(recovery_id))+preclaimed_prompt(started)
                     if args.client=='codex' and policy.get('agent_approval_mode')=='Full access':
                         prompt+='\nThis launch uses human-authorized Full access with approval policy never. Execute authorized project commands directly; previous sandbox-only failures do not establish a current access failure. The escalation advice above applies only to sandboxed launches. Do not request permission that this launch already has. Actual organization/OS restrictions still apply; diagnose real failures and attempt a bounded authorized repair, without weakening Stop, quota, ownership or verification.'
                     run_folder=Path(started.get('git',{}).get('worktree') or folder)
