@@ -865,7 +865,9 @@ function bindWorkerReadiness(profiles,sessions){
     content.innerHTML=report?`<p><strong>${esc(report.state.replaceAll('_',' '))}</strong> · ${esc(report.task?report.task.code+' · '+report.task.title:'No available task')}</p>
       <p>Coordination: ${esc(report.coordination)} · Effective MCP tools: ${esc(report.effective_specialists.join(', ')||'none selected')}</p>
       <ul>${report.checks.map(item=>`<li><strong>${esc(item.key)} · ${esc(item.state)}</strong>
-        <p>${esc(item.detail)} ${item.next?esc(item.next):''}</p></li>`).join('')}</ul>`:'';
+        <p>${esc(item.detail)} ${item.next?esc(item.next):''}</p></li>`).join('')}</ul>
+      ${report.skill_suggestions?.length?`<h4>Suggested installed skills</h4><ul>
+        ${report.skill_suggestions.map(item=>`<li><strong>${esc(item.name)}</strong> · ${esc(item.reason)} <small>${esc(item.paths.join(', '))}</small></li>`).join('')}</ul>`:''}`:'';
   };
   picker.onchange=()=>{readinessSelection=picker.value;render(workerReadinessCache.get(key()));};
   picker.onchange();

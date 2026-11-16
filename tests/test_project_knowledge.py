@@ -16,6 +16,21 @@ class ProjectKnowledgeTest(unittest.TestCase):
     def knowledge(self, project, action, **args):
         return run('project_knowledge',dict(project=project,actor=self.human,action=action,**args))
 
+    def test_readiness_suggests_only_relevant_installed_skills_for_the_worker(self):
+        project,root=self.project()
+        home=root/'isolated-home'
+        skills=root/'.codex/skills/playwright'
+        skills.mkdir(parents=True)
+        (skills/'SKILL.md').write_text('# Browser check',encoding='utf-8')
+        run('task_create',dict(project=project,title='Refactor web preview',description='Change the web preview',
+                               files=['public/app.js'],acceptance_criteria=['Verify the change in the browser.']))
+        with patch('project_knowledge.Path.home',return_value=home),patch.dict('os.environ',{'CODEX_HOME':str(home/'.codex')}):
+            codex=run('worker_readiness',dict(project=project,client='codex'))
+            claude=run('worker_readiness',dict(project=project,client='claude'))
+        self.assertEqual([item['name'] for item in codex['skill_suggestions']],['playwright'])
+        self.assertEqual(codex['skill_suggestions'][0]['paths'],['public/app.js'])
+        self.assertNotIn('skill_suggestions',claude)
+
     def test_graph_probe_uses_the_matching_checkout_and_is_bounded(self):
         project,root=self.project()
         args={'project':project,'paths':['store.py','workflow.py']}

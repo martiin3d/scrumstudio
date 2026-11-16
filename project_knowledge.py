@@ -444,6 +444,36 @@ def specification_impact(db, project, prefix, root, args):
     return {'groups':list(groups.values()),'has_more':False,'next_after':after}
 
 
+def skill_suggestions(root,task,client):
+    """Match a small catalog to observed task scope and installed skill files."""
+    if not root or not task:return []
+    root=Path(root)
+    home=Path.home()
+    shared=(root/'.agents/skills',home/'.agents/skills')
+    roots=shared+((root/'.codex/skills',Path(os.getenv('CODEX_HOME',home/'.codex'))/'skills') if client=='codex'
+                  else (root/'.claude/skills',home/'.claude/skills'))
+    files=task.get('files',[])
+    text=' '.join([task.get('title',''),task.get('description',''),*task.get('acceptance_criteria',[])]).casefold()
+    suggestions=[]
+
+    def suggest(name,reason,paths):
+        try:installed=any((folder/name/'SKILL.md').is_file() for folder in roots)
+        except OSError:installed=False
+        if installed:suggestions.append({'name':name,'reason':reason,'paths':paths[:2]})
+
+    authoring=[name for name in files if PurePosixPath(name).name=='SKILL.md']
+    if authoring:
+        suggest('skill-creator','The task edits a skill definition.',authoring)
+    frontend=[name for name in files if name.startswith(('public/','frontend/','web/')) and
+              PurePosixPath(name).suffix in ('.html','.css','.js','.ts','.tsx','.jsx')]
+    if frontend and re.search(r'\b(browser|ui|interface|web|navegador|interfaz)\b',text):
+        suggest('playwright','The planned web files and acceptance call for a browser check.',frontend)
+    source=[name for name in files if PurePosixPath(name).suffix in ('.py','.js','.ts','.tsx','.cs','.go','.rs')]
+    if source and re.search(r'\b(callers?|dependencies|refactor|migration|architecture|impact|migración|dependencias|arquitectura)\b',text):
+        suggest('codebase-memory','The task calls for structural tracing of source changes.',source)
+    return suggestions[:2]
+
+
 def worker_readiness(root, workspace, task, args, channel, stop='', unavailable=''):
     from mcp_selection import worker_readiness as effective_worker
     from scripts.verification_receipts import resume_checks
@@ -522,6 +552,8 @@ def worker_readiness(root, workspace, task, args, channel, stop='', unavailable=
             'task':{key:task[key] for key in ('id','code','title','status')} if task else None,
             'state':'blocked' if 'blocked' in statuses else 'needs_attention' if statuses-{'ready'} else 'ready',
             'checks':checks,**worker}
+    suggestions=skill_suggestions(root,task,args['client'])
+    if suggestions:report['skill_suggestions']=suggestions
     version=digest(json.dumps(report,sort_keys=True).encode())
     if args.get('version_seen')==version:
         return {'changed':False,'version':version}
