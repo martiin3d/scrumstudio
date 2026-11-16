@@ -54,6 +54,17 @@ class OverheadTest(unittest.TestCase):
         a = {'project':self.p,'actor':self.actor,'client':'codex','session_used_percent':12,'weekly_used_percent':3}
         self.assertEqual(overhead.cached_usage(a), a)
 
+    def test_audit_exposes_budget_without_logging_prompt(self):
+        overhead.record_startup(self.p,self.actor,'run','codex','fixture',None,[7],4120,{
+            'claim':4050,'rules':69,'_budget':{'limit_bytes':4096,'initial_bytes':7300,
+                                              'deferred':['knowledge'],'overflow_bytes':24}})
+        audit=run('coordination_metrics',{'project':self.p,'include_audit':True})['audit']
+        sample=audit['startup_samples'][0]
+        self.assertEqual(sample['prompt_bytes'],4120)
+        self.assertEqual(sample['sections'],{'claim':4050,'rules':69})
+        self.assertEqual(sample['budget']['deferred'],['knowledge'])
+        self.assertEqual(audit['startup_budget']['with_essential_overflow'],1)
+
 
 class CachedUsageTest(unittest.TestCase):
     setUp = test_storage.StorageTest.setUp

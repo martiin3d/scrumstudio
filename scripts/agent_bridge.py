@@ -230,6 +230,9 @@ def file_scope_guidance(started):
             'Do not adopt unrelated or pre-existing dirty files. This overrides generic per-file reservation wording; Stop/quota and actual permissions still apply.')
 
 
+STARTUP_BUDGET_BYTES=4096
+
+
 def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections=None):
     import shlex
     from scrum_cli import redact
@@ -260,16 +263,37 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
     diagnostics={key:started[key] for key in ('dirty_planned','file_lock_mode') if started.get(key)}
     git=started.get('git') or {}
     diagnostics.update({key:git[key] for key in ('branch','parent','worktree','error','refreshed_from') if git.get(key)})
+    claim=redact(startup_task(task))
+    def serialize_claim():
+        return 'Claim: '+json.dumps(claim,ensure_ascii=False,separators=(',',':'))
     parts={
         'rules':rules,
-        'claim':'Claim: '+json.dumps(redact(startup_task(task)),ensure_ascii=False,separators=(',',':')),
+        'claim':serialize_claim(),
         'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
         'project_policy':autonomy_prompt(policy).strip(),
         'role':'Role instructions: '+role if role else '',
     }
+    def render():
+        return '\n'.join(value for value in parts.values() if value)
+
+    prompt=render()
+    initial_bytes=len(prompt.encode('utf-8'))
+    deferred=[]
+    # Preserve the execution contract. The budget can overflow with essential scope.
+    for field in ('context_batch','knowledge','decision_context','preserved_inputs','workspace_delta','evidence'):
+        if len(prompt.encode('utf-8'))<=STARTUP_BUDGET_BYTES:break
+        if field not in claim:continue
+        deferred.append(field)
+        claim.pop(field)
+        parts['claim']=serialize_claim()
+        parts['deferred']='Deferred '+', '.join(deferred)+f". Use the native CLI show --task {task['code']} when needed. Review deferred decisions or inputs before affected edits and deferred checks before reuse."
+        prompt=render()
     if sections is not None:
         sections.update({name:len(value.encode('utf-8')) for name,value in parts.items() if value})
-    return '\n'.join(value for value in parts.values() if value)
+        actual=len(prompt.encode('utf-8'))
+        sections['_budget']={'limit_bytes':STARTUP_BUDGET_BYTES,'initial_bytes':initial_bytes,
+                             'deferred':deferred,'overflow_bytes':max(0,actual-STARTUP_BUDGET_BYTES)}
+    return prompt
 
 
 def autonomy_prompt(policy):

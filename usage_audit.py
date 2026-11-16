@@ -148,6 +148,13 @@ def audit(db,project,root,start=None,end=None,include_logs=False):
         if sample['run_id'] in by_run and by_run[sample['run_id']].get('input_tokens') is not None else sample
         for sample in overhead.startup_samples(project,start,end)
     ]
+    budgeted=[sample for sample in result['startup_samples'] if 'budget' in sample]
+    result['startup_budget']={
+        'samples':len(budgeted),
+        'with_deferred_context':sum(bool(sample['budget']['deferred']) for sample in budgeted),
+        'with_essential_overflow':sum(bool(sample['budget']['overflow_bytes']) for sample in budgeted),
+        'scope':'Bounded native startup sample. Byte counts exclude the provider catalog and later tool output.',
+    }
     import usage_measurement
     measurement=usage_measurement.summary(root)
     if measurement:result['measurement']=measurement

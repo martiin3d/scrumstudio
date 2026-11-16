@@ -79,7 +79,27 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('decision_context',prompt)
         self.assertNotIn('metadata-only',prompt)
         self.assertNotIn('internal-measurement',prompt)
+        budget=sections.pop('_budget')
+        self.assertEqual(budget['deferred'],[])
+        self.assertEqual(budget['overflow_bytes'],0)
         self.assertEqual(sum(sections.values())+len(sections)-1,len(prompt.encode('utf-8')))
+
+    def test_startup_budget_defers_optional_context_and_preserves_essential_overflow(self):
+        task={'id':7,'code':'FIX-7','acceptance_criteria':['Verificación vigente'],
+              'continuity':'Next: check the exported state.', 'files':['app.py'],
+              'preserved_inputs':{'items':[{'note':'optional-archive-'+('á'*3000)}]}}
+        sections={}
+        prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{}, {},{'task':task},sections=sections)
+        self.assertLessEqual(len(prompt.encode('utf-8')),4096)
+        self.assertIn('Verificación vigente',prompt)
+        self.assertIn('Next: check the exported state.',prompt)
+        self.assertIn('show --task FIX-7',prompt)
+        self.assertNotIn('optional-archive-',prompt)
+        self.assertEqual(sections['_budget']['deferred'],['preserved_inputs'])
+        task['acceptance_criteria']=['ñ'*2500]
+        prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{}, {},{'task':task},sections=sections)
+        self.assertIn(task['acceptance_criteria'][0],prompt)
+        self.assertEqual(sections['_budget']['overflow_bytes'],len(prompt.encode('utf-8'))-4096)
 
     def test_cli_command_disables_only_scrum_and_keeps_specialist_selection(self):
         with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=['-c','mcp_servers.unity.enabled=true']):

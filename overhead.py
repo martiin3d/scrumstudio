@@ -54,7 +54,14 @@ def startup_samples(project,start=None,end=None,limit=30):
             where='WHERE startup.at BETWEEN ? AND ?' if start is not None else ''
             params=(start,end,limit) if where else (limit,)
             rows=db.execute('SELECT startup.*, (SELECT SUM(calls) FROM timed_calls WHERE timed_calls.session=startup.session AND timed_calls.channel IN (\'cli\',\'mcp\')) AS coordination_calls FROM startup '+where+' ORDER BY at DESC LIMIT ?',params)
-            return [dict(row,sections=json.loads(row['sections']),tasks=json.loads(row['tasks'])) for row in rows]
+            samples=[]
+            for row in rows:
+                sections=json.loads(row['sections'])
+                budget=sections.pop('_budget',None)
+                sample=dict(row,sections=sections,tasks=json.loads(row['tasks']))
+                if budget is not None:sample['budget']=budget
+                samples.append(sample)
+            return samples
     except (OSError,ValueError,sqlite3.Error):
         return []
 
