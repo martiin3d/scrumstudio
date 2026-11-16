@@ -141,6 +141,38 @@ def effective(client,folder,home=None):
     return {'mode':choice['mode'],'effective_specialists':sorted(names-{REQUIRED}),
             'scrum_registered':REQUIRED in configured,'missing':missing,'warnings':warnings}
 
+
+def worker_readiness(client, folder, channel):
+    import shutil
+    from scripts.cli_runtime import codex_executable
+
+    if client not in CLIENTS:
+        raise ValueError('Select Codex or Claude')
+    checks=[]
+    try:
+        executable=codex_executable() if client=='codex' else shutil.which('claude')
+    except (OSError,RuntimeError):
+        executable=None
+    checks.append({'key':'runtime','state':'ready' if executable else 'missing',
+                   'detail':client+' CLI detected locally.' if executable else client+' CLI is unavailable.',
+                   **({} if executable else {'next':'Install or configure the selected CLI runtime.'})})
+    try:
+        tools=effective(client,folder)
+        if client=='codex' and tools['mode']=='selected' and not tools['missing'] and not tools['warnings']:
+            codex_options(folder)
+    except (OSError,ValueError):
+        tools={'effective_specialists':[]}
+        checks.append({'key':'tools','state':'unknown','detail':'The worker tool configuration could not be resolved.',
+                       'next':'Review the selected provider and MCP settings.'})
+    else:
+        state='missing' if tools['missing'] else 'unknown' if tools['warnings'] else 'ready'
+        detail=('Missing selected servers: '+', '.join(tools['missing']) if tools['missing'] else
+                'Some configuration files could not be read.' if tools['warnings'] else
+                'The effective configured tool names were resolved.')
+        checks.append({'key':'tools','state':state,'detail':detail,
+                       **({} if state=='ready' else {'next':'Update MCP selection in Settings and check again.'})})
+    return {'coordination':channel,'effective_specialists':tools['effective_specialists'],'checks':checks}
+
 def codex_options(folder):
     configured,names=selected('codex',folder)
     if names is None:return []

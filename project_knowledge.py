@@ -444,6 +444,90 @@ def specification_impact(db, project, prefix, root, args):
     return {'groups':list(groups.values()),'has_more':False,'next_after':after}
 
 
+def worker_readiness(root, workspace, task, args, channel, stop='', unavailable=''):
+    from mcp_selection import worker_readiness as effective_worker
+    from scripts.verification_receipts import resume_checks
+
+    def check(key,state,detail,next_action=None):
+        checks.append({'key':key,'state':state,'detail':detail,
+                       **({'next':next_action} if next_action else {})})
+
+    has_root=bool(root and Path(root).is_dir())
+    worker=effective_worker(args['client'],root,channel) if has_root else {
+        'coordination':channel,'effective_specialists':[],'checks':[]}
+    checks=worker.pop('checks')
+    if stop:
+        check('worker','blocked',stop,'Resolve the recorded Stop, quota or capacity condition before starting.')
+    if not has_root:
+        check('workspace','missing','The project folder is unavailable.','Open an available project folder.')
+    else:
+        root=Path(root)
+        manifest=source_manifest(root)
+        try:onboard=bool(manifest.get('onboarding') or load_state(root).get('phase')=='applied')
+        except (OSError,ValueError,AttributeError):onboard=None
+        if not onboard:
+            check('onboarding','unknown' if onboard is None else 'missing',
+                  'The onboarding record is unreadable.' if onboard is None else 'No accepted onboarding record.',
+                  'Open Wiki → Project setup and review the plan.')
+        else:
+            check('onboarding','ready','Onboarding is applied.')
+        if not safe_file(root,INDEX.as_posix()):
+            check('wiki','missing','The wiki index is missing.','Open Wiki → Project setup or restore the versioned index.')
+        else:
+            knowledge=knowledge_context(workspace or root,task) if task else None
+            pages=(knowledge or {}).get('pages',[])
+            try:
+                review=reassess(root,manifest)
+                affected=[item for item in [*review['sections'],*review['references_changed']] if item['page'] in pages]
+                issues=[item for item in diagnose(root) if item['path'] in {INDEX.as_posix(),*pages}]
+            except (KeyError,OSError,TypeError,ValueError,AttributeError):
+                check('wiki','unknown','The wiki sources or links could not be checked.','Use Wiki → Check links and Check sources.')
+            else:
+                if affected:
+                    check('wiki','stale','A source backing a relevant wiki topic changed.','Use Wiki → Check sources to review the affected text.')
+                elif issues:
+                    check('wiki','stale','A link or topic in the relevant wiki is inconsistent.','Use Wiki → Check links to locate the problem.')
+                else:
+                    check('wiki','ready','Relevant wiki links and recorded topic sources passed the local checks.')
+            worker['wiki_pages']=pages
+    if not task:
+        check('task','blocked',unavailable or 'No eligible unreserved task is available.',
+              'Check the board for dependencies, existing claims and TODO work.')
+    else:
+        work=workspace or root
+        if not workspace:
+            check('workspace','unknown','The task worktree is unavailable.','Restore or open the recorded worktree before reusing evidence.')
+        spec=specification_status(work,task['description'])
+        if spec:
+            level={'current':'ready','changed':'stale','missing':'missing'}[spec['state']]
+            check('specification',level,spec['page']+(('#'+spec['section']) if spec['section'] else '')+' · '+spec['state'],
+                  'Review the affected specification and update the task pin before proceeding.' if level!='ready' else None)
+            worker['specification']=spec
+        else:
+            check('specification','ready','This task has no shared specification pin.')
+        if not task.get('acceptance_criteria'):
+            check('verification','missing','The task has no acceptance check.','Record an observable acceptance check before starting.')
+        elif task.get('continuity') or task.get('evidence'):
+            receipts=resume_checks(work,task['id']) if workspace else []
+            states={item['status'] for item in receipts}
+            state='stale' if 'changed' in states else 'unknown' if not states or 'unknown' in states else 'ready'
+            if task.get('continuity_stale') or (spec and spec['state']!='current'):state='stale'
+            worker['verification']=receipts
+            check('verification',state,'Saved checks have been compared with their recorded inputs.' if workspace else 'No task worktree receipts are available.',
+                  'Re-run or review only the checks whose recorded scope or inputs are unverified.' if state!='ready' else None)
+        else:
+            check('verification','ready','The task has acceptance criteria for its first verification.')
+    statuses={item['state'] for item in checks}
+    report={'worker':{'client':args['client'],'actor':args.get('actor')},
+            'task':{key:task[key] for key in ('id','code','title','status')} if task else None,
+            'state':'blocked' if 'blocked' in statuses else 'needs_attention' if statuses-{'ready'} else 'ready',
+            'checks':checks,**worker}
+    version=digest(json.dumps(report,sort_keys=True).encode())
+    if args.get('version_seen')==version:
+        return {'changed':False,'version':version}
+    return {'changed':True,'version':version,**report}
+
+
 def write_wiki(root, path, body):
     folder=(root/path).parent
     if folder.resolve()!=folder or not folder.is_relative_to(root/WIKI):

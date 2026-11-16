@@ -1158,8 +1158,12 @@ def legacy_run(action, a, path=None, locks=None):
             if not cur.rowcount:
                 raise ValueError('Review note not found')
             return {'id': a['id'], 'done': bool(a['done'])}
-        if action in ('next_work','worker_launch'):
-            db.execute('CREATE TABLE IF NOT EXISTS worker_launch_offers(project INTEGER NOT NULL,actor INTEGER NOT NULL,task INTEGER NOT NULL,expires REAL NOT NULL,PRIMARY KEY(project,actor),UNIQUE(project,task))')
+        if action in ('next_work','worker_launch','worker_readiness'):
+            preview=action=='worker_readiness'
+            if preview and a.get('actor') is not None and actor_user(db,a)['kind']!='agent':
+                raise ValueError('Choose an active worker for this readiness check')
+            if not preview:
+                db.execute('CREATE TABLE IF NOT EXISTS worker_launch_offers(project INTEGER NOT NULL,actor INTEGER NOT NULL,task INTEGER NOT NULL,expires REAL NOT NULL,PRIMARY KEY(project,actor),UNIQUE(project,task))')
             if action=='worker_launch':
                 if actor_user(db,a)['kind']!='agent':raise ValueError('Worker launch requires an active agent')
                 mode=a.get('action','reserve')
@@ -1171,12 +1175,14 @@ def legacy_run(action, a, path=None, locks=None):
                     import context_batches
                     return {'released':True,**context_batches.release(db,project,a['actor'])}
             stop=runtime.reason(db,project,a.get('actor')) if a.get('actor') is not None or runtime.control(db,project)['paused'] else ''
-            if stop:
+            if stop and not preview:
                 return {'task':None,'should_stop':True,'reason':stop,'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'instruction':'Stop editing; call agent_checkpoint at a safe boundary to save handoff and release own work.'}
             import context_tools
             if a.get('actor') is not None and not coord.parallel_available(db,project,a['actor']):
                 if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
-                return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':project_row['max_parallel_agents']}}
+                if not preview:
+                    return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':project_row['max_parallel_agents']}}
+                stop=stop or 'Project parallel-agent limit reached.'
             if action=='worker_launch':
                 import git_completion
                 git_completion.reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
@@ -1184,8 +1190,9 @@ def legacy_run(action, a, path=None, locks=None):
                 import file_plan_repair
                 file_plan_repair.at_launch(db,project_row,a['actor'],activity,now)
             import scheduling
-            scheduling.reconcile(db,project,a.get('actor'),activity,now,prefix)
-            tasks = [context_tools.reminder_hint(db,project,task_dict(r, prefix)) for r in db.execute('SELECT * FROM tasks WHERE project=? ORDER BY priority,id', (project,))]
+            if not preview:scheduling.reconcile(db,project,a.get('actor'),activity,now,prefix)
+            tasks = [task_dict(r,prefix) for r in db.execute('SELECT * FROM tasks WHERE project=? ORDER BY priority,id', (project,))]
+            if not preview:tasks=[context_tools.reminder_hint(db,project,task) for task in tasks]
             done = {t['id'] for t in tasks if t['status'] == 'Done'}
             ranking=scheduling.keys(tasks,a.get('actor'),scheduling.blocked_history(db,project))
             tasks = [t for t in tasks if not t['locked'] or t['owner_id'] == a.get('actor')]
@@ -1199,7 +1206,8 @@ def legacy_run(action, a, path=None, locks=None):
             candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and mine(t)]
             candidates += [t for t in tasks if t['status'] == 'TODO' and ready(t) and not mine(t)]
             candidates.sort(key=lambda t:ranking[t['id']])
-            if a.get('actor') is not None and actor_user(db,a)['kind']=='agent':candidates=[t for t in candidates if not scheduling.human_only(t)]
+            if preview or (a.get('actor') is not None and actor_user(db,a)['kind']=='agent'):
+                candidates=[t for t in candidates if not scheduling.human_only(t)]
             excluded=a.get('exclude_ids',[])
             if not isinstance(excluded,list) or len(excluded)>100 or any(type(i) is not int for i in excluded):
                 raise ValueError('exclude_ids must be a list of at most 100 task IDs')
@@ -1211,7 +1219,8 @@ def legacy_run(action, a, path=None, locks=None):
             if a.get('actor') is not None and actor_user(db,a)['kind']=='agent' and active>=limit:
                 candidates=[t for t in candidates if t['owner_id']==a['actor'] and t['locked']]
             available=[]
-            offers=db.execute('SELECT actor,task FROM worker_launch_offers WHERE project=? AND actor!=? AND expires>?',(project,a.get('actor',-1),time.time())).fetchall()
+            has_offers=not preview or db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone()
+            offers=db.execute('SELECT actor,task FROM worker_launch_offers WHERE project=? AND actor!=? AND expires>?',(project,a.get('actor',-1),time.time())).fetchall() if has_offers else []
             offered_ids={o['task'] for o in offers}
             offered_paths=set()
             for task in tasks:
@@ -1251,7 +1260,7 @@ def legacy_run(action, a, path=None, locks=None):
                 branches={task_branch(task_dict(r,prefix)) for r in active_rows}
                 owned=next(iter(branches)) if len(branches)==1 else None
                 if owned is None and not branches:
-                    try:current=git_sync.refresh_index_state(project_row['workspace_root'])
+                    try:current=git_sync.state(project_row['workspace_root']) if preview else git_sync.refresh_index_state(project_row['workspace_root'])
                     except (ValueError,OSError,subprocess.SubprocessError):current=git_sync.state(project_row['workspace_root'])
                     if current and current[1]:
                         owned=current[0]
@@ -1286,6 +1295,18 @@ def legacy_run(action, a, path=None, locks=None):
                     branch_skipped=len(candidates)-len(keep)
                     candidates=keep
             if action=='worker_launch' and a.get('id') is not None:candidates=[t for t in candidates if t['id']==a['id']]
+            if preview:
+                import project_knowledge
+                selected=candidates[0] if candidates else None
+                root=project_row['workspace_root']
+                workspace=None
+                if root and selected:
+                    try:workspace=git_worktrees.workspace(root,git_worktrees.identity(selected))
+                    except (OSError,ValueError):pass
+                unavailable=('The shared Git checkout holds work from another branch.' if branch_skipped else
+                             'Required planned paths could not be resolved.' if invalid_files or missing_root else
+                             'Ready work conflicts with live file reservations.' if conflicts_skipped else '')
+                return project_knowledge.worker_readiness(root,workspace,selected,a,settings['coordination_channel'],stop,unavailable)
             if action=='worker_launch':
                 if not candidates:
                     reason=(str(branch_skipped)+' ready task(s) need another branch, but this checkout is owned by active work or contains uncommitted edits. Preserve those edits; finish/recover this branch or use Worktrees for isolation.' if branch_skipped else 'No eligible unreserved work; no model was started.')

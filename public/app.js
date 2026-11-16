@@ -5,6 +5,8 @@ let metricSession='', metricBySession=false;
 let metricDays=30, showDeletedUsers=false;
 const metricsAuditCache=new Map();
 let auditPatternFocus=null;
+const workerReadinessCache=new Map();
+let readinessSelection='';
 let lastControlSignal=null;
 const taskSortFields=['updated','code','title','status','priority','owner','context','batch','model'];
 const taskGroupFields=['none','status','priority','owner','context','batch','category'];
@@ -831,6 +833,40 @@ async function signalProject(action){
 $('#project-stop').onclick=()=>signalProject('stop');
 $('#project-wakeup').onclick=()=>signalProject('wakeup');
 $('#control-agents').onclick=async()=>{page='Agents';try{await refresh();$('#create-agent-profile')?.focus();}catch(e){error(e);}};
+function bindWorkerReadiness(profiles,sessions){
+  const workers=new Map();
+  for(const agent of [...sessions,...profiles.filter(item=>!item.deleted)]){
+    if(['codex','claude'].includes(agent.client)&&agent.actor)workers.set(agent.actor,agent);
+  }
+  const panel=$('#worker-readiness');
+  if(!workers.size)return;
+  panel.innerHTML=`<h3>Worker readiness</h3><label>Worker <select id="readiness-worker">
+    ${[...workers.values()].map(item=>`<option value="${item.actor}">${esc(item.name)} · ${esc(item.client)}</option>`).join('')}
+    </select></label> <button type="button" id="check-worker-readiness">Check next task</button><div id="worker-readiness-report" aria-live="polite"></div>`;
+  const picker=$('#readiness-worker'),button=$('#check-worker-readiness'),content=$('#worker-readiness-report');
+  if(workers.has(Number(readinessSelection)))picker.value=readinessSelection;
+  const key=()=>JSON.stringify([project,Number(picker.value),workers.get(Number(picker.value)).client]);
+  const render=report=>{
+    content.innerHTML=report?`<p><strong>${esc(report.state.replaceAll('_',' '))}</strong> · ${esc(report.task?report.task.code+' · '+report.task.title:'No available task')}</p>
+      <p>Coordination: ${esc(report.coordination)} · Effective MCP tools: ${esc(report.effective_specialists.join(', ')||'none selected')}</p>
+      <ul>${report.checks.map(item=>`<li><strong>${esc(item.key)} · ${esc(item.state)}</strong>
+        <p>${esc(item.detail)} ${item.next?esc(item.next):''}</p></li>`).join('')}</ul>`:'';
+  };
+  picker.onchange=()=>{readinessSelection=picker.value;render(workerReadinessCache.get(key()));};
+  picker.onchange();
+  button.onclick=async()=>{
+    const worker=workers.get(Number(picker.value)),selected=project,cacheKey=key();
+    const cached=workerReadinessCache.get(cacheKey);
+    button.disabled=true;
+    try{
+      const report=await api('worker_readiness',{project:selected,actor:worker.actor,client:worker.client,
+        ...(cached?{version_seen:cached.version}:{})});
+      if(report.changed)workerReadinessCache.set(cacheKey,report);
+      if(workerReadinessCache.size>12)workerReadinessCache.delete(workerReadinessCache.keys().next().value);
+      if(selected===project&&content.isConnected&&key()===cacheKey)render(report.changed?report:cached);
+    }catch(e){if(content.isConnected)content.textContent=e.message;}finally{button.disabled=false;}
+  };
+}
 function renderAgents(){
   const r=state.runtime;
   const profiles=state.managedAgents?.agents||[];
@@ -838,6 +874,8 @@ function renderAgents(){
   const usage=(a,key)=>a[key]===null||a[key]===undefined?'Unknown':`${a[key]}% used${a.usage_fresh?'':' · stale'}`;
   $('#content').innerHTML=`<section class="workflow"><h2>Agents in this project</h2>${profileCards}<p>Quota readings belong to the provider account, may repeat across agents, and must not be summed or attributed to tasks. Activity means a recent cooperative heartbeat; green task dots also require a live task claim. It is not proof that an OS process is running. Stop signals need a cooperating agent or a connected CLI bridge.</p><div class="lock-table-wrap"><table class="lock-table"><thead><tr><th>Agent</th><th>Status</th><th>Account quota · 5h / weekly</th><th>Bridge</th><th>Last seen</th></tr></thead><tbody>${r.agents.map(a=>`<tr><td>${esc(a.name)}<br><small>${esc(a.client)}</small></td><td>${a.active?'<span class="active-task-dot"></span>':''}${esc(a.status)}${a.stop_pending?' · stop pending':''}${a.reason?'<br>'+esc(a.reason):''}${a.auto_resume_status?'<br>Auto resume: '+esc(a.auto_resume_status):''}</td><td>${esc(usage(a,'session_used_percent'))}<br>${esc(usage(a,'weekly_used_percent'))}</td><td>${a.bridge_connected?'Connected':'Disconnected'}</td><td>${esc(new Date(a.heartbeat*1000).toLocaleString())}</td></tr>`).join('')||'<tr><td colspan="5">No agents have reported a checkpoint yet.</td></tr>'}</tbody></table></div><h3>Wakeup conversation</h3><p>With a connected CLI bridge, Wakeup sends a continuation instruction to its Codex or Claude worker. Open Chat to see the exact instruction, final response (up to 1,500 characters), launch failures and interruptions. Raw tool logs stay local. This is the Scrum Studio project chat, not a message in an existing Desktop conversation. Each Wakeup starts a new CLI run that recovers context from Scrum tasks.</p><h3>Connect a CLI bridge</h3><p>From the Scrum Studio installation, explicitly start one bridge for each intended worker:</p><pre><code>python scripts/agent_bridge.py --project ${project} --client codex --worker worker1 --allow-run</code></pre><p>Use <code>--client claude --usage-file ABSOLUTE_USAGE_JSON</code> for Claude Code with its status-line telemetry feed. Setup supports <code>--client codex</code>, <code>claude</code> or <code>both</code>. Manual bridges wait for Wakeup. Managed profiles use their explicit Start immediately setting. Opening this page alone never starts a worker. CLI permissions still apply. External desktop chats cannot be woken by this page.</p></section>`;
   $('#create-agent-profile').onclick=()=>openAgentProfile();
+  $('#agent-profile-result').insertAdjacentHTML('afterend','<section id="worker-readiness"></section>');
+  bindWorkerReadiness(profiles,r.agents);
   document.querySelectorAll('[data-profile-action]').forEach(button=>button.onclick=async()=>{
     const profile=profiles.find(a=>a.id===button.dataset.profileId);if(!profile)return;
     if(button.dataset.profileAction==='delete'){

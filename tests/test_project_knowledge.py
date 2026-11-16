@@ -15,6 +15,50 @@ class ProjectKnowledgeTest(unittest.TestCase):
     def knowledge(self, project, action, **args):
         return run('project_knowledge',dict(project=project,actor=self.human,action=action,**args))
 
+    def test_worker_readiness_is_read_only_and_refreshes_changed_inputs(self):
+        import mcp_selection
+        project,root=self.project()
+        path='docs/agents/contract.md'
+        task_path=root/path
+        task_path.parent.mkdir(parents=True)
+        (task_path.parent/'index.md').write_text('[Contract](contract.md#scope)\n',encoding='utf-8')
+        task_path.write_text('# Contract\n\n## Scope\n\nInitial behavior\n',encoding='utf-8')
+        task=run('task_plan',dict(project=project,actor=self.human,items=[dict(
+            key='continue',title='Continue scoped work',description='Implement the scope.',acceptance_criteria=['Tests pass'],
+            files=[path],specification=dict(page=path,section='scope'))]))['items'][0]
+        run('task_update',dict(project=project,id=task['id'],actor=self.human,continuity='Run verification.'))
+        mcp_selection.save(root,'codex','selected',['initial-server'])
+        args=dict(project=project,actor=self.agent,client='codex')
+        before={file.relative_to(root).as_posix():file.read_bytes()
+                for file in root.rglob('*') if file.is_file() and not file.name.endswith(('.db','.db-wal','.db-shm'))}
+        with patch('mcp_selection.discover',return_value=({},[])),patch('scripts.cli_runtime.codex_executable',return_value='codex'):
+            initial=run('worker_readiness',args)
+            self.assertEqual(run('worker_readiness',dict(args,version_seen=initial['version'])),
+                             {'changed':False,'version':initial['version']})
+        after={file.relative_to(root).as_posix():file.read_bytes()
+               for file in root.rglob('*') if file.is_file() and not file.name.endswith(('.db','.db-wal','.db-shm'))}
+        self.assertEqual(before,after)
+        self.assertEqual(initial['task']['id'],task['id'])
+        checks={item['key']:item['state'] for item in initial['checks']}
+        self.assertEqual(checks,{'runtime':'ready','tools':'missing','onboarding':'missing',
+                                 'wiki':'ready','specification':'ready','verification':'unknown'})
+        task_path.write_text('# Contract\n\n## Scope\n\nChanged behavior\n',encoding='utf-8')
+        with patch('mcp_selection.discover',return_value=({'initial-server':{}},[])),patch('scripts.cli_runtime.codex_executable',return_value='codex'):
+            changed=run('worker_readiness',dict(args,version_seen=initial['version']))
+        self.assertTrue(changed['changed'])
+        checks={item['key']:item for item in changed['checks']}
+        self.assertEqual(checks['tools']['state'],'ready')
+        self.assertEqual(checks['specification']['state'],'stale')
+        self.assertIn('task pin',checks['specification']['next'])
+        self.assertEqual(checks['verification']['state'],'stale')
+        resulting=run('task_get',dict(project=project,id=task['id']))
+        self.assertEqual(resulting['status'],'TODO')
+        self.assertFalse(resulting['locked'])
+        with patch('runtime.reason',return_value='Project stopped by human'):
+            stopped=run('worker_readiness',args)
+        self.assertEqual(stopped['state'],'blocked')
+        self.assertEqual(stopped['task']['id'],task['id'])
+
     def test_specification_impact_is_section_scoped_and_paginated(self):
         project,root=self.project()
         relative='docs/agents/contract.md'
