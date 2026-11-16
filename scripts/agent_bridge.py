@@ -260,7 +260,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
             'Inspect the relevant files, make the change, and run the acceptance checks. '
             'Reuse a passing check while its inputs match. Respect Stop and permissions. '
             'The native CLI uses your inherited private context. '
-            f'Finish verified work with {cli} finish --task {task["code"]} --evidence TEXT, then exit. '
+            'Use the supplied finish command for verified work, then exit. '
             'Open scrum-work references only for exceptions or missing information.'
         )
         if started.get('file_lock_mode')=='checkout':
@@ -269,7 +269,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
             rules+=' Reserve any extra output files with CLI lock before editing.'
     else:
         rules=(
-            f'Use scrum-work for project {project}, actor {actor}, in {folder}. '
+            'Use scrum-work for the supplied project, actor and checkout. '
             'The supervisor claimed the task below. Resume its continuity and reuse valid checks. '
             'Use the native CLI with inherited SCRUM_CLI_CONTEXT. Keep that context private. '
             'Start/claim and quota checks are handled by the supervisor. Respect Stop and permissions. '
@@ -300,10 +300,11 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         return 'Claim: '+json.dumps(claim,ensure_ascii=False,separators=(',',':'))
     parts={
         'rules':rules,
-        'claim':serialize_claim(),
-        'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
         'project_policy':autonomy_prompt(policy).strip(),
         'role':'Role instructions: '+role if role else '',
+        'execution':f'Finish: {cli} finish --task {task["code"]} --evidence TEXT' if light else f'Project {project}, actor {actor}, checkout {folder}.',
+        'claim':serialize_claim(),
+        'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
     }
     def render():
         return '\n'.join(value for value in parts.values() if value)

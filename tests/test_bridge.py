@@ -120,6 +120,21 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(sections['_budget']['renderer'],'standard')
         self.assertLess(len(light.encode()),len(standard.encode()))
 
+    def test_worker_instruction_prefix_is_stable_across_task_identity(self):
+        for workflow in ('Light','Standard'):
+            prompts=[]
+            for number in (1,2):
+                task={'code':f'FIX-{number}','files':[f'app{number}.py'],'acceptance_criteria':['Run checks.']}
+                started={'task':task,'workflow':workflow,'git':{'branch':f'task-{number}'}}
+                prompts.append(agent_bridge.cli_prompt(number,Path(f'checkout{number}'),number,'codex',{},
+                    {'execution_instructions':'Stable project rule.'},started,'Stable role.'))
+            marker='Role instructions: Stable role.'
+            self.assertEqual(prompts[0].split(marker)[0],prompts[1].split(marker)[0])
+            for number,prompt in enumerate(prompts,1):
+                self.assertIn(f'FIX-{number}',prompt)
+                self.assertIn(f'app{number}.py',prompt)
+                self.assertIn(f'task-{number}',prompt)
+
     def test_native_light_prompt_retains_full_contract_for_exceptions(self):
         task={'code':'FIX-7','files':['app.py'],'acceptance_criteria':['Run the check.']}
         started={'task':task,'workflow':'Light'}
