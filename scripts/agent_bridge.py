@@ -289,9 +289,13 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
             rules+=' Finish closes the session. Exit so the supervisor can select the next task.'
         if task.get('category')=='Git recovery':
             rules+=' Git recovery: preserve staging and unrelated work, follow recorded parents, and reuse retained verification. Verify conflict-resolution edits. Never force push.'
-    if (client=='codex' and os.name=='nt' and task.get('continuity')
-            and not offer.get('batch') and task.get('category')!='Git recovery'):
-        rules+=' Use apply_patch when available. For multiline shell edits, use a PowerShell here-string or Python.'
+    if task.get('continuity') and not offer.get('batch') and task.get('category')!='Git recovery':
+        if client=='codex' and os.name=='nt':
+            rules+=' Use apply_patch when available. For multiline shell edits, use a PowerShell here-string or Python.'
+        elif client=='codex' and sys.platform=='darwin':
+            rules+=' Use apply_patch when available. For multiline shell edits, use Python.'
+        elif client=='claude' and (os.name=='nt' or sys.platform=='darwin'):
+            rules+=' Use Edit for targeted changes and Write when creating or replacing an entire file.'
     diagnostics={key:started[key] for key in ('dirty_planned','file_lock_mode') if started.get(key)}
     git=started.get('git') or {}
     diagnostics.update({key:git[key] for key in ('branch','parent','worktree','error','refreshed_from') if git.get(key)})

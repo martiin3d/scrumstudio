@@ -120,22 +120,29 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(sections['_budget']['renderer'],'standard')
         self.assertLess(len(light.encode()),len(standard.encode()))
 
-    def test_windows_editing_guidance_is_limited_to_individual_codex_resumes(self):
+    def test_editing_guidance_matches_platform_and_client_for_individual_resumes(self):
         task={'code':'FIX-7','files':['app.py'],'acceptance_criteria':['Run checks.']}
         resume=task|{'continuity':'Continue with the remaining change.'}
-        for client,platform,current,offer,expected in (
-            ('codex','nt',resume,{},True),
-            ('codex','nt',task,{},False),
-            ('codex','nt',resume,{'batch':[{'code':'FIX-7'}]},False),
-            ('codex','nt',resume|{'category':'Git recovery'},{},False),
-            ('claude','nt',resume,{},False),
-            ('codex','posix',resume,{},False),
+        windows='Use apply_patch when available. For multiline shell edits, use a PowerShell here-string or Python.'
+        mac='Use apply_patch when available. For multiline shell edits, use Python.'
+        claude='Use Edit for targeted changes and Write when creating or replacing an entire file.'
+        for client,os_name,platform,current,offer,expected in (
+            ('codex','nt','win32',resume,{},[windows]),
+            ('codex','posix','darwin',resume,{},[mac]),
+            ('claude','nt','win32',resume,{},[claude]),
+            ('claude','posix','darwin',resume,{},[claude]),
+            ('codex','nt','win32',task,{},[]),
+            ('claude','posix','darwin',task,{},[]),
+            ('codex','nt','win32',resume,{'batch':[{'code':'FIX-7'}]},[]),
+            ('codex','posix','darwin',resume|{'category':'Git recovery'},{},[]),
+            ('codex','posix','linux',resume,{},[]),
+            ('claude','posix','linux',resume,{},[]),
         ):
             with self.subTest(client=client,platform=platform,task=current,offer=offer):
                 folder=Path('.')
-                with patch.object(agent_bridge.os,'name',platform), patch.object(agent_bridge,'worker_python',return_value='python'):
+                with patch.object(agent_bridge.os,'name',os_name), patch.object(agent_bridge.sys,'platform',platform), patch.object(agent_bridge,'worker_python',return_value='python'):
                     prompt=agent_bridge.cli_prompt(1,folder,9,client,offer,{}, {'task':current,'workflow':'Light'})
-                self.assertEqual('Use apply_patch when available.' in prompt,expected)
+                self.assertEqual([guidance for guidance in (windows,mac,claude) if guidance in prompt],expected)
 
     def test_worker_instruction_prefix_is_stable_across_task_identity(self):
         for workflow in ('Light','Standard'):
