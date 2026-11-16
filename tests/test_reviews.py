@@ -36,6 +36,32 @@ class ReviewTest(unittest.TestCase):
         run('task_update',dict(project=p,id=task,actor=self.agent,token=claim['token'],status='In Review',evidence='33 passing assertions; camera reviewed'))
         return task
 
+    def test_consolidated_findings_require_independent_proof_to_block_review(self):
+        p,_=self.project()
+        task=self.task(p)
+        verifier=run('user_register',dict(identity='human:reviewer-two',name='Verifier',kind='human'))['id']
+        base=dict(project=p,id=task,actor=self.human,path='app.py',revision='a'*40)
+        def write(action, key, **fields):
+            return run('task_review_findings',dict(base,action=action,key=key,**fields))
+        write('record','refresh-broken',summary='Selection lost',severity='high')
+        write('record','lost-selection',summary='Value no longer selected')
+        write('consolidate','lost-selection',canonical_key='refresh-broken',disposition='Same failing refresh path')
+        with self.assertRaisesRegex(ValueError,'different reviewer'):
+            write('confirm','refresh-broken',proof='Reproduced')
+        with self.assertRaisesRegex(ValueError,'exact revision'):
+            run('task_review_findings',dict(base,actor=verifier,key='refresh-broken',action='confirm',
+                                            revision='b'*40,proof='Wrong commit'))
+        run('task_review_findings',dict(base,actor=verifier,key='refresh-broken',action='confirm',
+                                        proof='Minimal refresh fixture reproduces the lost selection.'))
+        with patch('git_sync._git',return_value=type('Result',(),{'returncode':0,'stdout':'a'*40})()):
+            with self.assertRaisesRegex(ValueError,'Resolve confirmed high-severity'):
+                self.review(p,task,'approve')
+        history=run('task_review_findings',dict(project=p,id=task,include_resolved=True))['items']
+        self.assertEqual(history[0]['duplicate_of'],'refresh-broken')
+        self.assertEqual(history[1]['confirmed_by'],verifier)
+        with patch('git_sync._git',return_value=type('Result',(),{'returncode':0,'stdout':'b'*40})()):
+            self.assertEqual(self.review(p,task,'approve')['status'],'Done')
+
     def review(self,p,task,decision='request_changes',**extra):
         return run('task_review',dict(project=p,id=task,actor=self.human,decision=decision,**extra))
 
@@ -90,9 +116,9 @@ class ReviewTest(unittest.TestCase):
     def test_stop_is_preserved_and_review_does_not_launch_disabled_agents(self):
         p,_=self.project();task=self.task(p)
         stopped=run('project_control',dict(project=p,actor=self.human,action='stop'))
-        with patch('managed_agents.subprocess.Popen') as spawn:
+        with patch('managed_agents.subprocess') as process:
             result=self.review(p,task,comment='Adjust the spacing.')
-        spawn.assert_not_called()
+        process.Popen.assert_not_called()
         self.assertEqual(result['review_resume']['status'],'stopped')
         control=run('agent_status',dict(project=p))['control']
         self.assertTrue(control['paused'])
@@ -102,8 +128,8 @@ class ReviewTest(unittest.TestCase):
         p,_=self.project();task=self.task(p)
         run('agent_checkpoint',dict(project=p,actor=self.agent,client='codex',action='observe',running=False,session_used_percent=1,weekly_used_percent=1))
         before=run('agent_status',dict(project=p))['control']['generation']
-        with patch('managed_agents.subprocess.Popen') as spawn:result=self.review(p,task,comment='Use a larger title.')
-        spawn.assert_not_called()
+        with patch('managed_agents.subprocess') as process:result=self.review(p,task,comment='Use a larger title.')
+        process.Popen.assert_not_called()
         self.assertEqual(result['review_resume']['status'],'signal_sent')
         self.assertGreater(run('agent_status',dict(project=p))['control']['generation'],before)
 
@@ -111,9 +137,9 @@ class ReviewTest(unittest.TestCase):
         p,_=self.project();task=self.task(p)
         profile=run('agent_manage',dict(project=p,actor=self.human,action='create',name='Disabled reviewer worker',client='codex',start_immediately=False))
         run('task_update',dict(project=p,id=task,actor=self.human,owner_id=profile['actor']))
-        with patch('managed_agents.subprocess.Popen') as spawn:
+        with patch('managed_agents.subprocess') as process:
             self.review(p,task,comment='Change the padding.')
-        spawn.assert_not_called()
+        process.Popen.assert_not_called()
         saved=run('agent_manage',dict(project=p,action='get',id=profile['id']))
         self.assertFalse(saved['enabled']);self.assertFalse(saved['resume_on_wakeup'])
 
