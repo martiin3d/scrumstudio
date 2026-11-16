@@ -118,25 +118,51 @@ def checkpoint_workspace(project_root, workspace, task):
         return
 
 
+def verification_risk_path(workspace, task_id):
+    from pathlib import Path
+    return Path(workspace)/'.scrum/local/verification-risk'/f'{int(task_id)}.json'
+
+
+def verification_risk_state(workspace, task_id):
+    try:
+        path=verification_risk_path(workspace,task_id)
+        if path.is_symlink() or path.stat().st_size>256*1024:return {}
+        value=json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value,dict) else {}
+    except (OSError,ValueError,TypeError):
+        return {}
+
+
+def verification_risk_report(state):
+    pending=list(state.get('pending',[]))
+    unknown=list(state.get('unknown',[]))
+    return {'pending':pending[:12],'unknown_paths':unknown[:12],
+            'has_more':len(pending)>12 or len(unknown)>12}
+
+
 def workspace_delta(project_root, workspace, task):
     from pathlib import Path
     import subprocess
     from scripts.verification_receipts import resume_checks
-    if not project_root or not workspace or not (task.get('continuity') or task.get('evidence')):return None
+    if not project_root or not workspace:return None
+    risk=verification_risk_report(verification_risk_state(workspace,task['id']))
+    pending=bool(risk['pending'] or risk['unknown_paths'])
+    if not (task.get('continuity') or task.get('evidence') or pending):return None
+    additions={'verification_risk':risk} if pending else {}
     verification=resume_checks(workspace,task['id'])
     checkpoint=Path(project_root)/'.scrum/local/task-context'/f"{int(task['id'])}.json"
     try:
         before=json.loads(checkpoint.read_text(encoding='utf-8'))
         current=workspace_inputs(workspace,task)
     except (OSError,ValueError,subprocess.SubprocessError):
-        return {'verification':verification}
+        return {'verification':verification,**additions}
     changed=[key for key in ('branch','head','checkout','acceptance','evidence') if before.get(key)!=current[key]]
     files=[name for name in sorted(before['files'].keys()|current['files'].keys())
            if before['files'].get(name,'unobserved')!=current['files'].get(name,'unobserved')]
     incomplete=bool(task.get('files_page',{}).get('has_more')) or any(value=='unavailable' for value in current['files'].values())
     return {'changed_inputs':changed,'changed_paths':files[:12],'coverage':'partial' if incomplete or len(files)>12 else 'scoped',
             'observed_head':current['head'],'evidence_review':bool(changed or files or incomplete),
-            'verification':verification}
+            'verification':verification,**additions}
 
 def search(db, project, prefix, args):
     limit=args.get('limit',5);after=args.get('after',0)

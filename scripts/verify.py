@@ -95,22 +95,27 @@ RISK_CHECKS = {
                     ('test_policy.py', 'test_launch.py', 'test_single_worker_files.py')),
     'git_delivery': ('Git verification, integration, publication, or recovery changed.',
                      ('test_git_native_recovery.py', 'test_git_completion_recovery.py', 'test_worktrees.py')),
+    'shared_contract': ('An operation or shared workflow contract changed.',
+                        ('test_mcp_protocol.py', 'test_scrum_cli.py', 'test_workflow.py')),
 }
 
 RISK_PATHS = {
     'schema': {'storage.py'},
     'permissions': {'runtime.py'},
     'git_delivery': {'git_sync.py', 'git_completion.py', 'git_worktrees.py', 'git_retained.py', 'git_paused.py'},
+    'shared_contract': {'coordination_api.py', 'mcp_server.py'},
 }
 
 RISK_CONTENT = {
     'schema': re.compile(r'\b(?:CREATE|ALTER|DROP)\s+(?:TABLE|INDEX)\b|\b(?:user_version|schema_version|add_column)\b', re.I),
     'permissions': re.compile(r'\b(?:actor_user|require_claim|verify_token|lock_until|claim_token|should_stop|usage_guard|approval_policy|agent_approval_mode|sandbox_mode)\b'),
     'git_delivery': re.compile(r'\b(?:git_finalize|git_reconcile|reconcile_pr|completion_basis|publish_verified|merge_completed|save_receipt|verified_source_sha)\b'),
+    'shared_contract': re.compile(r'\b(?:startup_task|agent_task|completion_basis|work_finish|work_start)\b'),
 }
 
 
-def diff_lines(name, base, root=ROOT):
+def diff_lines(name, base, root=None):
+    root=ROOT if root is None else root
     args=['git','--literal-pathspecs','-C',str(root)]
     try:
         result=subprocess.run([*args,'diff','--no-ext-diff','--no-textconv','--unified=0',base,'--',name],
@@ -136,7 +141,9 @@ def plan(files,base='HEAD'):
         raise ValueError('Supply a Git base revision')
     checks=set();notes=[];full=False;js=False;wiki=False
     risk={key:set() for key in RISK_CHECKS}
+    observed={key:set() for key in RISK_CHECKS}
     unavailable=[]
+    covered=[]
     for value in dict.fromkeys(files):
         path=(ROOT/value).resolve()
         try:name=path.relative_to(ROOT).as_posix()
@@ -152,39 +159,105 @@ def plan(files,base='HEAD'):
         if not name.endswith(('.py','.js','.sql')) or name.startswith('tests/'):continue
         lines=diff_lines(name,base)
         if lines is None:unavailable.append(name)
+        else:covered.append(name)
         for key,pattern in RISK_CONTENT.items():
             if name in RISK_PATHS[key] or (lines and any(pattern.search(line) for line in lines)):
                 risk[key].add(name)
+                if lines:observed[key].add(name)
     detected=[]
     for key,(reason,tests) in RISK_CHECKS.items():
         if risk[key]:
             checks.update(tests)
-            detected.append({'area':key,'paths':sorted(risk[key]),'reason':reason,'checks':list(tests)})
+            detected.append({'area':key,'paths':sorted(risk[key]),'observed_paths':sorted(observed[key]),
+                             'reason':reason,'checks':list(tests)})
     return {'tests':['test_*.py'] if full else sorted(checks),'node_syntax':js,'wiki_doctor':wiki,'notes':sorted(set(notes)),
-            'risk':detected,'diff_base':base,'diff_unavailable':sorted(set(unavailable)),
+            'risk':detected,'diff_base':base,'diff_unavailable':sorted(set(unavailable)),'diff_covered':covered,
             'reason':'Cross-cutting or unmapped change: run full regressions.' if full else 'Targeted checks; expand for new failures, broader impact or unresolved risk.'}
+
+
+def risk_state(previous, selected):
+    """Advance observations only for paths whose diff was actually available."""
+    covered=set(selected['diff_covered'])
+    observed={(risk['area'],path):{'area':risk['area'],'path':path,'reason':risk['reason'],'checks':risk['checks']}
+              for risk in selected['risk'] for path in risk['observed_paths']}
+    known={tuple(item) for item in previous.get('known',[])}
+    introduced=[item for key,item in observed.items() if key not in known]
+    retained=known-{key for key in known if key[1] in covered and key not in observed}
+    pending=[item for item in previous.get('pending',[])
+             if item['path'] not in covered or (item['area'],item['path']) in observed]
+    unknown=sorted((set(previous.get('unknown',[]))-covered)|set(selected['diff_unavailable']))
+    return {'base':selected['diff_base'],'known':[list(key) for key in sorted(retained|observed.keys())],
+            'pending':pending+introduced,'unknown':unknown},introduced
+
+
+def claim_risk_plan(files, requested_base, context):
+    from context_tools import verification_risk_path, verification_risk_report, verification_risk_state
+    from scrum_cli import atomic, context_file, locked
+    import git_sync
+
+    default=requested_base or 'HEAD'
+    try:
+        with locked(context):
+            current=context_file(context).get('current')
+            if not current:return plan(files,default),None
+            task_id=current['id']
+            previous=verification_risk_state(ROOT,task_id)
+            base=requested_base or previous.get('base') or default
+            if not isinstance(base,str) or not base or base.startswith('-'):
+                raise ValueError('Supply a Git base revision')
+            result=git_sync._git(ROOT,'rev-parse','--verify','--end-of-options',base+'^{commit}')
+            base=result.stdout.strip() if not result.returncode else base
+            selected=plan(files,base)
+            if previous.get('base')!=base:previous={}
+            state,introduced=risk_state(previous,selected)
+            if introduced or state['pending'] or state['unknown']:
+                selected['risk_change']={**verification_risk_report(state),'introduced':introduced[:12]}
+            path=verification_risk_path(ROOT,task_id)
+            if state!=previous:atomic(path,state)
+            return selected,(context,task_id,state)
+    except (OSError,ValueError,subprocess.SubprocessError,KeyError,TypeError,AttributeError):
+        return plan(files,default),None
+
+
+def record_verified_risk(checkpoint, selected):
+    from context_tools import verification_risk_path, verification_risk_state
+    from scrum_cli import atomic, context_file, locked
+
+    if checkpoint is None:return
+    context,task_id,saved=checkpoint
+    if not saved['pending']:return
+    eligible={(risk['area'],path) for risk in selected['risk'] for path in risk['observed_paths']}
+    try:
+        with locked(context):
+            current=context_file(context).get('current')
+            state=verification_risk_state(ROOT,task_id)
+            if current and current['id']==task_id and state==saved:
+                state['pending']=[item for item in state['pending'] if (item['area'],item['path']) not in eligible]
+                if state!=saved:atomic(verification_risk_path(ROOT,task_id),state)
+    except (OSError,ValueError,KeyError):
+        pass
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--files',nargs='+',required=True)
-    parser.add_argument('--base',default='HEAD',help='Compare working files with this Git revision (default HEAD)')
+    parser.add_argument('--base',help='Compare with this Git revision (default: the current task verification base or HEAD)')
     parser.add_argument('--run',action='store_true')
     parser.add_argument('--verbose',action='store_true',help='Stream unittest details instead of the default local report and compact result')
     parser.add_argument('--reuse',action='store_true',help='Reuse an actual prior pass only for identical sources, runtime and checks; report its original time')
     args=parser.parse_args()
-    try:selected=plan(args.files,args.base)
+    sys.path.insert(0,str(ROOT))
+    native_context=os.getenv('SCRUM_CLI_CONTEXT')
+    try:selected,checkpoint=claim_risk_plan(args.files,args.base,native_context) if native_context else (plan(args.files,args.base or 'HEAD'),None)
     except ValueError as error:parser.error(str(error))
     print(json.dumps(selected),flush=True)
     if not args.run:return
     if selected['wiki_doctor']:
         check=subprocess.run([sys.executable,str(ROOT/'scripts/wiki_doctor.py')],check=False)
         if check.returncode:raise SystemExit(check.returncode)
-    sys.path.insert(0,str(ROOT))
     source=fingerprint()
     key=signature(selected,source)
     import verification_receipts as receipts
-    native_context=os.getenv('SCRUM_CLI_CONTEXT')
     checks={}
     if native_context and selected['tests']:
         label='Python: '+', '.join(selected['tests'])
@@ -195,6 +268,7 @@ def main():
     cache=ROOT/'data'/'verification-cache'/('check-'+hashlib.sha256(json.dumps([selected['tests'],selected['node_syntax']]).encode()).hexdigest()[:20]+'.json')
     cached=read_cached(cache,key) if args.reuse and source else None
     if cached:
+        record_verified_risk(checkpoint,selected)
         for label,(paths,executable,inputs) in checks.items():
             receipts.record_task_check(ROOT,label,paths,executable,inputs,inputs,cached['verified_at'])
         receipts.event(ROOT,key,{'passed':True,'kind':'passed','reused':True},0)
@@ -230,6 +304,7 @@ def main():
         after=receipts.check_inputs(ROOT,paths,executable,tree=final_source) if verified and (paths or final_source) else None
         receipts.record_task_check(ROOT,label,paths,executable,inputs,after,time.time())
     if passed and source and (selected['tests'] or selected['node_syntax']) and final_source==source:
+        record_verified_risk(checkpoint,selected)
         try:save_pass(cache,key,source)
         except OSError:print('Verification passed; cache unavailable.',file=sys.stderr)
     if selected['tests'] or selected['node_syntax']:

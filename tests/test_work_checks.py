@@ -6,9 +6,56 @@ import sys
 import tempfile
 import unittest
 from scripts import work_checks
+from scripts import verify
+from unittest.mock import patch
 
 
 class WorkChecksTest(unittest.TestCase):
+    def test_risk_drift_keeps_the_task_base_and_pending_checks_across_verification(self):
+        from context_tools import verification_risk_state, workspace_delta
+        from scrum_cli import atomic
+
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            context=root/'.scrum/local/claim.json'
+            atomic(context,{'schema':1,'current':{'id':9}})
+            def git(*args):
+                return subprocess.run(['git','-C',folder,*args],capture_output=True,text=True,check=True).stdout.strip()
+            git('init','-q')
+            git('config','user.name','Verification fixture')
+            git('config','user.email','fixture@example.invalid')
+            source=root/'context_tools.py'
+            source.write_text('value = 1\n',encoding='utf-8')
+            git('add','context_tools.py')
+            git('commit','-qm','Initial')
+            with patch.object(verify,'ROOT',root):
+                initial,_=verify.claim_risk_plan(['context_tools.py'],None,str(context))
+                self.assertNotIn('risk_change',initial)
+                source.write_text('value = 1\nshould_stop = True\n',encoding='utf-8')
+                git('commit','-qam','Add a policy dependency')
+                changed,checkpoint=verify.claim_risk_plan(['context_tools.py'],None,str(context))
+                self.assertEqual(changed['diff_base'],initial['diff_base'])
+                self.assertEqual([item['area'] for item in changed['risk_change']['introduced']],['permissions'])
+                self.assertIn('test_policy.py',changed['risk_change']['pending'][0]['checks'])
+                repeated,checkpoint=verify.claim_risk_plan(['context_tools.py'],None,str(context))
+                self.assertEqual(repeated['risk_change']['introduced'],[])
+                self.assertTrue(workspace_delta(root,root,{'id':9})['verification_risk']['pending'])
+                verify.record_verified_risk(checkpoint,repeated)
+                self.assertEqual(verification_risk_state(root,9)['pending'],[])
+                self.assertIsNone(workspace_delta(root,root,{'id':9}))
+
+    def test_risk_drift_does_not_reannounce_unrelated_or_unavailable_paths(self):
+        hint={'area':'schema','paths':['store.py'],'observed_paths':['store.py'],
+              'reason':'Schema changed','checks':['test_storage.py']}
+        state,added=verify.risk_state({}, {'diff_base':'baseline','diff_covered':['store.py'],
+                                         'diff_unavailable':[],'risk':[hint]})
+        self.assertEqual(added[0]['path'],'store.py')
+        state,added=verify.risk_state(state,{'diff_base':'baseline','diff_covered':['public/app.js'],
+                                            'diff_unavailable':['store.py'],'risk':[]})
+        self.assertEqual(added,[])
+        self.assertEqual(state['unknown'],['store.py'])
+        self.assertEqual(state['pending'][0]['path'],'store.py')
+
     def test_batch_hashes_report_mismatch_missing_and_scope(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]/'data') as folder:
             root=Path(folder);(root/'a').write_bytes(b'checked')

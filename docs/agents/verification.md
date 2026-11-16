@@ -4,6 +4,8 @@ Run `python scripts/verify.py --files PATH --run --reuse` for the changed behavi
 
 Preview the plan by omitting `--run`. The `risk` entries list the changed paths, the reason and checks selected for schema, permissions and Git delivery. Use `--base REF` to include committed changes relative to a known base. Review `diff_unavailable` when Git could not inspect a path. The content rules are signals alongside the existing file-based test selection.
 
+With an active native CLI claim, the first verifier plan records its Git base for later `verify.py` calls. A newly observed risk appears in `risk_change.introduced` with affected paths and suggested checks. Unfinished checks and unavailable diff paths remain in task continuity as `workspace_delta.verification_risk`. A matching pass clears the pending risk entries it covered. Explicit `--base REF` selects a different comparison baseline.
+
 Keep review findings tied to the behavior, path and revision that exposed them. When a revision addresses a finding, verify its outcome and the affected diff. Human approval follows the task review state in [reviews.py](../../reviews.py).
 
 Use `python scrum.py help task_review_findings` for the native findings operation. Record a stable issue key and relative path. The open findings page is enough for the next revision. Resolve a finding with the checked Git SHA and evidence.
