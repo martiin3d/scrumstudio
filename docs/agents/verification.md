@@ -48,6 +48,14 @@ A `task_plan` item can include `"specification": {"page": "docs/agents/project.m
 
 The usage audit distinguishes identical versioned task reads from older same-task counts. It records signatures of the requested page and returned version, without keeping request contents.
 
+## Verify a handoff in another environment
+
+1. Export the source project with `python scrum.py call project_export --project PATH`. Transfer the versioned wiki and source tree plus the returned `.scrum/project.json` and `.scrum/snapshot.json`.
+2. Use a separate checkout and registry on the receiving machine or agent environment. Open it with the native `project_open` operation. Resolve the task by code and the worker by identity in the receiving registry. Inspect the Wiki, onboarding status, pinned specification and relevant decisions.
+3. Check the task's verification status before running anything. Local verification receipts stay with their original checkout and the fresh checkout reports unknown. Use the native claim and the relevant verification helper to establish evidence in the receiving environment. Run again with `--reuse` to confirm the original timestamp survives. A covered input edit should change the receipt's status.
+
+SCR-128 tested this flow on the same Windows host with an independent Python virtual environment, checkout and registry. The exported onboarding state, wiki link, pinned section and decision arrived intact. A passing JavaScript syntax receipt was unknown immediately after import. After executing the check on the receiver, identical inputs reused its timestamp and an edit to `public/app.js` marked it changed. This trial covered an isolated agent environment.
+
 Run `python scripts/wiki_doctor.py` to find broken local links, missing Markdown anchors, topic pages absent from the index, and unresolved local Git references. Use the `git:REVISION` destination in a Markdown link when a local commit reference should be checked. The verifier also runs the doctor for changes under this wiki or to `AGENTS.md`.
 
 When finishing a task with a durable decision or a reusable procedure proven by its evidence, use the existing `decisions` field. The optional `wiki_page` names an existing topic such as `docs/agents/git.md`. Scrum can infer a single topic from recognized source files when the page is omitted. Read the drafts with `python scrum.py call project_wiki_proposals --project PATH`. To find the full source task and evidence, use `python scrum.py show --project PATH --task CODE` with the proposal's `source_code`.
