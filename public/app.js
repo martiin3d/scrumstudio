@@ -867,7 +867,19 @@ function bindWorkerReadiness(profiles,sessions){
       <ul>${report.checks.map(item=>`<li><strong>${esc(item.key)} · ${esc(item.state)}</strong>
         <p>${esc(item.detail)} ${item.next?esc(item.next):''}</p></li>`).join('')}</ul>
       ${report.skill_suggestions?.length?`<h4>Suggested installed skills</h4><ul>
-        ${report.skill_suggestions.map(item=>`<li><strong>${esc(item.name)}</strong> · ${esc(item.reason)} <small>${esc(item.paths.join(', '))}</small></li>`).join('')}</ul>`:''}`:'';
+        ${report.skill_suggestions.map(item=>`<li><strong>${esc(item.name)}</strong> · ${esc(item.reason)} <small>${esc(item.paths.join(', '))}</small></li>`).join('')}</ul>`:''}
+      ${report.approved_wiki_changes?.length?`<h4>Approved wiki changes</h4><ul>${report.approved_wiki_changes.map(item=>`<li>
+        ${item.state==='removed'?esc(item.page+(item.section?'#'+item.section:'')):`<button type="button" data-approved-wiki="${esc(item.page)}"
+          data-approved-sha="${esc(item.approved_sha)}" data-approved-section="${esc(item.section)}">${esc(item.page)}${item.section?'#'+esc(item.section):''}</button>`}
+        · ${esc(item.state)} · ${esc(item.approved_branch)} <code>${esc(item.approved_sha.slice(0,12))}</code></li>`).join('')}</ul>`:''}`:'';
+    content.querySelectorAll('[data-approved-wiki]').forEach(link=>link.onclick=async()=>{try{
+      const result=await api('project_knowledge',{project,action:'wiki_revision',page:link.dataset.approvedWiki,revision:link.dataset.approvedSha});
+      if(!content.isConnected)return;
+      content.querySelector('[data-approved-preview]')?.remove();
+      content.insertAdjacentHTML('beforeend',`<article data-approved-preview><h4>${esc(result.page)} · ${esc(result.revision.slice(0,12))}</h4>
+        ${renderWikiText(result.body,result.page,[])}</article>`);
+      if(link.dataset.approvedSection)content.querySelector('#wiki-'+CSS.escape(link.dataset.approvedSection))?.scrollIntoView();
+    }catch(e){error(e);}});
   };
   picker.onchange=()=>{readinessSelection=picker.value;render(workerReadinessCache.get(key()));};
   picker.onchange();

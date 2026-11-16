@@ -1,5 +1,6 @@
 import unittest
 import json
+import subprocess
 from unittest.mock import Mock, patch
 
 from store import run
@@ -30,6 +31,44 @@ class ProjectKnowledgeTest(unittest.TestCase):
         self.assertEqual([item['name'] for item in codex['skill_suggestions']],['playwright'])
         self.assertEqual(codex['skill_suggestions'][0]['paths'],['public/app.js'])
         self.assertNotIn('skill_suggestions',claude)
+
+    def test_worktree_notice_uses_the_exact_approved_section_revision(self):
+        project,root=self.project()
+        wiki='docs/agents/contract.md'
+        topic=root/wiki
+        topic.parent.mkdir(parents=True)
+        def git(*args):
+            return subprocess.check_output(['git','-C',str(root),*args],text=True).strip()
+        git('init','-qb','main')
+        git('config','user.name','Wiki reviewer')
+        git('config','user.email','wiki@example.invalid')
+        original='# Contract\n\n## Scope\n\nOld contract\n\n## Other\n\nOld note\n'
+        topic.write_text(original,encoding='utf-8')
+        git('add',wiki)
+        git('commit','-qm','Initial contract')
+        worktree=root/'.scrum/local/worker-copy'
+        git('worktree','add','-qb','worker-preview',str(worktree))
+        task={'id':1,'description':project_knowledge.bind_specification(
+            root,'Use the contract',{'page':wiki,'section':'scope'}),'files':[]}
+        settings={'git_base_branch':'main'}
+        notice=lambda:project_knowledge.approved_wiki_changes(root,worktree,task,settings)
+        topic.write_text(original.replace('Old note','Unrelated note'),encoding='utf-8')
+        git('commit','-qam','Unrelated heading')
+        self.assertEqual(notice(),[])
+        updated=topic.read_text(encoding='utf-8').replace('Old contract','Approved contract')
+        topic.write_text(updated,encoding='utf-8')
+        self.assertEqual(notice(),[])
+        git('commit','-qam','Approve scope change')
+        (worktree/wiki).write_text(original.replace('Old contract','Worker draft'),encoding='utf-8')
+        topic.write_text(updated.replace('Approved contract','Private canonical draft'),encoding='utf-8')
+        changes=notice()
+        self.assertEqual(len(changes),1)
+        record=changes[0]
+        self.assertEqual((record['section'],record['approved_sha']),('scope',git('rev-parse','HEAD')))
+        pinned=self.knowledge(project,'wiki_revision',page=wiki,revision=record['approved_sha'])
+        self.assertIn('Approved contract',pinned['body'])
+        self.assertNotIn('Private canonical draft',pinned['body'])
+        self.assertIn('Worker draft',(worktree/wiki).read_text(encoding='utf-8'))
 
     def test_graph_probe_uses_the_matching_checkout_and_is_bounded(self):
         project,root=self.project()

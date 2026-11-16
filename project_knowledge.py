@@ -336,7 +336,10 @@ def specification_revision(root, page, section):
     page=wiki_path(page)
     path=safe_file(Path(root).resolve(),page.as_posix())
     if not path:raise ValueError('Specification page does not exist')
-    text=path.read_text(encoding='utf-8-sig')
+    return specification_body_revision(path.read_text(encoding='utf-8-sig'),section)
+
+
+def specification_body_revision(text,section):
     if section:
         headings=list(re.finditer(r'^(#{1,6})\s+([^\n]+)$',text,re.M))
         slug=lambda heading:re.sub(r'[^\w -]','',heading.lower().strip()).replace(' ','-')
@@ -347,6 +350,60 @@ def specification_revision(root, page, section):
             break
         else:raise ValueError('Specification section does not exist')
     return digest(text.encode())
+
+
+def approved_wiki_changes(root,workspace,task,settings):
+    """Report committed relevant knowledge added on the approved branch since divergence."""
+    import git_sync
+    import git_worktrees
+    import subprocess
+
+    if not root or not workspace or Path(root).resolve()==Path(workspace).resolve():return []
+    root=Path(root).resolve()
+    target=settings.get('git_base_branch')
+    if not target:
+        branch=git_worktrees.branch(root,git_worktrees.identity(task))
+        target=git_sync.parent_branch(root,branch) if branch else None
+    if not target:return []
+    wanted={}
+    spec=SPEC_LINE.search(task.get('description',''))
+    if spec:wanted[spec[1]]=spec[2] or ''
+    try:
+        approved=git_sync._git(root,'rev-parse','--verify','refs/heads/'+target)
+        current=git_sync._git(workspace,'rev-parse','--verify','HEAD')
+        if approved.returncode or current.returncode:return []
+        destination,head=approved.stdout.strip(),current.stdout.strip()
+        base=git_sync._git(root,'merge-base',destination,head)
+        if base.returncode or base.stdout.strip()==destination:return []
+        ancestor=base.stdout.strip()
+        committed=git_sync._git(root,'show',f'{destination}:{MANIFEST.as_posix()}')
+        if not committed.returncode and len(committed.stdout.encode())<=MAX_FILE:
+            try:references=json.loads(committed.stdout).get('references',[])
+            except (ValueError,AttributeError):references=[]
+            for reference in references:
+                if not isinstance(reference,dict) or not isinstance(reference.get('page'),str):continue
+                scope=reference.get('scope') or [reference.get('path')]
+                if any(name==path or name.startswith(path.rstrip('/')+'/') for name in task.get('files',[])
+                       for path in scope if isinstance(path,str) and path):
+                    wanted.setdefault(reference['page'],'')
+
+        def revision(commit,page,section):
+            content=git_sync._git(root,'show',f'{commit}:{page}')
+            if content.returncode:return None
+            if len(content.stdout.encode())>MAX_FILE:raise ValueError('Wiki topic exceeds the read budget')
+            try:return specification_body_revision(content.stdout.lstrip('\ufeff'),section)
+            except ValueError:return None
+
+        changes=[]
+        for page,section in list(wanted.items())[:3]:
+            page=wiki_path(page).as_posix()
+            latest=revision(destination,page,section)
+            if latest==revision(ancestor,page,section) or latest==revision(head,page,section):continue
+            changes.append({'page':page,'section':section,'approved_sha':destination,'approved_branch':target,
+                            'state':'updated' if latest else 'removed','revision':latest})
+        return changes
+    except (OSError,ValueError,subprocess.SubprocessError):
+        return []
 
 
 def bind_specification(root, description, spec):
@@ -474,7 +531,7 @@ def skill_suggestions(root,task,client):
     return suggestions[:2]
 
 
-def worker_readiness(root, workspace, task, args, channel, stop='', unavailable=''):
+def worker_readiness(root, workspace, task, args, channel, stop='', unavailable='', wiki_changes=None):
     from mcp_selection import worker_readiness as effective_worker
     from scripts.verification_receipts import resume_checks
 
@@ -554,6 +611,7 @@ def worker_readiness(root, workspace, task, args, channel, stop='', unavailable=
             'checks':checks,**worker}
     suggestions=skill_suggestions(root,task,args['client'])
     if suggestions:report['skill_suggestions']=suggestions
+    if wiki_changes:report['approved_wiki_changes']=wiki_changes
     version=digest(json.dumps(report,sort_keys=True).encode())
     if args.get('version_seen')==version:
         return {'changed':False,'version':version}
@@ -682,6 +740,16 @@ def operation(db, row, prefix, args):
         return specification_impact(db,project,prefix,root,args)
     if action=='source_draft':
         return source_summary(root,source_manifest(root),args.get('source'),args.get('page'))[0]
+    if action=='wiki_revision':
+        import git_sync
+        revision=args.get('revision','')
+        if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}',revision):
+            raise ValueError('Use a specific Git commit for the wiki revision')
+        page=wiki_path(args.get('page')).as_posix()
+        result=git_sync._git(root,'show',f'{revision}:{page}')
+        if result.returncode or len(result.stdout.encode())>MAX_FILE:
+            raise ValueError('The committed wiki page is unavailable at that revision')
+        return {'page':page,'revision':revision,'body':result.stdout}
     if action=='source':
         name=args.get('source','')
         if not isinstance(name,str):raise ValueError('Supply a project source path')

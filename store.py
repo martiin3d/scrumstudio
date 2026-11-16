@@ -524,7 +524,7 @@ def legacy_run(action, a, path=None, locks=None):
             return project_knowledge.graph_readiness(root,workspace,task,a)
         if action=='project_knowledge':
             import project_knowledge
-            if a.get('action','view') in ('view','diagnose','status','source','reassess','learning','specification_impact','source_draft'):
+            if a.get('action','view') in ('view','diagnose','status','source','reassess','learning','specification_impact','source_draft','wiki_revision'):
                 return project_knowledge.operation(db,project_row,prefix,a)
             if not project_row['workspace_root']:raise ValueError('Project workspace is unavailable')
             return project_knowledge.serialize(Path(project_row['workspace_root']),
@@ -687,9 +687,10 @@ def legacy_run(action, a, path=None, locks=None):
                         knowledge=project_knowledge.knowledge_context(workspace,task)
                         spec=project_knowledge.specification_status(workspace,task['description'])
                         delta=context_tools.workspace_delta(root,workspace,task)
-                        for key,value in (('knowledge',knowledge),('specification',spec),('workspace_delta',delta)):
+                        changes=project_knowledge.approved_wiki_changes(root,workspace,task,coord.settings(project_row))
+                        for key,value in (('knowledge',knowledge),('specification',spec),('workspace_delta',delta),('approved_wiki_changes',changes)):
                             if value:task[key]=value
-                        if knowledge or spec or delta:task['version']=context_tools.digest(task)
+                        if knowledge or spec or delta or changes:task['version']=context_tools.digest(task)
                 import task_decisions
                 relevant=task_decisions.context(db,project,task,prefix,a)
                 if project_row['git_merge']=='PR' and task['status'] in ('In Review','Done'):
@@ -1318,7 +1319,8 @@ def legacy_run(action, a, path=None, locks=None):
                 unavailable=('The shared Git checkout holds work from another branch.' if branch_skipped else
                              'Required planned paths could not be resolved.' if invalid_files or missing_root else
                              'Ready work conflicts with live file reservations.' if conflicts_skipped else '')
-                return project_knowledge.worker_readiness(root,workspace,selected,a,settings['coordination_channel'],stop,unavailable)
+                changes=project_knowledge.approved_wiki_changes(root,workspace,selected,settings) if selected else []
+                return project_knowledge.worker_readiness(root,workspace,selected,a,settings['coordination_channel'],stop,unavailable,changes)
             if action=='worker_launch':
                 if not candidates:
                     reason=(str(branch_skipped)+' ready task(s) need another branch, but this checkout is owned by active work or contains uncommitted edits. Preserve those edits; finish/recover this branch or use Worktrees for isolation.' if branch_skipped else 'No eligible unreserved work; no model was started.')
