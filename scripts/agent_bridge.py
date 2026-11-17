@@ -296,6 +296,10 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
             rules+=' Use apply_patch when available. For multiline shell edits, use Python.'
         elif client=='claude' and (os.name=='nt' or sys.platform=='darwin'):
             rules+=' Use Edit for targeted changes and Write when creating or replacing an entire file.'
+    if client=='codex':
+        lookup_path=str(ROOT/'scripts/skill_lookup.py')
+        lookup=('& '+json.dumps(worker_python())+' '+json.dumps(lookup_path)) if os.name=='nt' else shlex.join([worker_python(),lookup_path])
+        rules+=f' If a required skill is missing from the catalog, first run {lookup} "capability keywords", then read the matching SKILL.md.'
     diagnostics={key:started[key] for key in ('dirty_planned','file_lock_mode') if started.get(key)}
     git=started.get('git') or {}
     diagnostics.update({key:git[key] for key in ('branch','parent','worktree','error','refreshed_from') if git.get(key)})

@@ -13,6 +13,7 @@ SCRIPTS=Path(__file__).resolve().parents[1]/'scripts'
 sys.path.insert(0,str(SCRIPTS))
 import provider_usage
 import agent_bridge
+import skill_lookup
 
 class BridgeTest(unittest.TestCase):
     def test_execution_prompt_is_bounded_and_preclaim_instructions_are_unambiguous(self):
@@ -257,6 +258,19 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual({Path(x['path']).parent.name for x in config},{'scrum-resume','scrum-rules','scrum-usage'})
             self.assertTrue(all(Path(x['path']).name=='SKILL.md' for x in config))
             self.assertTrue(all(not x['enabled'] for x in config))
+
+    def test_skill_lookup_ranks_project_capabilities_without_loading_instructions(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            folder=Path(temp)
+            skill=folder/'.agents/skills/mesh-audit/SKILL.md'
+            skill.parent.mkdir(parents=True)
+            skill.write_text('---\nname: mesh-audit\ndescription: >-\n  Inspect topology and diagnose malformed geometry.\n---\nPRIVATE_BODY\n')
+            results=skill_lookup.lookup(folder,'inspect topology')
+            self.assertEqual(results[0]['name'],'mesh-audit')
+            self.assertEqual(results[0]['path'],str(skill))
+            self.assertNotIn('PRIVATE_BODY',str(results))
+            self.assertEqual(skill_lookup.lookup(folder,'zzznomatch'),[])
+            self.assertEqual(skill_lookup.lookup(folder,'scrum-complete')[0]['name'],'scrum-complete')
 
     def test_project_skill_selection_retains_specialist_and_user_overrides(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:

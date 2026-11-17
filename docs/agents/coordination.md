@@ -9,3 +9,5 @@
 For a smaller Codex worker catalog on this checkout, put a JSON array of skill directory names in `.scrum/local/codex-skills.json`, for example `["codebase-memory"]`. Add the specialists this project needs. The filter keeps `scrum-work` and preserves explicit Codex skill rules. It covers the immediate skill directories in Codex home, the user's `.agents/skills`, and the project. A skill omitted from the catalog can still be read from its known path.
 
 For changes to this flow, run the relevant CLI, bridge, workflow or context tests listed by `python scripts/verify.py --files PATH`.
+
+A native Codex worker can run `python scripts/skill_lookup.py "capability keywords"` from its checkout when it needs specialist or Scrum instructions. The lookup returns up to five manifests by name or description. Open the matching `SKILL.md` for the full procedure.
