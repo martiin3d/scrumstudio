@@ -167,7 +167,7 @@ class BridgeTest(unittest.TestCase):
         task={'code':'FIX-7','files':['app.py'],'acceptance_criteria':['Run the check.']}
         started={'task':task,'workflow':'Light'}
         exceptions=(
-            ({},{},{'task':task|{'continuity':'Continue from the previous result.'}}),
+            ({},{},{'task':task|{'continuity':'Continue from the previous result.','continuity_stale':True}}),
             ({},{},{'task':task|{'category':'Git recovery'}}),
             ({},{},{'task':task|{'verification_level':'full'}}),
             ({},{},{'task':task|{'review':{'open':True}}}),
@@ -186,6 +186,34 @@ class BridgeTest(unittest.TestCase):
                 self.assertIn('SCRUM_CLI_CONTEXT',prompt)
                 if extra.get('task',{}).get('continuity'):
                     self.assertIn('Continue from the previous result.',prompt)
+
+    def test_concise_resume_preserves_scope_and_falls_back_for_recovery(self):
+        task={'code':'FIX-7','files':['app.py'],'acceptance_criteria':['Verify changed behavior.'],
+              'continuity':'Previous check passed; implement remaining change.',
+              'required_skills':['codebase-memory'],
+              'workspace_delta':{'coverage':'scoped','changed_inputs':[], 'changed_paths':[],
+                                 'verification':[{'status':'unknown'}]}}
+        started={'task':task,'workflow':'Standard','file_lock_mode':'checkout'}
+        sections={}
+        with patch.object(skill_lookup,'required_skill_prompt',return_value='REQUIRED_SKILL_PATH'):
+            prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{}, {},started,sections=sections)
+        self.assertEqual(sections['_budget']['renderer'],'resume')
+        self.assertIn('any failed check must prevent finish',prompt)
+        for text in (task['continuity'],'workspace_delta','unknown','REQUIRED_SKILL_PATH',
+                     'Stop and permissions','--paths','finish --task FIX-7','Verify changed behavior.'):
+            self.assertIn(text,prompt)
+        self.assertFalse(agent_bridge.light_launch({}, {},started))
+        for changed in ({'continuity_stale':True},{'evidence':'prior result'},
+                        {'decision_context':{'has_more':True}},{'files_page':{'has_more':True}},
+                        {'workspace_delta':{'coverage':'partial'}},
+                        {'workspace_delta':{'coverage':'scoped','changed_paths':['app.py']}},
+                        {'workspace_delta':{'coverage':'scoped','evidence_review':True}},
+                        {'workspace_delta':{'coverage':'scoped','verification_risk':{'pending':True}}}):
+            with self.subTest(changed=changed):
+                self.assertFalse(agent_bridge.concise_resume_launch({}, {},started|{'task':task|changed}))
+        for offer,policy,extra in (({'batch':[1]},{},{}),({}, {'workflow_mode':'Standard'},{}),
+                                  ({},{'autonomy_mode':'Autonomous'},{}),({}, {},{'dirty_planned':['app.py']})):
+            self.assertFalse(agent_bridge.concise_resume_launch(offer,policy,started|extra))
 
     def test_cli_command_disables_only_scrum_and_keeps_specialist_selection(self):
         with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=['-c','mcp_servers.unity.enabled=true']):

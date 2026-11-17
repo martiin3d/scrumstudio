@@ -247,6 +247,20 @@ def light_launch(offer,policy,started):
             and not (started.get('dirty_planned') or git.get('worktree') or git.get('error') or git.get('refreshed_from')))
 
 
+def concise_resume_launch(offer,policy,started):
+    """Use saved scope directly only when no recovery context needs interpretation."""
+    task=started['task']
+    if not task.get('continuity') or policy.get('workflow_mode','Auto')!='Auto':
+        return False
+    delta=task.get('workspace_delta') or {}
+    if delta and (delta.get('coverage')!='scoped' or any(delta.get(key) for key in
+            ('changed_inputs','changed_paths','evidence_review','verification_risk'))):
+        return False
+    # Apply the fresh-launch safeguards without pretending the task is fresh.
+    candidate={**started,'workflow':'Light','task':{**task,'continuity':'','workspace_delta':{}}}
+    return started.get('workflow') in ('Light','Standard') and light_launch(offer,policy,candidate)
+
+
 def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections=None):
     import shlex
     from scrum_cli import redact
@@ -255,7 +269,25 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
     cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
     task=started['task']
     light=light_launch(offer,policy,started)
-    if light:
+    resumed=concise_resume_launch(offer,policy,started)
+    if resumed:
+        rules=(
+            'The supervisor validated quota and already claimed this task in the current checkout. '
+            'Use the supplied scope and saved continuity directly; implement only the remaining work. '
+            'Inspect the relevant source and acceptance checks. Preserve unrelated content. '
+            'Run acceptance checks after editing; reuse a successful result only while its inputs match. '
+            'The inherited private SCRUM_CLI_CONTEXT handles ownership. Keep it private. '
+            'For missing information or an actual failure, read the relevant scrum-work reference. '
+            'Resolve the supplied required skills and use specialist skills when the work needs them. '
+            'Respect Stop and permissions. When possible, run acceptance verification and the supplied finish command '
+            'in one tool call, with an explicit success guard: any failed check must prevent finish. '
+            'Finish only verified acceptance, then exit.'
+        )
+        if started.get('file_lock_mode')=='checkout':
+            rules+=' Declare extra output files at finish with --paths.'
+        else:
+            rules+=' Reserve any extra output files with CLI lock before editing.'
+    elif light:
         rules=(
             'The supervisor already claimed this task in the current checkout. Work within the supplied scope. '
             'Inspect the relevant files, make the change, and run the acceptance checks. '
@@ -314,7 +346,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         'rules':rules,
         'project_policy':autonomy_prompt(policy).strip(),
         'role':'Role instructions: '+role if role else '',
-        'execution':f'Finish: {cli} finish --task {task["code"]} --evidence TEXT' if light else f'Project {project}, actor {actor}, checkout {folder}.',
+        'execution':f'Finish: {cli} finish --task {task["code"]} --evidence TEXT' if light or resumed else f'Project {project}, actor {actor}, checkout {folder}.',
         'claim':serialize_claim(),
         'required_skills':required_skill_prompt(Path(folder),Path(git.get('worktree') or folder),client,task.get('required_skills',[])),
         'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
@@ -339,7 +371,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         actual=len(prompt.encode('utf-8'))
         sections['_budget']={'limit_bytes':STARTUP_BUDGET_BYTES,'initial_bytes':initial_bytes,
                              'deferred':deferred,'overflow_bytes':max(0,actual-STARTUP_BUDGET_BYTES),
-                             'renderer':'light' if light else 'standard'}
+                             'renderer':'resume' if resumed else 'light' if light else 'standard'}
     return prompt
 
 
