@@ -11,6 +11,39 @@ class UsageTest(unittest.TestCase):
     tearDown=test_storage.StorageTest.tearDown
     project=test_storage.StorageTest.project
 
+    def test_interaction_windows_keep_duplicate_resets_and_missing_values_distinct(self):
+        path=self.root/'samples.log'
+        sample=lambda total,last=None:{'type':'usage.sample','total':total,'last':last}
+        counts=lambda tokens,cache:{'input_tokens':tokens,'cached_input_tokens':cache}
+        tool={'kind':'command','tags':['read'],'failed':True,'retry':False,'output_bytes':42}
+        events=[{'type':'thread.started'},sample(counts(100,80)),{'type':'tool.observed','tool':tool},
+                sample(counts(100,80)),sample(counts(140,90)),sample(counts(5,2)),sample({}),
+                sample(None,counts(30,20)),{'type':'tool.observed','tool':tool},
+                {'type':'turn.completed','usage':counts(200,150)}]
+        path.write_text(''.join(json.dumps(row)+'\n' for row in events),encoding='utf-8')
+        report=execution_usage.interaction_report(path)
+        self.assertEqual([window['uncached_input_tokens'] for window in report['windows']],[20,30,None,None,10])
+        self.assertEqual([window['source'] for window in report['windows']],
+                         ['cumulative_delta','cumulative_delta','unavailable','unavailable','provider_last'])
+        self.assertEqual(report['windows'][1]['tools_since_last_sample'],[tool])
+        self.assertEqual(report['tools_without_following_sample'],[tool])
+        self.assertEqual(report['terminal_uncached_input_tokens'],50)
+        path.write_text(json.dumps({'type':'result','usage':{'input_tokens':4,'cache_read_input_tokens':10}}))
+        claude=execution_usage.interaction_report(path,client='claude')
+        self.assertEqual(claude['terminal_uncached_input_tokens'],4)
+        self.assertEqual(claude['windows'],[])
+
+    def test_tool_observation_flags_exact_failed_command_retry_and_excludes_content(self):
+        seen=set()
+        command='Get-Content private.txt'
+        failed=execution_usage.tool_observation({'type':'commandExecution','command':command,
+            'aggregatedOutput':'private é','exitCode':1},seen)
+        retry=execution_usage.tool_observation({'type':'commandExecution','command':command,'exitCode':0},seen)
+        self.assertEqual(failed,{'kind':'command','tags':['read'],'failed':True,'retry':False,'output_bytes':10})
+        self.assertTrue(retry['retry'])
+        self.assertIsNone(retry['output_bytes'])
+        self.assertEqual(seen,set())
+
     def test_six_task_batch_telemetry_matches_planner_and_mcp_schema(self):
         from mcp_server import handle
         from context_batches import CONTEXT_BATCH_SIZE

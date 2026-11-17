@@ -1,9 +1,96 @@
 """Reported CLI counters only. Local run totals are never allocated to tasks."""
 import json
+import re
 import time
 from worker_catalog import MAX_CONTEXT_BATCH_TASKS
 
 COUNTERS=('input_tokens','output_tokens','cached_input_tokens','cache_write_input_tokens','reasoning_output_tokens')
+CODEX_FIELDS=dict(input_tokens='inputTokens',output_tokens='outputTokens',
+                  cached_input_tokens='cachedInputTokens',reasoning_output_tokens='reasoningOutputTokens')
+
+
+def codex_counts(value):
+    if not isinstance(value,dict):return {}
+    return {key:value[field] for key,field in CODEX_FIELDS.items()
+            if field in value and type(value[field]) is int and 0<=value[field]<=10**15}
+
+
+COMMAND_TAGS={
+    'read':r'\b(get-content|rg|grep|cat|git\s+(?:show|diff))\b',
+    'verify':r'\b(verify[\w.-]*\.py|unittest|pytest|npm\s+test)\b',
+    'coordination':r'\bscrum\.py\b',
+    'edit':r'\b(apply_patch|set-content|write_text|writealltext)\b',
+}
+
+
+def tool_observation(item, failed_commands):
+    kind={'commandExecution':'command','fileChange':'edit','mcpToolCall':'mcp',
+          'dynamicToolCall':'dynamic','webSearch':'search'}.get(item.get('type'))
+    if not kind:return None
+    exit_code=item.get('exitCode')
+    status=item.get('status')
+    failed=True if status in ('failed','declined') else exit_code!=0 if type(exit_code) is int else False if status=='completed' else None
+    command=item.get('command')
+    tags=[];retry=False
+    if kind=='command' and isinstance(command,str) and command:
+        tags=[tag for tag,pattern in COMMAND_TAGS.items() if re.search(pattern,command,re.I)]
+        retry=command in failed_commands
+        if failed is True:failed_commands.add(command)
+        elif failed is False:failed_commands.discard(command)
+    output=item.get('aggregatedOutput')
+    return {'kind':kind,'tags':tags,'failed':failed,'retry':retry,
+            'output_bytes':len(output.encode('utf-8',errors='replace')) if isinstance(output,str) else None}
+
+
+def observed_input(counts):
+    if not isinstance(counts,dict):return None
+    total=counts.get('input_tokens')
+    cached=counts.get('cached_input_tokens')
+    if type(total) is int and type(cached) is int and 0<=cached<=total<=10**15:
+        return total,cached
+    return None
+
+
+def interaction_report(path,offset=0,client='codex'):
+    """Correlate provider samples with tools completed between them."""
+    windows=[];pending=[];previous=None
+    with open(path,'rb') as stream:
+        stream.seek(offset)
+        for line in stream:
+            try:record=json.loads(line)
+            except (ValueError,UnicodeError):continue
+            if not isinstance(record,dict):continue
+            kind=record.get('type')
+            if kind=='thread.started':
+                previous=(0,0)
+            elif kind=='tool.observed' and isinstance(record.get('tool'),dict):
+                pending.append(record['tool'])
+            elif kind=='usage.sample' and client=='codex':
+                total=observed_input(record.get('total'))
+                latest=observed_input(record.get('last'))
+                if previous is not None and total==previous:
+                    continue
+                delta=None
+                source='unavailable'
+                if total is not None and previous is not None:
+                    increase=tuple(after-before for before,after in zip(previous,total))
+                    if 0<=increase[1]<=increase[0]:
+                        delta=increase
+                        source='cumulative_delta'
+                elif latest is not None:
+                    delta=latest
+                    source='provider_last'
+                previous=total
+                windows.append({'source':source,'uncached_input_tokens':delta[0]-delta[1] if delta else None,
+                                'input_tokens':delta[0] if delta else None,'tools_since_last_sample':pending})
+                pending=[]
+    terminal=parse(path,offset,client)
+    final=observed_input(terminal) if client=='codex' else None
+    terminal_uncached=(final[0]-final[1] if final is not None else
+                       terminal.get('input_tokens') if terminal and client=='claude' else None)
+    return {'client':client,'terminal_uncached_input_tokens':terminal_uncached,'windows':windows,
+            'tools_without_following_sample':pending,
+            'attribution':'Provider intervals. Tools in an interval share its context; no token count is assigned to an individual tool.'}
 
 def parse(path,offset,client):
     try:

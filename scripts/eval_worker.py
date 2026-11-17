@@ -310,9 +310,18 @@ def main():
     parser.add_argument('--collect',metavar='RUN_ID')
     parser.add_argument('--replicate',type=int,default=1)
     parser.add_argument('--observed',type=Path,help='Independent confirmation of verification and semantic repeated calls')
+    parser.add_argument('--interaction-log',type=Path,help='Analyze local provider samples and intervening tool activity')
+    parser.add_argument('--offset',type=int,default=0,help='Byte offset of the run in a shared worker log')
+    parser.add_argument('--client',choices=('codex','claude'),default='codex')
     args = parser.parse_args()
     if args.cases:
         result = CASES
+    elif args.interaction_log:
+        from execution_usage import interaction_report
+        try:
+            result=interaction_report(args.interaction_log,args.offset,args.client)
+        except (OSError,ValueError) as error:
+            parser.error(str(error))
     elif args.fixture and (args.prepare or args.collect):
         try:
             result=prepare_fixture(args.fixture,args.prepare) if args.prepare else collect_fixture(
@@ -327,7 +336,7 @@ def main():
         except (OSError, ValueError, KeyError, TypeError) as error:
             parser.error(str(error))
     else:
-        parser.error('Use --cases or supply both --baseline and --candidate')
+        parser.error('Use --cases, --interaction-log, or supply both --baseline and --candidate')
     print(json.dumps(result, indent=2))
     return int(bool(result.get('quality_regressions')))
 

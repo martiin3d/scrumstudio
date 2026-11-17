@@ -15,6 +15,7 @@ from mcp_client import ScrumClient
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import idle_signals
+from execution_usage import CODEX_FIELDS, codex_counts, tool_observation
 
 
 APPROVALS={'item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval'}
@@ -47,7 +48,7 @@ def event(kind,**fields):
 
 def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=None,signals=None,full_access=False):
     owned=rpc is None
-    child=None;pending={};messages=queue.Queue();usage={};exit_code=1;items={}
+    child=None;pending={};messages=queue.Queue();usage={};exit_code=1;items={};failed_commands=set()
     permission_profile=':danger-full-access' if full_access else 'scrum-worker'
     def send(value):
         child.stdin.write(json.dumps(value)+'\n');child.stdin.flush()
@@ -110,10 +111,17 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
             elif method in ('item/started','item/completed'):
                 item=params.get('item',{})
                 if item.get('id') and item.get('type')=='fileChange':items[item['id']]=item
-                if method=='item/completed' and item.get('type')=='agentMessage':event('item.completed',item={'type':'agent_message','text':item.get('text','')})
+                if method=='item/completed':
+                    if item.get('type')=='agentMessage':
+                        event('item.completed',item={'type':'agent_message','text':item.get('text','')})
+                    observation=tool_observation(item,failed_commands)
+                    if observation:event('tool.observed',tool=observation)
             elif method=='thread/tokenUsage/updated':
-                total=params.get('tokenUsage',{}).get('total',{})
-                usage={out:total.get(key) for out,key in [('input_tokens','inputTokens'),('output_tokens','outputTokens'),('cached_input_tokens','cachedInputTokens'),('reasoning_output_tokens','reasoningOutputTokens')]}
+                provider=params.get('tokenUsage') or {}
+                total=codex_counts(provider.get('total'))
+                last=codex_counts(provider.get('last'))
+                if total:usage={key:total.get(key) for key in CODEX_FIELDS}
+                event('usage.sample',total=total,last=last)
             elif method=='turn/completed':
                 turn=params.get('turn',{})
                 if turn.get('status')=='completed':event('turn.completed',usage=usage);exit_code=0
