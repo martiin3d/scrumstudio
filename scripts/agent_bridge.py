@@ -251,6 +251,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
     import shlex
     from scrum_cli import redact
     from context_tools import startup_task
+    from skill_lookup import required_skill_prompt
     cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
     task=started['task']
     light=light_launch(offer,policy,started)
@@ -284,7 +285,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         if policy.get('agent_followup_tasks'):
             rules+=' For a discovered prerequisite use plan with defer_task=current ID. PLAN_REJECTED rolled back. Exit on deferred=true.'
         if offer.get('batch'):
-            rules+=' Finish each task separately. Continue only with the fresh next.claim and next.task. Exit when the batch ends or the next claim fails.'
+            rules+=' Finish each task separately. Continue only with the fresh next.claim and next.task. Resolve that task’s required_skills before editing. Exit when the batch ends or the next claim fails.'
         else:
             rules+=' Finish closes the session. Exit so the supervisor can select the next task.'
         if task.get('category')=='Git recovery':
@@ -315,6 +316,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         'role':'Role instructions: '+role if role else '',
         'execution':f'Finish: {cli} finish --task {task["code"]} --evidence TEXT' if light else f'Project {project}, actor {actor}, checkout {folder}.',
         'claim':serialize_claim(),
+        'required_skills':required_skill_prompt(Path(folder),Path(git.get('worktree') or folder),client,task.get('required_skills',[])),
         'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
     }
     def render():
@@ -872,6 +874,10 @@ def main():
                     if args.client=='codex' and policy.get('agent_approval_mode')=='Full access':
                         prompt+='\nThis launch uses human-authorized Full access with approval policy never. Execute authorized project commands directly; previous sandbox-only failures do not establish a current access failure. The escalation advice above applies only to sandboxed launches. Do not request permission that this launch already has. Actual organization/OS restrictions still apply; diagnose real failures and attempt a bounded authorized repair, without weakening Stop, quota, ownership or verification.'
                     run_folder=Path(started.get('git',{}).get('worktree') or folder)
+                    if channel!='cli':
+                        from skill_lookup import required_skill_prompt
+                        required=required_skill_prompt(folder,run_folder,args.client,started['task'].get('required_skills',[]))
+                        if required:prompt+='\n'+required
                     if run_folder!=folder:
                         prompt=prompt.replace(' in '+str(folder)+'.',' in '+str(run_folder)+'.')
                         prompt+='\nWorking directory: '+str(run_folder)+'. The board stays at '+str(folder)+'; keep its project ID. Edit only this worktree. Use relative file plans so central reservations match across workers. Do not open/register this worktree as a new Scrum project. Verify graph results against source in this worktree.'

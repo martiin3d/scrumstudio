@@ -33,6 +33,7 @@ def digest(value):
 
 def basis(task):
     content={k:task.get(k) for k in ('title','description','acceptance_criteria','status','dependencies','blocked_reason','files','checklist','evidence','attachments')}
+    if task.get('required_skills'):content['required_skills']=task['required_skills']
     if task.get('blocked_reason') and task.get('blocked_reason_kind')=='dependency':content['blocked_reason_kind']='dependency'
     return digest(content)
 
@@ -62,7 +63,7 @@ def agent_task(task, files_after=0, files_limit=20):
     if files_after or len(files)>files_limit:
         result['files']=files[files_after:files_after+files_limit]
         result['files_page']={'total':len(files),'after':files_after,'next_after':min(len(files),files_after+files_limit),'has_more':files_after+files_limit<len(files)}
-    for key in ('model_selection','scope_reason','model_reason','context_group'):
+    for key in ('model_selection','scope_reason','model_reason','context_group','required_skills'):
         if not result.get(key):result.pop(key,None)
     if result.get('verification_level','auto')=='auto' and not result.get('verification_reason'):
         result.pop('verification_level',None);result.pop('verification_reason',None)
@@ -82,7 +83,7 @@ def startup_task(task):
         'blocked_reason','blocked_reason_kind','evidence','continuity','continuity_stale',
         'preserved_inputs','decision_context','pending_ai_notes','attachment_count',
         'verification_level','verification_reason','review','context_group','context_batch',
-        'specification','knowledge','workspace_delta','approved_wiki_changes',
+        'specification','knowledge','workspace_delta','approved_wiki_changes','required_skills',
     )
     return {key:task[key] for key in fields if key in task and task[key] not in (None,'',[],{})}
 

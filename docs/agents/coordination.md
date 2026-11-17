@@ -11,3 +11,5 @@ For a smaller Codex worker catalog on this checkout, put a JSON array of skill d
 For changes to this flow, run the relevant CLI, bridge, workflow or context tests listed by `python scripts/verify.py --files PATH`.
 
 A native Codex worker can run `python scripts/skill_lookup.py "capability keywords"` from its checkout when it needs specialist or Scrum instructions. The lookup returns up to five manifests by name or description. Open the matching `SKILL.md` for the full procedure.
+
+Declare skills by name in a task plan item, for example `"required_skills": ["codebase-memory"]`. The worker gets the matching manifest paths at startup, including on resume. Record newly needed skills with a task update when they matter for a handoff. For skills needed by every task on this machine, put their names in `.scrum/local/required-skills.json`. Task requirements travel in project snapshots. Each checkout resolves the paths locally.

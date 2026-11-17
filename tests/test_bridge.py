@@ -141,7 +141,10 @@ class BridgeTest(unittest.TestCase):
         ):
             with self.subTest(client=client,platform=platform,task=current,offer=offer):
                 folder=Path('.')
-                with patch.object(agent_bridge.os,'name',os_name), patch.object(agent_bridge.sys,'platform',platform), patch.object(agent_bridge,'worker_python',return_value='python'):
+                with (patch.object(agent_bridge.os,'name',os_name),
+                      patch.object(agent_bridge.sys,'platform',platform),
+                      patch.object(agent_bridge,'worker_python',return_value='python'),
+                      patch.object(skill_lookup,'required_skill_prompt',return_value='')):
                     prompt=agent_bridge.cli_prompt(1,folder,9,client,offer,{}, {'task':current,'workflow':'Light'})
                 self.assertEqual([guidance for guidance in (windows,mac,claude) if guidance in prompt],expected)
 
@@ -271,6 +274,24 @@ class BridgeTest(unittest.TestCase):
             self.assertNotIn('PRIVATE_BODY',str(results))
             self.assertEqual(skill_lookup.lookup(folder,'zzznomatch'),[])
             self.assertEqual(skill_lookup.lookup(folder,'scrum-complete')[0]['name'],'scrum-complete')
+
+    def test_required_skill_prompt_uses_worktree_and_keeps_missing_names(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            project=Path(temp)
+            checkout=project/'worktree'
+            manifest=checkout/'.agents/skills/mesh-audit/SKILL.md'
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('---\nname: mesh-audit\ndescription: Inspect topology.\n---\nPRIVATE_BODY\n')
+            defaults=project/'.scrum/local/required-skills.json'
+            defaults.parent.mkdir(parents=True)
+            defaults.write_text('["scrum-complete","mesh-audit"]')
+            started={'workflow':'Light','git':{'worktree':str(checkout)},
+                     'task':{'code':'FIX-7','required_skills':['mesh-audit','missing-specialist'],'continuity':'Continue.'}}
+            prompt=agent_bridge.cli_prompt(1,project,9,'codex',{}, {},started)
+            self.assertIn(json.dumps(str(manifest)),prompt)
+            self.assertIn('Required skills missing from local manifests: missing-specialist',prompt)
+            self.assertIn('scrum-complete',prompt)
+            self.assertNotIn('PRIVATE_BODY',prompt)
 
     def test_project_skill_selection_retains_specialist_and_user_overrides(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:

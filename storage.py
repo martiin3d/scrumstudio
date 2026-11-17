@@ -432,6 +432,8 @@ def snapshot_data(db, meta, folder):
                 row['cost_data'] = json.loads(row['cost_data'])
                 row['model_selection']=json.loads(row['model_selection'])
                 row['acceptance_criteria'] = json.loads(row['acceptance_criteria'])
+                required_skills=json.loads(row.pop('required_skills','[]'))
+                if required_skills:row['required_skills']=required_skills
                 row['dependencies'] = [task_ids[i] for i in json.loads(row['dependencies'])]
                 row['checklist'] = json.loads(row['checklist'])
                 row['files'] = [portable_file(p, folder) for p in json.loads(row['files'])]
@@ -509,7 +511,7 @@ def validate_snapshot(data, meta):
         if not isinstance(row.get('model_selection',{}),dict):raise ValueError('Invalid model selection')
         from store import validate_verification
         validate_verification(row.get('verification_level','auto'),row.get('verification_reason',''))
-        from store import acceptance_criteria
+        from store import acceptance_criteria,validate_required_skills
         import task_decisions
         task_decisions.validate(row.get('decisions',[]))
         from attachments import validate_metadata
@@ -524,6 +526,7 @@ def validate_snapshot(data, meta):
             if not isinstance(row.get(key,''),str) or len(row.get(key,''))>limit:
                 raise ValueError('Invalid continuity data')
         acceptance_criteria(row.get('acceptance_criteria',[]),allow_empty=True)
+        validate_required_skills(row.get('required_skills',[]))
         if row.get('status') not in STATUSES or type(row.get('number')) is not int or row['number'] < 1 or row['number'] in numbers:
             raise ValueError('Invalid or duplicate task number/status; resolve Git conflicts first')
         numbers.add(row['number'])
@@ -595,6 +598,7 @@ def restore_into(db, data, meta):
         row.setdefault('decisions',[])
         row.setdefault('attachments',[])
         row.setdefault('acceptance_criteria',[])
+        row.setdefault('required_skills',[])
         row.setdefault('continuity','')
         row.setdefault('continuity_basis','')
         import task_cost
@@ -645,6 +649,7 @@ def restore_into(db, data, meta):
                 row['cost_data'] = json.dumps(row['cost_data'])
                 row['model_selection']=json.dumps(row['model_selection'])
                 row['acceptance_criteria'] = json.dumps(row['acceptance_criteria'])
+                row['required_skills'] = json.dumps(row['required_skills'])
                 row['id'] = task_map[row['uid']]
                 row['dependencies'] = json.dumps([task_map[i] for i in row['dependencies']])
                 row['checklist'] = json.dumps(row['checklist'])

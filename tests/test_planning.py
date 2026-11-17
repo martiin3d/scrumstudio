@@ -38,6 +38,31 @@ class PlanningTest(unittest.TestCase):
         self.assertEqual(len(run('task_search',dict(project=p))['items']),1)
         self.assertEqual(run('file_locks',dict(project=p))['items'],[])
 
+    def test_task_skill_requirements_survive_planning_claim_and_continuity(self):
+        p,_=self.project()
+        task=self.plan(p,[self.item('mesh','Verify geometry',required_skills=['mesh-audit','MESH-AUDIT'])])[0]['id']
+        self.plan(p,[self.item('mesh','Verify revised geometry',id=task)])
+        claim=run('task_claim',dict(project=p,id=task,actor=self.agent))
+        run('task_update',dict(project=p,id=task,actor=self.agent,token=claim['token'],
+                              continuity='Inspect the remaining mesh.',required_skills=['mesh-audit','scrum-complete']))
+        run('task_release',dict(project=p,id=task,actor=self.agent,token=claim['token']))
+        resumed=run('work_start',dict(project=p,id=task,actor=self.agent,client='codex',claim=True,
+                                    session_used_percent=1,weekly_used_percent=2))
+        self.assertEqual(resumed['task']['required_skills'],['mesh-audit','scrum-complete'])
+        self.assertEqual(resumed['task']['continuity'],'Inspect the remaining mesh.')
+        self.assertFalse(resumed['task']['continuity_stale'])
+        run('task_release',dict(project=p,id=task,actor=self.agent,token=resumed['claim']['token']))
+        run('project_export',dict(project=p))
+        claim=run('task_claim',dict(project=p,id=task,actor=self.agent))
+        run('task_update',dict(project=p,id=task,actor=self.agent,token=claim['token'],required_skills=[]))
+        run('task_release',dict(project=p,id=task,actor=self.agent,token=claim['token']))
+        self.assertNotIn('required_skills',run('task_get',dict(project=p,id=task)))
+        run('project_restore',dict(project=p,confirm=True))
+        self.assertEqual(run('task_get',dict(project=p,code=resumed['task']['code']))['required_skills'],
+                         ['mesh-audit','scrum-complete'])
+        with self.assertRaises(ValueError):
+            self.plan(p,[self.item('invalid','Invalid reference',required_skills=['../unsafe'])])
+
     def test_invalid_plan_rolls_back_refinement_creation_and_activity(self):
         p,_=self.project()
         original=run('task_create',dict(project=p,title='Original',description='Keep history',acceptance_criteria=['Kept']))['id']

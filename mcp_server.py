@@ -24,6 +24,9 @@ VERIFICATION=dict(verification_level={'type':'string','enum':['auto','minimal','
 PLAN_ITEM=schema(dict(**VERIFICATION,context_group={'type':'string','maxLength':80},model_tier={'type':'string','enum':['auto','economy','standard','advanced'],'description':'Auto defaults to standard independently of size; economy for mechanical low-risk work, advanced for difficult reasoning. Choose with a reason during existing planning.'},model_reason=S,key=S,id=I,title=S,description=S,acceptance_criteria={'type':'array','items':S,'minItems':1,'maxItems':100},priority=I,category=S,files=FILES,dependencies={'type':'array','items':{'type':['integer','string']},'maxItems':100},scope_size={'type':'string','enum':['Unknown','Small','Large']},scope_reason=S),['key','title','description','acceptance_criteria'])
 PLAN_ITEM['properties']['status']={'type':'string','enum':['TODO','Backlog']}
 PLAN_ITEM['properties']['specification']=schema(dict(page=S,section=S),['page'])
+REQUIRED_SKILLS={'type':'array','items':{'type':'string','maxLength':80},'maxItems':8,
+                 'description':'Installed skill names needed by this task. An empty list clears task requirements.'}
+PLAN_ITEM['properties']['required_skills']=REQUIRED_SKILLS
 
 TOOLS = [
     ('project_workspaces','Human maintenance: preview managed worktrees and cleanup retention reasons, or archive them with confirm=true. Content equivalence is informational. Archiving requires Stop and no live claims, and preserves all files and branch refs.',schema(dict(P,actor=I,confirm=B),['project','actor'])),
@@ -82,7 +85,7 @@ TOOLS = [
 for _name,_description,_schema in TOOLS:
     if _name=='project_settings':_schema['properties'].update(git_merge={'type':'string','enum':['Off','Group','Task','PR']},git_cleanup=B,git_pause_blocked=B)
     if _name=='worker_launch':_schema['properties']['id']=I
-    if _name in ('task_create','task_update'):_schema['properties'].update(VERIFICATION,context_group={'type':'string','maxLength':80})
+    if _name in ('task_create','task_update'):_schema['properties'].update(VERIFICATION,context_group={'type':'string','maxLength':80},required_skills=REQUIRED_SKILLS)
     if _name in ('task_create','task_update'):_schema['properties'].update(model=S,model_tier={'type':'string','enum':['auto','economy','standard','advanced'],'description':'Auto defaults to standard independently of size; economy for mechanical low-risk work, advanced for difficult reasoning. Choose with a reason during existing planning.'},model_reason=S)
     if _name in ('task_create','task_plan'):_schema['properties']['allow_duplicate']=B
     if _name=='task_create':_schema['properties']['status']={'type':'string','enum':['TODO','Backlog']}

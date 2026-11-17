@@ -37,28 +37,58 @@ def metadata(manifest):
     return None
 
 
-def lookup(project, query):
+def catalog(project, client='codex'):
     home = Path.home()
     codex_home = Path(os.environ.get('CODEX_HOME', home / '.codex'))
+    provider = (project / '.claude/skills', home / '.claude/skills') if client=='claude' else (codex_home / 'skills',)
     roots = (project / '.agents/skills', project / 'skills', home / '.agents/skills',
-             codex_home / 'skills', Path(__file__).resolve().parents[1] / 'skills')
-    terms = words(query)
-    if not terms:
-        return []
+             *provider, Path(__file__).resolve().parents[1] / 'skills')
     found = {}
     for root in roots:
         for manifest in sorted(root.glob('*/SKILL.md')):
             item = metadata(manifest)
             if item:
                 found.setdefault(item['name'].casefold(), item)
+    return found
+
+
+def lookup(project, query):
+    terms = words(query)
+    if not terms:
+        return []
     matches = []
-    for name, item in found.items():
+    for name, item in catalog(project).items():
         score = 4 * len(terms & words(name)) + len(terms & words(item['description']))
         if name == query.casefold():
             score += 100
         if score:
             matches.append((-score, name, item))
     return [item | {'description': item['description'][:180]} for _, _, item in sorted(matches)[:5]]
+
+
+def required_skill_prompt(project, checkout, client, names):
+    from store import validate_required_skills
+    defaults = project / '.scrum/local/required-skills.json'
+    warning = ''
+    try:
+        declared = validate_required_skills(json.loads(defaults.read_text(encoding='utf-8-sig')))
+    except FileNotFoundError:
+        declared = []
+    except (OSError, ValueError):
+        declared = []
+        warning = 'Project required-skills.json is unreadable or invalid.'
+    names = {name.casefold(): name for name in (*declared, *names)}
+    if not names:
+        return warning
+    available = catalog(checkout, client)
+    manifests = {name: available[key]['path'] for key, name in names.items() if key in available}
+    missing = [name for key, name in names.items() if key not in available]
+    sections = [warning]
+    if manifests:
+        sections.append('Read these required SKILL.md manifests before affected work: '+json.dumps(manifests,ensure_ascii=False))
+    if missing:
+        sections.append('Required skills missing from local manifests: '+', '.join(missing)+'. Check the provider catalog and report any unresolved requirement before affected work.')
+    return '\n'.join(section for section in sections if section)
 
 
 if __name__ == '__main__':

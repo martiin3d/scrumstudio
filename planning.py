@@ -18,7 +18,7 @@ def apply(db,a,project):
 
 
 def _apply(db,a,project):
-    from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix,duplicate_task
+    from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix,duplicate_task,validate_required_skills
     actor=actor_user(db,a)
     db.execute('BEGIN IMMEDIATE')
     runtime.gate(db,project,actor['id'])
@@ -42,7 +42,7 @@ def _apply(db,a,project):
     items=a.get('items')
     if not isinstance(items,list) or not 1<=len(items)<=10:
         raise ValueError('Plan needs 1..10 concrete outcomes')
-    allowed={'id','key','title','description','acceptance_criteria','priority','category','files','dependencies','scope_size','scope_reason','model_tier','model_reason','verification_level','verification_reason','context_group','status','specification'}
+    allowed={'id','key','title','description','acceptance_criteria','priority','category','files','dependencies','scope_size','scope_reason','model_tier','model_reason','verification_level','verification_reason','context_group','status','specification','required_skills'}
     prepared=[];keys={};existing=set()
     for item in items:
         if not isinstance(item,dict) or set(item)-allowed:
@@ -78,6 +78,7 @@ def _apply(db,a,project):
             if not workspace:raise ValueError('A specification needs a project workspace')
             description=required(bind_specification(workspace,description,item['specification']),'description',12000)
         criteria=acceptance_criteria(item.get('acceptance_criteria'))
+        skills=validate_required_skills(item.get('required_skills',[]))
         size=item.get('scope_size',old['scope_size'] if old else 'Unknown')
         reason=item.get('scope_reason',old['scope_reason'] if old else '')
         coord.validate_scope(size,reason)
@@ -85,7 +86,7 @@ def _apply(db,a,project):
         deps=item.get('dependencies',json.loads(old['dependencies']) if old else [])
         if not isinstance(deps,list) or len(deps)>100 or any(type(d) not in (str,int) for d in deps):
             raise ValueError('Dependencies must be task IDs or plan keys')
-        prepared.append(dict(same=same,differs=differs,item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps))
+        prepared.append(dict(same=same,differs=differs,item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps,skills=skills))
     prefix=project_prefix(db.execute('SELECT name FROM projects WHERE id=?',(project,)).fetchone()['name'])
     result=[]
     resolved_items=[]
@@ -126,6 +127,8 @@ def _apply(db,a,project):
         reason=item.get('verification_reason',old['verification_reason'] if old else '')
         validate_verification(level,reason)
         db.execute('UPDATE tasks SET verification_level=?,verification_reason=? WHERE id=?',(level,reason,task))
+        if 'required_skills' in item:
+            db.execute('UPDATE tasks SET required_skills=? WHERE id=?',(json.dumps(value['skills']),task))
         keys[value['key']]=task
         result.append({'key':value['key'],'id':task,'code':f'{prefix}-{number}','status':status})
     for value in prepared:

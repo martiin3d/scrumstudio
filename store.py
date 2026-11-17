@@ -1,6 +1,7 @@
 import json
 import git_worktrees
 import os
+import re
 import sqlite3
 import subprocess
 import unicodedata
@@ -69,7 +70,7 @@ def connect(path=None, locks=None):
         for field in ('continuity','continuity_basis'):
             if field not in columns:
                 db.execute(f"ALTER TABLE tasks ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
-        for field,default in [('context_group',''),('scope_size','Unknown'),('scope_reason',''),('verification_level','auto'),('verification_reason','')]:
+        for field,default in [('context_group',''),('scope_size','Unknown'),('scope_reason',''),('verification_level','auto'),('verification_reason',''),('required_skills','[]')]:
             if field not in columns:
                 db.execute(f"ALTER TABLE tasks ADD COLUMN {field} TEXT NOT NULL DEFAULT '{default}'")
         for field,default in [('model',''),('model_tier','auto'),('model_reason',''),('model_selection','{}')]:
@@ -205,6 +206,18 @@ def description(value):
         raise ValueError('Description must be text, max 12000 characters')
     return value
 
+def validate_required_skills(value):
+    if not isinstance(value,list) or len(value)>8:
+        raise ValueError('required_skills must list up to eight skill names')
+    names=[]
+    for name in value:
+        if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_:-]{0,79}',name):
+            raise ValueError('required_skills accepts skill names only, without paths')
+        if name.casefold() not in {item.casefold() for item in names}:
+            names.append(name)
+    return names
+
+
 def task_dict(row, prefix, include_cost=False):
     t = dict(row)
     import reviews
@@ -214,6 +227,7 @@ def task_dict(row, prefix, include_cost=False):
     t['dependencies'] = json.loads(t['dependencies'])
     t['checklist'] = json.loads(t['checklist'])
     t['files'] = json.loads(t['files'])
+    t['required_skills'] = json.loads(t.get('required_skills','[]'))
     decisions=json.loads(t.pop('decisions','[]'))
     if decisions:t['decisions']=decisions
     t['attachments'] = json.loads(t['attachments'])
@@ -255,6 +269,8 @@ def duplicate_task(db, project, title, a):
         if json.loads(row['acceptance_criteria'])!=a.get('acceptance_criteria'):differs.append('acceptance_criteria')
         for field in ('files','dependencies','checklist'):
             if field in a and json.loads(row[field])!=a[field]:differs.append(field)
+        if 'required_skills' in a and json.loads(row['required_skills'])!=validate_required_skills(a['required_skills']):
+            differs.append('required_skills')
         for field in ('category','priority','scope_size','scope_reason','context_group','model','model_tier','model_reason','verification_level','verification_reason'):
             if field in a and row[field]!=a[field]:differs.append(field)
         if differs and row['status']=='Done':
@@ -829,6 +845,7 @@ def legacy_run(action, a, path=None, locks=None):
             title = required(a.get('title'), 'title', 240)
             scope = required(a.get('description'),'description',12000)
             criteria = acceptance_criteria(a.get('acceptance_criteria'))
+            skills = validate_required_skills(a.get('required_skills',[]))
             coord.validate_scope(a.get('scope_size','Unknown'),a.get('scope_reason',''))
             db.execute('BEGIN IMMEDIATE')
             same,differs=duplicate_task(db,project,title,a)
@@ -843,6 +860,8 @@ def legacy_run(action, a, path=None, locks=None):
             db.execute('UPDATE tasks SET scope_size=?,scope_reason=? WHERE id=?',(a.get('scope_size','Unknown'),a.get('scope_reason',''),cur.lastrowid))
             db.execute('UPDATE tasks SET dependencies=? WHERE id=?', (json.dumps(deps), cur.lastrowid))
             db.execute('UPDATE tasks SET files=? WHERE id=?',(json.dumps(coord.file_plan(a.get('files',[]))),cur.lastrowid))
+            if skills:
+                db.execute('UPDATE tasks SET required_skills=? WHERE id=?',(json.dumps(skills),cur.lastrowid))
             import model_routing
             model_routing.validate(a.get('model',''),a.get('model_tier','auto'),a.get('model_reason',''))
             if a.get('model') and actor_user(db,a)['kind']!='human':raise ValueError('Only a human can set a fixed task model')
@@ -914,6 +933,9 @@ def legacy_run(action, a, path=None, locks=None):
                 if old['model'] and actor_user(db,a)['kind']!='human':raise ValueError('Human task model is fixed; automatic routing cannot replace it')
             db.execute('UPDATE tasks SET model=?,model_tier=?,model_reason=? WHERE id=?',(*routing.values(),t['id']))
             level=a.get('verification_level',old['verification_level']);reason=a.get('verification_reason',old['verification_reason'])
+            if 'required_skills' in a:
+                t['required_skills']=validate_required_skills(a['required_skills'])
+                db.execute('UPDATE tasks SET required_skills=? WHERE id=?',(json.dumps(t['required_skills']),t['id']))
             validate_verification(level,reason)
             db.execute('UPDATE tasks SET verification_level=?,verification_reason=? WHERE id=?',(level,reason,t['id']))
             for field in ('scope_size','scope_reason'):
