@@ -350,22 +350,54 @@ def batch_prompt(prompt,batch,client,code):
     prompt=prompt.replace('Claim an eligible task/files (claimed=true) ONLY for '+str(code),'Work sequentially starting with '+str(code))
     return prompt+'\nSequential reserved batch headers (bounded; load only the current scope): '+json.dumps(batch,separators=(',',':'))+'. Others remain TODO and reserved, not In Progress. Finish each with work_finish(use_batch=true,claim_next=true,client="'+client+'"). Continue only with returned next.task and next.claim; a successful next.claim already grants its fresh token and full scope, so do not start/claim/read it again. A missing/failed next.claim requires task_get and task_update(claim=true) or the normal MCP fallback before edits. Exit when batch_done, session offline, Stop/quota or a real impediment; never select outside this batch yourself.'
 
-def skill_options():
-    """Hide optional Scrum catalog entries for this run; files stay readable."""
+def skill_options(folder=None):
+    """Filter the worker catalog without changing installed skills."""
     import tomllib
     home=Path(os.environ.get('CODEX_HOME',Path.home()/'.codex'))
     try:
         config=tomllib.loads((home/'config.toml').read_text(encoding='utf-8')) if (home/'config.toml').exists() else {}
         existing=config.get('skills',{}).get('config',[])
+        roots=[home/'skills',Path.home()/'.agents/skills']
+        selected=None
+        if folder is not None:
+            folder=Path(folder).resolve()
+            selection=folder/'.scrum/local/codex-skills.json'
+            if selection.is_file():
+                selected=json.loads(selection.read_text(encoding='utf-8-sig'))
+                if not isinstance(selected,list) or any(not isinstance(name,str) or not name.strip() for name in selected):
+                    return []
+                roots.append(folder/'.agents/skills')
+            # A CLI array replaces the project array. Leave explicit project
+            # rules to Codex, including any config inherited from a parent.
+            for directory in (folder,*folder.parents):
+                checkout_config=directory/'.codex/config.toml'
+                if (checkout_config.is_file() and checkout_config.resolve()!=(home/'config.toml').resolve()
+                        and tomllib.loads(checkout_config.read_text(encoding='utf-8')).get('skills',{}).get('config')):
+                    return []
         if not isinstance(existing,list):return []
-        entries=[dict(item) for item in existing]
-        known={os.path.normcase(str(Path(item['path']).resolve())) for item in entries}
-        core={'scrum-work'}
-        for base in [home/'skills',Path.home()/'.agents/skills']:
-            for path in sorted(base.glob('scrum-*')):
-                if path.name not in core and (path/'SKILL.md').is_file() and os.path.normcase(str(path.resolve())) not in known:
-                    entries.append({'path':str(path),'enabled':False})
-        value='['+','.join('{path='+json.dumps(item['path'])+',enabled='+str(bool(item.get('enabled',True))).lower()+'}' for item in entries)+']'
+        if any(not isinstance(item,dict) or ('path' in item)==('name' in item) for item in existing):
+            return []
+        entries=list(existing)
+        known_names={item['name'] for item in entries if 'name' in item}
+        known_paths={os.path.normcase(str(Path(item['path']).resolve())) for item in entries if 'path' in item}
+        for base in roots:
+            for manifest in sorted(base.glob('*/SKILL.md')):
+                name=manifest.parent.name
+                if name=='scrum-work' or name in known_names or name in (selected or []):
+                    continue
+                if selected is None and not name.startswith('scrum-'):
+                    continue
+                path=os.path.normcase(str(manifest.resolve()))
+                if path in known_paths or os.path.dirname(path) in known_paths:
+                    continue
+                entries.append({'path':str(manifest.resolve()),'enabled':False})
+                known_paths.add(path)
+        rules=[]
+        for item in entries:
+            selector='path' if 'path' in item else 'name'
+            enabled='true' if item.get('enabled',True) else 'false'
+            rules.append('{'+selector+'='+json.dumps(item[selector])+',enabled='+enabled+'}')
+        value='['+','.join(rules)+']'
         return ['-c','skills.config='+value] if entries else []
     except (OSError,ValueError,KeyError,TypeError):return []
 
@@ -377,7 +409,7 @@ def command(client,folder,prompt,model='',policy_folder=None,coordination_channe
         raise RuntimeError(client+' CLI not found in PATH')
     if client=='codex':
         options=['-c','approval_policy="on-request"','-c','approvals_reviewer="auto_review"']
-        options+=skill_options()
+        options+=skill_options(policy_folder or folder)
         import mcp_selection
         options+=mcp_selection.codex_options(policy_folder or folder)
         options+=['-c','default_permissions="scrum-worker"','-c','permissions.scrum-worker.extends=":workspace"']

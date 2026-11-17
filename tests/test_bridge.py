@@ -254,8 +254,29 @@ class BridgeTest(unittest.TestCase):
             with patch.dict(os.environ,{'CODEX_HOME':str(home/'.codex')}),patch.object(agent_bridge.Path,'home',return_value=home):
                 options=agent_bridge.skill_options()
             config=tomllib.loads(options[1])['skills']['config']
-            self.assertEqual({Path(x['path']).name for x in config},{'scrum-resume','scrum-rules','scrum-usage'})
+            self.assertEqual({Path(x['path']).parent.name for x in config},{'scrum-resume','scrum-rules','scrum-usage'})
+            self.assertTrue(all(Path(x['path']).name=='SKILL.md' for x in config))
             self.assertTrue(all(not x['enabled'] for x in config))
+
+    def test_project_skill_selection_retains_specialist_and_user_overrides(self):
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp:
+            home=Path(temp)
+            project=home/'project'
+            for root,names in ((home/'.codex/skills',('scrum-work','user-choice','unrelated')),
+                               (project/'.agents/skills',('specialist','other-project-skill'))):
+                for name in names:
+                    manifest=root/name/'SKILL.md'
+                    manifest.parent.mkdir(parents=True)
+                    manifest.write_text('fixture')
+            (home/'.codex/config.toml').write_text('[[skills.config]]\nname="user-choice"\nenabled=true\n')
+            selected=project/'.scrum/local/codex-skills.json'
+            selected.parent.mkdir(parents=True)
+            selected.write_text('["specialist"]')
+            with patch.dict(os.environ,{'CODEX_HOME':str(home/'.codex')}),patch.object(agent_bridge.Path,'home',return_value=home):
+                config=tomllib.loads(agent_bridge.skill_options(project)[1])['skills']['config']
+            self.assertEqual(config[0],{'name':'user-choice','enabled':True})
+            self.assertEqual({Path(item['path']).parent.name for item in config[1:]},{'unrelated','other-project-skill'})
+            self.assertTrue(all(not item['enabled'] for item in config[1:]))
 
     def test_native_transport_retry_is_bounded_and_excludes_policy_failures(self):
         for n,expected in enumerate((2,5,None)):

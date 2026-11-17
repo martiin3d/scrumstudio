@@ -6,4 +6,6 @@
 - A fresh native Light claim with planned files and acceptance criteria can start directly from the supplied scope and finish command. Project rules and the native checks for evidence, reservations and Stop still apply. Resume, batch and Git recovery keep the full startup instructions. Startup measurements record the renderer used.
 - Resume from task continuity and the saved file plan. Check the current branch, changed paths and any stale-continuity marker before reusing evidence. Fetch linked decisions, attachments and diagnostics when relevant to the task. Record the next unfinished action on the same task.
 
+For a smaller Codex worker catalog on this checkout, put a JSON array of skill directory names in `.scrum/local/codex-skills.json`, for example `["codebase-memory"]`. Add the specialists this project needs. The filter keeps `scrum-work` and preserves explicit Codex skill rules. It covers the immediate skill directories in Codex home, the user's `.agents/skills`, and the project. A skill omitted from the catalog can still be read from its known path.
+
 For changes to this flow, run the relevant CLI, bridge, workflow or context tests listed by `python scripts/verify.py --files PATH`.
