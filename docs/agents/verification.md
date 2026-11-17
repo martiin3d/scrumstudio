@@ -22,8 +22,6 @@ Run the usage audit on demand:
 
 ## Worker behavior evaluation
 
-Use `python scripts/eval_worker.py --interaction-log LOG --offset BYTES` to audit one managed Codex run from its local log. For each provider sample, the report shows input and uncached tokens alongside tools completed since the previous sample. Read, edit and verification tags describe commands observed in that interval. An exact repeat of a failed command is flagged separately. Tool output is measured in bytes. Tool text and commands are omitted from the new observations. The most recent interval can include tools without a following sample. Logs that only contain terminal totals, including current Claude summaries, cannot assign usage to intervals.
-
 Run `python scripts/eval_worker.py --cases` for the new claim, resume and Git recovery scenarios. Use a disposable copy of the same starting fixture for each trial. Run the baseline and candidate with the same model, client and tool configuration, changing only the rules under evaluation. Use the normal Scrum supervisor and quota policy for model runs.
 
 Save each variant as a JSON array. Each trial records `case`, `replicate` (a positive integer), `client`, `model`, `fixture_sha256`, `checks`, `calls` and optional `usage`. Record a boolean for each published check from observed files, verification receipts and task state. Provide the complete tool call list using normalized labels. Use the published redundant labels only when the trace shows the exact condition, for example `show_same_scope` for refetching a scope already supplied in the claim. Copy native provider counters into `usage` when available.

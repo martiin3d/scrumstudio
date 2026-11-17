@@ -103,7 +103,6 @@ for line in sys.stdin:
  elif i==7:
   assert x['result']=={'decision':'accept'}
   emit({'method':'item/completed','params':{'threadId':'fixture','item':{'type':'agentMessage','text':'Verified fixture'}}})
-  emit({'method':'item/completed','params':{'threadId':'fixture','item':{'type':'commandExecution','command':'Get-Content private.txt','aggregatedOutput':'PRIVATE_BODY','exitCode':0}}})
   emit({'method':'thread/tokenUsage/updated','params':{'threadId':'fixture','tokenUsage':{'total':{'inputTokens':3,'outputTokens':2}}}})
   emit({'method':'turn/completed','params':{'threadId':'fixture','turn':{'status':'completed'}}})
   break
@@ -114,10 +113,6 @@ for line in sys.stdin:
             with contextlib.redirect_stdout(output):result=client.run([sys.executable,str(server)],1,9,folder,'fixture prompt',rpc=rpc,full_access=True)
             events=[json.loads(line) for line in output.getvalue().splitlines()]
             self.assertNotIn('Child done',output.getvalue())
-            self.assertNotIn('PRIVATE_BODY',output.getvalue())
-            self.assertNotIn('private.txt',output.getvalue())
             self.assertEqual(result,0)
             self.assertEqual(events[-1]['usage']['input_tokens'],3)
-            self.assertEqual(events[-2]['total']['input_tokens'],3)
-            self.assertEqual(events[-3]['tool']['tags'],['read'])
-            self.assertEqual(events[-4]['item']['text'],'Verified fixture')
+            self.assertEqual(events[-2]['item']['text'],'Verified fixture')
