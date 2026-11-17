@@ -430,13 +430,18 @@ function renderLearning(list){
 function renderWiki(){
   const wiki=state.wiki;
   const pages=['docs/agents/index.md',...wiki.pages];
+  const showingSkills=wiki.page==='project-skills';
+  const skillContent=showingSkills?'<h2>Project skills</h2>'+((wiki.skills??[]).length?
+    '<ul>'+wiki.skills.map(item=>`<li><button type="button" class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.name)}</button><p>${esc(item.description)}</p></li>`).join('')+'</ul>':
+    '<p>No project skills found.</p>'):'';
   $('#content').innerHTML=`<section class="wiki-layout"><div class="workflow wiki-nav"><h2>Pages</h2>
     ${pages.map(path=>`<button data-wiki-page="${esc(path)}" aria-current="${path===wiki.page?'page':'false'}">${esc(path.split('/').at(-1).replace(/\.md$/,'').replace(/-/g,' '))}</button>`).join('')}
+    <button data-wiki-page="project-skills" aria-current="${showingSkills?'page':'false'}">Skills</button>
     <button id="wiki-check">Check links</button><button id="wiki-reassess">Check sources</button><button id="wiki-spec-impact">Specification impact</button><p id="wiki-result" role="status"></p></div>
-    <article class="workflow wiki-body">${wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}
+    <article class="workflow wiki-body">${showingSkills?skillContent:wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}
     ${wiki.onboarding!=='applied'?'<button id="wiki-onboarding">Project setup</button>':''}
     <div id="wiki-onboard-content"></div><div id="wiki-source-content"></div><div id="wiki-spec-impact-content"></div>
-    ${wiki.page!=='docs/agents/index.md'?`<h3>Linked sources</h3>
+    ${wiki.page!=='docs/agents/index.md'&&!showingSkills?`<h3>Linked sources</h3>
     ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}
       ${actor?`<button data-source-summary="${esc(item.path)}">${item.summary?'Review summary':'Draft summary'}</button>`:''}</p>`).join('')}
     <button id="wiki-ingest">Link a source</button>`:''}</article></section>
@@ -448,7 +453,7 @@ function renderWiki(){
       const current=project;
       const content=$('#wiki-spec-impact-content');
       const report=await api('project_knowledge',{project:current,action:'specification_impact',after,
-        ...(wiki.page==='docs/agents/index.md'?{}:{page:wiki.page})});
+        ...(wiki.page==='docs/agents/index.md'||showingSkills?{}:{page:wiki.page})});
       if(current!==project||!content.isConnected)return;
       content.querySelector('#wiki-impact-more')?.remove();
       const groups=report.groups.map(group=>`<article><h4>${esc(group.page)}${group.section?' #'+esc(group.section):''} · ${esc(group.state)}</h4>

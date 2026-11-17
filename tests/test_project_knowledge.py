@@ -17,6 +17,28 @@ class ProjectKnowledgeTest(unittest.TestCase):
     def knowledge(self, project, action, **args):
         return run('project_knowledge',dict(project=project,actor=self.human,action=action,**args))
 
+    def test_wiki_lists_project_skills_and_opens_their_original_manifests(self):
+        project,root=self.project()
+        index=root/'docs/agents/index.md'
+        index.parent.mkdir(parents=True)
+        index.write_text('# Handwritten index\n\nKeep this content.\n',encoding='utf-8')
+        self.assertEqual(self.knowledge(project,'view',page='project-skills')['skills'],[])
+        path='.agents/skills/mesh-review/SKILL.md'
+        skill=root/path
+        skill.parent.mkdir(parents=True)
+        manifest='---\nname: mesh-review\ndescription: Inspect topology and report malformed faces.\n---\n# Review steps\n'
+        skill.write_text(manifest,encoding='utf-8')
+        unlinked=root/'private/SKILL.md'
+        unlinked.parent.mkdir()
+        unlinked.write_text(manifest,encoding='utf-8')
+        view=self.knowledge(project,'view',page='project-skills')
+        self.assertEqual(view['skills'],[{'name':'mesh-review',
+            'description':'Inspect topology and report malformed faces.','path':path}])
+        self.assertEqual(self.knowledge(project,'source',source=path)['body'],manifest)
+        with self.assertRaises(ValueError):
+            self.knowledge(project,'source',source='private/SKILL.md')
+        self.assertEqual(self.knowledge(project,'view')['body'],index.read_text(encoding='utf-8'))
+
     def test_readiness_suggests_only_relevant_installed_skills_for_the_worker(self):
         project,root=self.project()
         home=root/'isolated-home'

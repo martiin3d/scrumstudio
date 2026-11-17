@@ -34,6 +34,8 @@ CAPABILITY_GUIDANCE = {
 STATE = Path('.scrum/local/knowledge-onboarding.json')
 MANIFEST = WIKI/'sources.json'
 MAX_FILE = 128 * 1024
+SKILLS_PAGE = 'project-skills'
+PROJECT_SKILL_ROOTS = ('skills','.agents/skills','.claude/skills','.codex/skills')
 SPEC_LINE = re.compile(r'^Specification: (docs/agents/[^#\n]+\.md)(?:#([^@\n]+))? @ ([a-f0-9]{64})$',re.M)
 
 
@@ -53,6 +55,28 @@ def safe_file(root, name):
         return path
     except OSError:
         return None
+
+
+def project_skill_manifest(root, name):
+    file=PurePosixPath(name)
+    if file.name!='SKILL.md' or file.parent.parent.as_posix() not in PROJECT_SKILL_ROOTS:
+        return None
+    path=safe_file(root,name)
+    if path is None:
+        return None
+    from scripts.skill_lookup import metadata
+    return metadata(path)
+
+
+def project_skills(root):
+    items=[]
+    for directory in PROJECT_SKILL_ROOTS:
+        for path in sorted((root/directory).glob('*/SKILL.md')):
+            relative=path.relative_to(root).as_posix()
+            item=project_skill_manifest(root,relative)
+            if item:
+                items.append({'name':item['name'],'description':item['description'][:300],'path':relative})
+    return sorted(items,key=lambda item:(item['name'].casefold(),item['path']))
 
 
 def digest(value):
@@ -726,10 +750,14 @@ def operation(db, row, prefix, args):
     if action=='view':
         pages=topic_links(root,{})
         name=args.get('page',INDEX.as_posix())
-        relative=INDEX if name==INDEX.as_posix() else wiki_path(name)
-        path=safe_file(root,relative.as_posix())
+        if name==SKILLS_PAGE:
+            content={'body':None,'skills':project_skills(root)}
+        else:
+            relative=INDEX if name==INDEX.as_posix() else wiki_path(name)
+            path=safe_file(root,relative.as_posix())
+            content={'body':path.read_text(encoding='utf-8-sig') if path else None}
         saved=load_state(root)
-        return {'pages':pages,'page':name,'body':path.read_text(encoding='utf-8-sig') if path else None,
+        return {'pages':pages,'page':name,**content,
                 'onboarding':saved.get('phase') or ('applied' if source_manifest(root).get('onboarding') else None),
                 'sources':source_manifest(root).get('references',[]),
                 'proposals':pending_proposals(db,project,prefix,root,saved),
@@ -755,7 +783,7 @@ def operation(db, row, prefix, args):
         if not isinstance(name,str):raise ValueError('Supply a project source path')
         sources=source_manifest(root)
         allowed=set(SOURCES)|{source['path'] for source in sources.get('references',[])+sources.get('inventory',{}).get('sources',[])}
-        path=safe_file(root,name) if name in allowed else None
+        path=safe_file(root,name) if name in allowed or project_skill_manifest(root,name) else None
         if not path:raise ValueError('Source is unavailable or has not been linked to the wiki')
         return {'path':name,'body':path.read_text(encoding='utf-8-sig')}
     if action=='reassess':return reassess(root,source_manifest(root))
