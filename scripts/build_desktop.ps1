@@ -1,15 +1,14 @@
 # Build the Windows GUI launcher from the checkout. Output stays in ignored data/.
+param([string]$OutputDirectory)
+
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$output = Join-Path $root 'data\desktop'
+$output = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $root 'data\desktop' }
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $compiler)) {
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 }
 if (-not (Test-Path -LiteralPath $compiler)) { throw '.NET Framework 4 is required to build the Windows launcher.' }
-if (-not (Test-Path -LiteralPath (Join-Path $root 'data\desktop-venv\Scripts\pythonw.exe'))) {
-    throw 'Create the desktop environment first. See Desktop setup in README.md.'
-}
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 
 Add-Type -AssemblyName System.Drawing

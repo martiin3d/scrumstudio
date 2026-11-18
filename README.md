@@ -12,6 +12,10 @@ Double-click **start.bat**, or run `python server.py`. Open http://127.0.0.1:876
 
 ## Desktop preview for Windows
 
+To use a packaged build, download the Windows x64 ZIP from [GitHub Releases](https://github.com/martiin3d/scrumstudio/releases), extract the whole folder and open **Scrum Studio.exe**. Python is included. Microsoft Edge WebView2 Runtime is required. The portable copy keeps its registry and profile under `app/data`. Back it up before upgrading and copy it into the new version with both apps closed. Project data stays in each project's `.scrum` folder. Workers still require their own installed and authorized CLI, and Git delivery requires Git.
+
+Build the portable ZIP and SHA-256 checksum from a Windows x64 Git checkout with Python 3.11+, pip and PowerShell using `python scripts/package_desktop.py 0.1.0`. Output goes to `data/releases`. This build bundles a checked Python download and pinned dependencies.
+
 Scrum Studio Desktop opens from a Windows executable with no console window. Pick a project in the sidebar and navigate between Board, Wiki, Notes and Chat in the workspace. The board stays available beside the open task. The desktop app shares the project registry and task data with the website and CLI. Browsing, searching and editing use the local server and consume no AI tokens. Starting an AI worker uses its configured provider account as usual.
 
 Install Python 3.10+ and the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) if needed. From the checkout, run the one-time setup in PowerShell:

@@ -12,11 +12,16 @@ internal static class ScrumStudioLauncher
         try
         {
             var output = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
-            string root = output.Parent.Parent.FullName;
-            string python = Path.Combine(root, @"data\desktop-venv\Scripts\pythonw.exe");
+            string root = Path.Combine(output.FullName, "app");
+            string python = Path.Combine(output.FullName, @"runtime\pythonw.exe");
+            if (!File.Exists(python) && !Directory.Exists(root) && output.Parent != null && output.Parent.Parent != null)
+            {
+                root = output.Parent.Parent.FullName;
+                python = Path.Combine(root, @"data\desktop-venv\Scripts\pythonw.exe");
+            }
             string app = Path.Combine(root, "desktop.py");
             if (!File.Exists(python) || !File.Exists(app))
-                throw new InvalidOperationException("Build the app from your Scrum Studio checkout and launch it from data\\desktop. See the Desktop setup in README.md.");
+                throw new InvalidOperationException("Extract the whole Scrum Studio ZIP before opening the executable. For a source checkout, see Desktop setup in README.md.");
 
             using (Process.Start(new ProcessStartInfo(python, "\"" + app + "\"")
             {

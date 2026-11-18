@@ -40,6 +40,8 @@ def main():
 
     profile = Path(os.environ.get('SCRUM_DESKTOP_PROFILE', DATA / 'desktop-profile'))
     icon = DATA / 'desktop' / 'Scrum Studio.ico'
+    if not icon.is_file():
+        icon = Path(sys.executable).resolve().parent.parent / 'Scrum Studio.ico'
     options = {'icon': str(icon)} if icon.is_file() else {}
     try:
         with desktop_backend(args.port) as url:
