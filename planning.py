@@ -10,17 +10,17 @@ class PlanRejected(ValueError):
     """A planning transaction was explicitly rolled back, safe to correct."""
 
 
-def apply(db,a,project):
-    try:return _apply(db,a,project)
+def apply(db,a,project,*,begin=True):
+    try:return _apply(db,a,project,begin=begin)
     except ValueError as error:
         db.rollback()
         raise PlanRejected(str(error)) from error
 
 
-def _apply(db,a,project):
+def _apply(db,a,project,*,begin):
     from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix,duplicate_task,validate_required_skills
     actor=actor_user(db,a)
-    db.execute('BEGIN IMMEDIATE')
+    if begin:db.execute('BEGIN IMMEDIATE')
     runtime.gate(db,project,actor['id'])
     deferred=None
     if 'defer_task' in a:

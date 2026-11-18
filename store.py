@@ -402,6 +402,12 @@ def run(action, a):
         if candidate:result['git_recovery_id']=candidate['id']
     import idle_signals
     idle_signals.notify(action,a)
+    if action=='feature_planning' and result.pop('_launch',False):
+        import feature_planning
+        try:feature_planning.launch(a['project'],result)
+        except OSError:
+            return _run(action,{'project':a['project'],'id':result['id'],'attempt':result['attempt'],
+                               'action':'finish','capability':feature_planning.PRIVATE,'error':'Could not start the local planner. Check that the application can launch Python, then retry.'})
     if action=='task_review' and a.get('decision')=='request_changes' and isinstance(result,dict):
         import managed_agents
         result['review_resume']=managed_agents.resume_review(a,run)
@@ -581,6 +587,9 @@ def legacy_run(action, a, path=None, locks=None):
         if action == 'agent_interaction':
             import agent_interactions
             return agent_interactions.operation(db,a,actor_user,now,activity)
+        if action=='feature_planning':
+            import feature_planning
+            return feature_planning.operation(db,project,a)
         if action == 'project_chat':
             if 'text' in a:
                 author = actor_user(db, a)

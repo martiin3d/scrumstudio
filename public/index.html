@@ -7,7 +7,10 @@
     <button type="button" id="project-stop" class="danger"><span aria-hidden="true">■</span> Stop</button>
     <button type="button" id="control-agents">Manage agents</button>
   </section>
-  <button type="button" id="add" class="primary">＋ Create task</button>
+  <div class="task-actions">
+    <button type="button" id="feature-request-shortcut" hidden>Request a feature</button>
+    <button type="button" id="add" class="primary">＋ Create task</button>
+  </div>
 </div>
 <div id="agent-feedback" class="agent-feedback" hidden><span id="agent-counts"></span><span id="control-status" role="status" aria-live="polite"></span><span id="control-next-step"></span></div>
 </section><section class="toolbar"><div class="view-label">▦ <b id="view-label">Kanban board</b></div><div id="board-views" class="view-switch" role="group" aria-label="Task view"><button type="button" data-board-view="board" aria-pressed="true">Board</button><button type="button" data-board-view="list" aria-pressed="false">Task list</button></div><div id="list-options" hidden><label>Group by <select id="task-group" aria-label="Group tasks by"><option value="none">None</option><option value="status">Status</option><option value="priority">Priority</option><option value="owner">Owner</option><option value="context">Context group</option><option value="batch">Agent batch</option><option value="category">Category</option></select></label><label>Sort by <select id="task-sort" aria-label="Sort tasks by"><option value="updated">Updated</option><option value="code">Code</option><option value="title">Title</option><option value="status">Status</option><option value="priority">Priority</option><option value="owner">Owner</option><option value="context">Context group</option><option value="batch">Agent batch</option><option value="model">Model</option></select></label><button type="button" id="task-sort-direction" aria-label="Toggle task sort direction">↓ Descending</button></div><select id="category-filter" aria-label="Filter category"><option value="">All categories</option></select><input id="search" placeholder="Search tasks…" aria-label="Search tasks"><span id="task-count"></span></section><div id="content"></div><div id="error" role="alert"></div></main>

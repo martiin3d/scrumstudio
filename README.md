@@ -26,6 +26,12 @@ Double-click **data\desktop\Scrum Studio.exe**. Keep the executable in its build
 
 The web and desktop views use the same light and dark palettes. **Metrics** shows locally reported token usage for the selected interval, including input, cache reads, output and coverage by provider. Executions with unavailable counters remain visible in the coverage count. Calendar flow metrics and the optional local audit remain available below the token summary.
 
+### Guided project setup and feature planning
+
+**New project** opens a local, resumable setup conversation in the wiki. For an existing codebase it shows the files Scrum recognized. For an empty folder it starts with the goal. It saves each answer, previews the wiki and the first task, and applies both only on confirmation. Setup runs without a model.
+
+Choose **Request a feature** beside **Create task** on the board, or open **Chat → Request a feature**, and describe the outcome. **Ask planner** starts one local, read-only Codex planning run with the configured Codex account and consumes provider tokens. It respects project Stop, usage limits and parallel capacity. Answer any clarification in the same view. When the proposal is ready, **Create tasks on board** applies it through the normal task planner, including duplicate and dependency validation. Applying does not send Wakeup or launch an implementation worker.
+
 ## MCP connection
 
 Task codes use the first three letters of the project name in uppercase and a project-local sequence starting at 1 (for example, Website: `WEB-1`, `WEB-2`). Spaces and punctuation are ignored; accents are normalized. Short names use their available letters; names without letters use `PRJ`. Existing tasks are numbered automatically in creation order per project. Codes appear on cards, in search, and in MCP results. The local numeric internal `id` remains the input for task updates and dependencies. Projects with the same first three letters share a prefix, so always include the project when referring to a code.

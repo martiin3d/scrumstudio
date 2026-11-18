@@ -118,6 +118,8 @@ def check_capacity(db, project, actor, task):
 
 def parallel_available(db,project,actor):
     actors={r[0] for r in db.execute("SELECT DISTINCT t.owner_id FROM tasks t JOIN users u ON u.id=t.owner_id WHERE t.project=? AND u.kind='agent' AND t.status='In Progress' AND t.lock_until>?",(project,time.time()))}
+    import feature_planning
+    actors.update(feature_planning.active_actors(db,project))
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone():
         actors.update(r[0] for r in db.execute('SELECT o.actor FROM worker_launch_offers o JOIN users u ON u.id=o.actor WHERE o.project=? AND o.expires>? AND u.active=1',(project,time.time())))
     limit=db.execute('SELECT max_parallel_agents FROM projects WHERE id=?',(project,)).fetchone()[0]

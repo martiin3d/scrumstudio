@@ -40,6 +40,8 @@ const desktopMode = new URLSearchParams(location.search).get('desktop') === '1';
 let taskOpenSerial = 0, editorCleanup, inspectorDirty = false;
 let chatView;
 const chatDrafts = new Map();
+const setupOpen = new Set();
+const chatModes = new Map();
 document.documentElement.classList.toggle('desktop-mode', desktopMode);
 if(desktopMode){
   $('.brand').href='/?desktop=1';
@@ -167,6 +169,7 @@ function render(){
   const view=taskView();
   $('#view-label').textContent=page==='Board'?(view.mode==='list'?'Task list':'Kanban board'):page==='AI workflow'?'Agent workspace':page==='Projects'?'Project directory':page==='Agents'?'Agent activity':page==='Notes'?'Project notes':`${page} notes`;
   $('#board-views').hidden=page!=='Board';$('#list-options').hidden=page!=='Board'||view.mode!=='list';
+  $('#feature-request-shortcut').hidden=!project||page!=='Board';
   $('main > .toolbar').hidden=['Chat','Wiki'].includes(page);
   document.querySelectorAll('[data-board-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.boardView===view.mode)));
   $('#task-group').value=view.group;$('#task-sort').value=view.sort;
@@ -461,8 +464,7 @@ function openProject(){
   modal('Add project',field('Project folder (absolute path)','path','','required')+
     field('Project name','name','','required'),async form=>{
     const result=await api('project_create',{path:form.get('path'),name:form.get('name')});
-    project=result.id;page='Wiki';await loadProjects();
-    if(actor)await loadOnboarding(true);
+    project=result.id;setupOpen.add(project);page='Wiki';await loadProjects();
   },'Add project');
 }
 
@@ -715,33 +717,69 @@ function renderWiki(){
     const {issues}=await api('project_knowledge',{project,action:'diagnose'});
     $('#wiki-result').textContent=issues.length?issues.map(i=>i.path+':'+i.line+' '+i.kind+' '+i.target).join('\n'):'Wiki checks passed.';
   }catch(e){error(e);}};
-  const setup=$('#wiki-onboarding');if(setup)setup.onclick=()=>loadOnboarding(true).catch(error);
+  const setup=$('#wiki-onboarding');
+  if(setup)setup.onclick=()=>{setupOpen.add(project);loadOnboarding(true).catch(error);};
+  if(setupOpen.has(project)||['draft','applying'].includes(wiki.onboarding))loadOnboarding(true).catch(error);
 }
 
+function chooseHumanProfile(){
+  if(users.some(user=>user.kind==='human'&&user.active!==0))$('#current-user').focus();
+  else $('#new-user').click();
+}
+
+const guidedMessage=(name,text,own=false)=>`<article class="chat-message${own?' is-own':''}"><div class="chat-message-meta"><strong>${esc(name)}</strong></div><p>${esc(text)}</p></article>`;
+
 async function loadOnboarding(prepare=false){
-  const selected=project;
-  let data=await api('project_knowledge',{project,action:'status'});
-  if(!data.phase&&prepare){
-    if(!actor)throw Error('Choose a human user to prepare onboarding.');
-    data=await api('project_knowledge',{project,actor,action:'prepare'});
+  const selected=project, target=$('#wiki-onboard-content');
+  const live=()=>target?.isConnected&&selected===project&&page==='Wiki';
+  if(!live())return;
+  let data=await api('project_knowledge',{project:selected,action:'status'});
+  if(!live())return;
+  if(data.phase==='applied'){setupOpen.delete(selected);return;}
+  if(!actor){
+    target.innerHTML='<section class="guided-chat"><h2>Project setup</h2><button type="button">Choose a human profile to continue</button></section>';
+    target.querySelector('button').onclick=chooseHumanProfile;
+    return;
   }
-  if(project!==selected||page!=='Wiki'||!data.plan)return;
-  const {plan}=data;
-  $('#wiki-onboard-content').innerHTML=`<section class="wiki-onboard"><h2>Project setup</h2><p>${plan.inventory.kind==='empty'?'Empty folder':'Existing project'} · ${plan.inventory.sources.length} observed sources</p>
-    <details open><summary>Wiki preview</summary>${Object.entries(plan.pages).map(([path,body])=>`<details><summary>${esc(path)} · ${plan.existing[path]?'existing page retained':'new page'}</summary><pre>${esc(body)}</pre></details>`).join('')}</details>
-    <form id="wiki-onboard-answers">${Object.entries(data.questions).map(([key,label])=>`<label class="field">${esc(label)}<textarea name="${esc(key)}" maxlength="${key==='acceptance'?500:1000}" ${data.phase==='applying'?'readonly':''}>${esc(plan.answers[key]||'')}</textarea></label>`).join('')}
-    ${data.phase==='applying'?'':'<button type="submit">Save answers and preview</button>'} <button type="button" class="primary" id="wiki-apply" ${plan.ready?'':'disabled'}>${data.phase==='applying'?'Resume application':'Apply plan'}</button></form><p id="wiki-setup-result" role="status"></p></section>`;
-  const form=$('#wiki-onboard-answers');
-  form.oninput=()=>{$('#wiki-apply').disabled=true;};
-  form.onsubmit=async e=>{e.preventDefault();try{
-    await api('project_knowledge',{project,actor,action:'prepare',answers:Object.fromEntries(new FormData(form))});
-    await loadOnboarding();
-  }catch(err){$('#wiki-setup-result').textContent=err.message;}};
-  $('#wiki-apply').onclick=async e=>{e.target.disabled=true;try{
-    const accepted=await api('project_knowledge',{project,actor,action:'apply',plan_id:plan.plan_id});
-    await refresh();
-    $('#wiki-result').textContent=accepted.tasks.map(item=>item.code).join(', ')+' · First milestone saved';
-  }catch(err){$('#wiki-setup-result').textContent=err.message;e.target.disabled=false;}};
+  if(!data.phase&&prepare)data=await api('project_knowledge',{project:selected,actor,action:'prepare'});
+  if(live()&&data.plan)show(data);
+
+  function show(current, editKey){
+    if(!live())return;
+    const {plan}=current, questions=Object.entries(current.questions);
+    const key=editKey??questions.find(([name])=>!Object.hasOwn(plan.answers,name)||(!plan.answers[name]&&name!=='constraints'))?.[0];
+    const reviewing=current.phase==='applying'||!key;
+    const sources=plan.inventory.sources;
+    target.innerHTML=`<section class="guided-chat" aria-label="Project setup"><h2>Project setup</h2>
+      <p>${plan.inventory.kind==='empty'?'Empty folder':'Existing project'} · ${sources.length} sources found</p>
+      ${sources.length?`<details><summary>Scan results</summary><ul>${sources.map(source=>`<li><code>${esc(source.path)}</code> · ${esc(source.label)}</li>`).join('')}</ul></details>`:''}
+      <div class="guided-messages">${questions.filter(([name])=>Object.hasOwn(plan.answers,name)&&name!==key).map(([name,label])=>`${guidedMessage('Scrum Studio',label)}${guidedMessage('You',plan.answers[name]||'No additional constraints',true)}`).join('')}
+      ${!reviewing?guidedMessage('Scrum Studio',current.questions[key]):''}</div>
+      ${reviewing?`<h3>Review before applying</h3><p><strong>First task</strong> ${esc(plan.answers.milestone)}</p><p><strong>Acceptance</strong> ${esc(plan.answers.acceptance)}</p>
+        <details open><summary>Wiki preview</summary>${Object.entries(plan.pages).map(([path,body])=>`<details><summary>${esc(path)} · ${plan.updates.includes(path)?'add links':plan.existing[path]?'retain':'create'}</summary><pre>${esc(body)}</pre></details>`).join('')}</details>
+        ${current.phase!=='applying'?'<button type="button" id="wiki-answer-back">Edit answers</button>':''} <button type="button" class="primary" id="wiki-apply" ${plan.ready?'':'disabled'}>${current.phase==='applying'?'Resume application':'Create wiki and first task'}</button>`:
+        `<form id="wiki-onboard-answers"><label class="sr" for="wiki-answer">Answer</label><textarea id="wiki-answer" name="answer" rows="3" maxlength="${key==='acceptance'?500:1000}" ${key==='constraints'?'':'required'} placeholder="Write your answer…">${esc(plan.answers[key]||'')}</textarea>
+        <div class="guided-actions"><button type="button" id="wiki-answer-back" ${key===questions[0][0]?'hidden':''}>Back</button><button type="submit" class="primary">${key==='constraints'?'Review plan':'Continue'}</button></div></form>`}
+      <p id="wiki-setup-result" role="status"></p></section>`;
+    const feedback=target.querySelector('#wiki-setup-result');
+    const back=target.querySelector('#wiki-answer-back');
+    if(back)back.onclick=()=>show(current,reviewing?questions[0][0]:questions[questions.findIndex(([name])=>name===key)-1]?.[0]);
+    const form=target.querySelector('form');
+    if(form)form.onsubmit=async e=>{e.preventDefault();e.submitter.disabled=true;
+      try{
+        const next=await api('project_knowledge',{project:selected,actor,action:'prepare',answers:{...plan.answers,[key]:form.elements.answer.value}});
+        show(next,editKey?questions[questions.findIndex(([name])=>name===key)+1]?.[0]:undefined);
+      }catch(err){feedback.textContent=err.message;e.submitter.disabled=false;}
+    };
+    const apply=target.querySelector('#wiki-apply');
+    if(apply)apply.onclick=async()=>{apply.disabled=true;try{
+      const accepted=await api('project_knowledge',{project:selected,actor,action:'apply',plan_id:plan.plan_id});
+      setupOpen.delete(selected);
+      if(!live())return;
+      await refresh();
+      if(project===selected&&page==='Wiki')$('#wiki-onboard-content').textContent=`Wiki saved. First task ${accepted.tasks.map(item=>item.code).join(', ')} is on the board.`;
+    }catch(err){feedback.textContent=err.message;apply.disabled=false;}};
+  }
 }
 
 function readChecklist(){
@@ -969,7 +1007,7 @@ function openNote(){
   });
 }
 $('#new-user').onclick=()=>modal('Create human user',field('Name','name','','required'),async f=>{const r=await api('user_register',{identity:'human:'+crypto.randomUUID(),name:f.get('name'),kind:'human'});actor=r.id;localStorage.setItem('scrum-user',actor);await loadUsers();if(page==='Chat')await refresh();else render();});
-$('#current-user').onchange=()=>{actor=Number($('#current-user').value)||null;localStorage.setItem('scrum-user',actor||'');chatView?.updateComposer();};
+$('#current-user').onchange=()=>{actor=Number($('#current-user').value)||null;localStorage.setItem('scrum-user',actor||'');chatView?.updateComposer();if(page==='Wiki'&&setupOpen.has(project))loadOnboarding(true).catch(error);};
 $('#new-project').onclick=openProject;
 function selectProject(id){
   if(id===project)return;
@@ -988,6 +1026,16 @@ function applyTheme(theme){document.documentElement.dataset.theme=theme;$('#them
 applyTheme(localStorage.getItem('scrum-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));
 $('#theme-toggle').onclick=()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';localStorage.setItem('scrum-theme',theme);applyTheme(theme);};
 $('#add').onclick=()=>page==='Board'?openTask():page==='File locks'?openFileReservation():openNote();
+$('#feature-request-shortcut').onclick=async()=>{
+  const selected=project;
+  if(!selected||!leaveInspector())return;
+  chatModes.set(selected,'planner');
+  page='Chat';
+  try{
+    await refresh();
+    if(project===selected&&page==='Chat')$('#feature-request')?.focus();
+  }catch(e){error(e);}
+};
 $('#close').onclick=$('#cancel').onclick=()=>{if(leaveInspector() && editor.open)editor.close();};
 editor.addEventListener('input',()=>{if(editor.matches('.desktop-inspector[open]'))inspectorDirty=true;});
 editor.addEventListener('close',()=>{
@@ -1020,7 +1068,7 @@ loadProjects().catch(error);
 function renderChat(){
   const {chat:data,tasks}=state, selected=project;
   const people=new Map(users.map(u=>[u.id,u.name])), codes=new Map(tasks.map(t=>[t.id,t.code]));
-  $('#content').innerHTML=`<div class="project-chat">
+  $('#content').innerHTML=`<div class="view-switch chat-modes" role="group" aria-label="Chat view"><button type="button" data-chat-mode="messages">Messages</button><button type="button" data-chat-mode="planner">Request a feature</button></div><div class="project-chat">
     <section class="chat-thread" aria-labelledby="chat-thread-title">
       <div class="chat-thread-heading"><h2 id="chat-thread-title">Project messages</h2><button type="button" id="chat-refresh">Refresh</button></div>
       <div class="chat-history" tabindex="0" aria-label="Message history">
@@ -1047,11 +1095,12 @@ function renderChat(){
       <h2 id="chat-requests-title">Agent requests <span id="chat-request-count" hidden></span></h2>
       <div id="chat-interactions" aria-live="polite"></div>
     </section>
-  </div>`;
+  </div><section id="feature-planning" class="guided-chat" hidden></section>`;
   const root=$('.project-chat'), history=root.querySelector('.chat-history'), messages=$('#chat-messages');
   const form=$('#chat-form'), chooseUser=$('#chat-choose-user'), send=form.querySelector('[type=submit]');
   const olderButton=$('#chat-older'), refreshButton=$('#chat-refresh'), empty=$('#chat-empty'), feedback=$('#chat-error');
   const live=()=>root.isConnected&&page==='Chat'&&project===selected;
+  const plannerRoot=$('#feature-planning'), planner=mountFeaturePlanner(plannerRoot,selected);
   const showError=e=>{if(live())feedback.textContent=e.message;};
   const scrollToEnd=()=>{history.scrollTop=history.scrollHeight;};
   const draft=chatDrafts.get(selected)||{};
@@ -1102,14 +1151,25 @@ function renderChat(){
     return pending[direction];
   }
   async function refreshChat(){
-    if(live())await Promise.all([read(),refreshInteractions()]).catch(showError);
+    if(!live())return;
+    if(!plannerRoot.hidden)await planner.refresh();
+    else await Promise.all([read(),refreshInteractions()]).catch(showError);
   }
 
-  chatView={refresh:refreshChat,updateComposer:()=>{if(live())updateComposer();}};
+  function showMode(mode){
+    chatModes.set(selected,mode);
+    root.hidden=mode==='planner';
+    plannerRoot.hidden=mode!=='planner';
+    document.querySelectorAll('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===mode)));
+    if(mode==='planner')planner.refresh();
+    else {scrollToEnd();refreshChat();}
+  }
+  document.querySelectorAll('[data-chat-mode]').forEach(button=>button.onclick=()=>showMode(button.dataset.chatMode));
+  chatView={refresh:refreshChat,updateComposer:()=>{if(live()){updateComposer();planner.updateIdentity();}}};
   olderButton.onclick=()=>read(true).catch(showError);
   refreshButton.onclick=()=>{feedback.textContent='';refreshChat();};
   form.oninput=saveDraft;
-  chooseUser.onclick=()=>{if(users.some(u=>u.kind==='human'&&u.active!==0))$('#current-user').focus();else $('#new-user').click();};
+  chooseUser.onclick=chooseHumanProfile;
   form.onsubmit=async e=>{
     e.preventDefault();
     const {text,recipient,task}=Object.fromEntries(new FormData(form));
@@ -1129,10 +1189,88 @@ function renderChat(){
     finally{sending=false;if(live())updateComposer();}
   };
   updateComposer();
-  scrollToEnd();
+  showMode(chatModes.get(selected)||'messages');
 }
 
-function openFolder(){modal('Open / import project',field('Folder containing .scrum (absolute path)','path','','required')+'<p>Imports snapshot.json only when no local project data exists. Opening an existing database preserves local work.</p>',async f=>{const r=await api('project_open',{path:f.get('path')});project=r.id;await loadProjects();});}
+function mountFeaturePlanner(root,selected){
+  const live=()=>root.isConnected&&project===selected&&page==='Chat';
+  root.innerHTML=`<h2>Request a feature</h2><form id="feature-request-form">
+    <label for="feature-request">What do you want to add or change?</label>
+    <textarea id="feature-request" name="text" rows="4" required maxlength="4000" placeholder="Describe the outcome, who needs it and any constraints…"></textarea>
+    <p>Asking starts the local Codex planner and uses model tokens. Review its draft before creating tasks.</p>
+    <div class="guided-actions"><button type="button" id="feature-profile" hidden>Choose a human profile</button><button type="submit" class="primary">Ask planner</button></div></form>
+    <p class="feature-feedback" role="status"></p><div class="feature-requests"></div>`;
+  const list=root.querySelector('.feature-requests'), form=root.querySelector('form'), feedback=root.querySelector('.feature-feedback');
+  const profile=root.querySelector('#feature-profile'), submit=form.querySelector('[type=submit]');
+  const updateIdentity=()=>{profile.hidden=!!actor;submit.disabled=!actor;};
+  profile.onclick=chooseHumanProfile;
+  let version='', loading, pendingId='', pendingText='';
+  const showError=err=>{if(live())feedback.textContent=err.message;};
+
+  function show(items){
+    const signature=JSON.stringify(items);
+    if(signature===version)return;
+    version=signature;
+    const drafts=new Map([...list.querySelectorAll('[data-feature-answer]')].map(input=>[input.dataset.featureAnswer,input.value]));
+    list.innerHTML=items.map(request=>{
+      const {id,state,result}=request;
+      const status=({queued:'Waiting for the planner',running:'Planning…',question:'Your answer is needed',ready:'Plan ready for review',failed:'Planner paused or failed',applied:'Tasks created'})[state];
+      return `<article class="feature-request" data-feature-id="${esc(id)}" data-attempt="${request.attempt}">
+        <h3>${status}</h3><div class="guided-messages">${guidedMessage('You',request.request,true)}${request.answer?guidedMessage('Clarifications',request.answer,true):''}${result.message?guidedMessage('Feature planner',result.message):''}${result.question?guidedMessage('Feature planner',result.question):''}</div>
+        ${state==='question'?`<form class="feature-clarify"><label>Answer<textarea data-feature-answer="${esc(id)}" name="text" required maxlength="1500">${esc(drafts.get(id)||'')}</textarea></label><button type="submit" class="primary">Send and continue</button></form>`:''}
+        ${state==='ready'?`<ol>${result.items.map(task=>`<li><strong>${esc(task.title)}</strong><p>${esc(task.description)}</p><ul>${task.acceptance_criteria.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>${task.files.length?`<p>Files · ${esc(task.files.join(', '))}</p>`:''}${task.dependencies.length?`<p>After · ${esc(task.dependencies.map(key=>result.items.find(item=>item.key===key)?.title||key).join(', '))}</p>`:''}${task.specification?`<p>Wiki · ${esc(task.specification.page)} #${esc(task.specification.section)}</p>`:''}${task.required_skills.length?`<p>Skills · ${esc(task.required_skills.join(', '))}</p>`:''}</li>`).join('')}</ol><button type="button" data-feature-action="apply" class="primary">Create tasks on board</button>
+        <details><summary>Ask for changes</summary><form class="feature-clarify"><label>Changes<textarea data-feature-answer="${esc(id)}" name="text" required maxlength="1500">${esc(drafts.get(id)||'')}</textarea></label><button type="submit">Revise plan</button></form></details>`:''}
+        ${state==='failed'?'<button type="button" data-feature-action="retry">Retry planning</button>':''}
+        ${state==='applied'?`<p>${request.tasks.map(task=>`${esc(task.code)}${task.existing?' (existing)':''}`).join(' · ')}</p>`:''}</article>`;
+    }).join('');
+  }
+
+  async function refreshRequests(){
+    if(!live()||root.hidden)return;
+    if(loading)return loading;
+    loading=api('feature_planning',{project:selected}).then(data=>{if(live())show(data.requests);}).catch(showError).finally(()=>{loading=undefined;});
+    return loading;
+  }
+
+  async function send(action,values,button,after){
+    if(!live())return;
+    if(!actor){chooseHumanProfile();return;}
+    button.disabled=true;
+    feedback.textContent='';
+    try{
+      await api('feature_planning',{project:selected,actor,action,...values});
+      after?.();
+      await loading;
+      await refreshRequests();
+      if(live()&&!root.hidden)list.querySelector(`[data-feature-id="${CSS.escape(values.id)}"]`)?.scrollIntoView({block:'nearest'});
+    }catch(err){showError(err);}finally{button.disabled=false;updateIdentity();}
+  }
+  form.onsubmit=e=>{
+    e.preventDefault();const text=form.elements.text.value.trim();
+    if(!text)return;
+    if(pendingText!==text||!pendingId){pendingId=crypto.randomUUID().replaceAll('-','');pendingText=text;}
+    send('submit',{id:pendingId,text},e.submitter,()=>{if(form.elements.text.value.trim()===text)form.reset();pendingId='';});
+  };
+  list.onclick=e=>{
+    const button=e.target.closest('[data-feature-action]');if(!button)return;
+    const card=button.closest('[data-feature-id]');
+    send(button.dataset.featureAction,{id:card.dataset.featureId,attempt:Number(card.dataset.attempt)},button);
+  };
+  list.onsubmit=e=>{
+    if(!e.target.matches('.feature-clarify'))return;
+    e.preventDefault();const card=e.target.closest('[data-feature-id]');
+    send('answer',{id:card.dataset.featureId,attempt:Number(card.dataset.attempt),text:e.target.elements.text.value},e.submitter);
+  };
+  updateIdentity();
+  return {refresh:refreshRequests,updateIdentity};
+}
+
+function openFolder(){modal('Open / import project',field('Folder containing .scrum (absolute path)','path','','required')+'<p>Imports snapshot.json only when no local project data exists. Opening an existing database preserves local work.</p>',async f=>{
+  const result=await api('project_open',{path:f.get('path')});
+  const setup=await api('project_knowledge',{project:result.id,action:'status'});
+  project=result.id;page=['draft','applying'].includes(setup.phase)?'Wiki':'Board';
+  await loadProjects();
+});}
 function renderProjects(){
   $('#content').innerHTML=`<section class="workflow"><h2>Project folders</h2><p>One panel, separate local databases. Git carries project.json and snapshot.json; local databases and locks stay in each checkout.</p><button id="folder-create">Create in folder</button> <button id="folder-open">Open / import folder</button><div class="lock-table-wrap"><table class="lock-table"><thead><tr><th>Project</th><th>Folder & identity</th><th>Actions</th></tr></thead><tbody>${projects.map(p=>`<tr><td>${esc(p.name)}${p.available===false?' · unavailable':''}${p.legacy?' · legacy database':''}</td><td>${esc(p.path||'No workspace set')}<br><small>${esc(p.uuid||'Migration required')}${p.error?'<br>'+esc(p.error):''}</small></td><td>${p.legacy?`<button data-migrate="${p.id}">Migrate to folder</button>`:`${p.available!==false?`<button data-export="${p.id}">Export for Git</button> <button data-restore="${p.id}">Restore snapshot</button>`:''} <button data-forget="${p.id}">Remove from panel</button>`}</td></tr>`).join('')||'<tr><td colspan="3">No registered projects.</td></tr>'}</tbody></table></div><p id="folder-result" role="status"></p></section>`;
   $('#folder-create').onclick=openProject;$('#folder-open').onclick=openFolder;
