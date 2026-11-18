@@ -223,6 +223,37 @@ class BridgeTest(unittest.TestCase):
                                   ({},{'autonomy_mode':'Autonomous'},{}),({}, {},{'dirty_planned':['app.py']})):
             self.assertFalse(agent_bridge.concise_resume_launch(offer,policy,started|extra))
 
+    def test_prepared_context_requires_current_wiki_and_scoped_complete_diff(self):
+        from project_knowledge import bind_specification, specification_status
+
+        with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as folder:
+            root=Path(folder)
+            page=root/'docs/agents/sample.md'
+            page.parent.mkdir(parents=True)
+            page.write_text('## Acceptance\n\nUse 37 seconds.\n\n## Extra\n\nDo not preload.',encoding='utf-8')
+            (root/'feature.py').write_text('RETRY_LIMIT = 11\n',encoding='utf-8')
+            description=bind_specification(root,'Review the retry change.',{'page':'docs/agents/sample.md','section':'acceptance'})
+            task={'code':'FIX-7','continuity':'Saved scope','files':['feature.py'],'specification':specification_status(root,description)}
+            started={'task':task,'dirty_planned':['feature.py']}
+            with patch('git_changes.review',return_value={'diff':'+RETRY_LIMIT = 11'}) as review:
+                bundle=agent_bridge.prepared_resume_context(root,{},started)
+                self.assertIn('Use 37 seconds.',bundle)
+                self.assertIn('+RETRY_LIMIT = 11',bundle)
+                self.assertNotIn('Do not preload',bundle)
+                self.assertEqual(review.call_args.kwargs['scope'],['feature.py'])
+                prompt=agent_bridge.cli_prompt(1,root,9,'codex',{}, {},started)
+                self.assertIn('use the supplied snapshot directly',prompt)
+                self.assertIn('details outside the snapshot',prompt)
+                self.assertIn('finish --task FIX-7 --evidence TEXT',prompt)
+                self.assertFalse(agent_bridge.prepared_resume_context(root,{'batch':[1]},started))
+                self.assertFalse(agent_bridge.prepared_resume_context(root,{},started|{'dirty_planned':['other.py']}))
+                review.return_value={'diff':'+partial','truncated':True}
+                self.assertFalse(agent_bridge.prepared_resume_context(root,{},started))
+                review.reset_mock()
+                page.write_text('## Acceptance\n\nUse 40 seconds.',encoding='utf-8')
+                self.assertFalse(agent_bridge.prepared_resume_context(root,{},started))
+                review.assert_not_called()
+
     def test_cli_command_disables_only_scrum_and_keeps_specialist_selection(self):
         with patch.object(agent_bridge,'codex_executable',return_value='codex'),patch.object(agent_bridge,'skill_options',return_value=[]),patch.object(agent_bridge,'worker_filesystem',return_value={}),patch('mcp_selection.codex_options',return_value=['-c','mcp_servers.unity.enabled=true']):
             cmd=agent_bridge.command('codex',Path('.'),'scope',coordination_channel='cli')
