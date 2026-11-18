@@ -241,7 +241,19 @@ class BridgeTest(unittest.TestCase):
                 self.assertIn('+RETRY_LIMIT = 11',bundle)
                 self.assertNotIn('Do not preload',bundle)
                 self.assertEqual(review.call_args.kwargs['scope'],['feature.py'])
-                prompt=agent_bridge.cli_prompt(1,root,9,'codex',{}, {},started)
+                manifest=root/'skill/SKILL.md'
+                reference=manifest.parent/'references/cli.md'
+                reference.parent.mkdir(parents=True)
+                manifest.write_text('Work instructions',encoding='utf-8')
+                reference.write_text('CLI reference',encoding='utf-8')
+                with patch.object(agent_bridge,'scrum_work_manifest',return_value=manifest):
+                    prompt=agent_bridge.cli_prompt(1,root,9,'codex',{}, {},started)
+                    self.assertIn(reference.as_posix(),prompt)
+                    self.assertIn('only when needed; do not guess installation paths',prompt)
+                    with patch.object(agent_bridge,'scrum_work_manifest',return_value=Path('x'*5000)):
+                        bounded=agent_bridge.cli_prompt(1,root,9,'codex',{}, {},started)
+                        self.assertIn('Supervisor prepared read-only context:',bounded)
+                        self.assertNotIn('Scrum procedure on demand:',bounded)
                 self.assertIn('use the supplied snapshot directly',prompt)
                 self.assertIn('details outside the snapshot',prompt)
                 self.assertIn('finish --task FIX-7 --evidence TEXT',prompt)

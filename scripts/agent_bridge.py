@@ -297,11 +297,21 @@ def prepared_resume_context(folder, offer, started):
             'Existing edits are not yours; normal ownership and verification still apply.')
 
 
+def scrum_work_manifest(checkout, client):
+    from skill_lookup import catalog
+
+    try:
+        skill=catalog(checkout,client).get('scrum-work')
+        return Path(skill['path']) if skill else None
+    except (OSError, RuntimeError):
+        return None
+
+
 def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections=None):
     import shlex
     from scrum_cli import redact
     from context_tools import startup_task
-    from skill_lookup import catalog as skill_catalog, required_skill_prompt
+    from skill_lookup import required_skill_prompt
     cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
     task=started['task']
     light=light_launch(offer,policy,started)
@@ -309,12 +319,9 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
     resume_reference=''
     if resumed:
         checkout=Path((started.get('git') or {}).get('worktree') or folder)
-        try:
-            skill=skill_catalog(checkout,client).get('scrum-work')
-        except (OSError, RuntimeError):
-            skill=None
+        skill=scrum_work_manifest(checkout,client)
         if skill:
-            resume_reference='Scrum exceptions: use this resolved manifest only when needed: '+json.dumps(skill['path'],ensure_ascii=False)
+            resume_reference='Scrum exceptions: use this resolved manifest only when needed: '+json.dumps(str(skill),ensure_ascii=False)
         rules=(
             'The supervisor validated quota and already claimed this task in the current checkout. '
             'Use the supplied scope and saved continuity directly; implement only the remaining work. '
@@ -425,6 +432,16 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
                 'Read scrum-work references/cli.md for commands, evidence and recovery when needed. ', '',1).replace(
                 f'CLI: {cli} finish --task CODE --evidence TEXT. ', '',1)+guidance,
                 'execution':parts['execution']+'\n'+exact,'prepared_context':prepared}
+            manifest=scrum_work_manifest(Path(git.get('worktree') or folder),client)
+            if manifest:
+                reference={'manifest':manifest.as_posix()}
+                cli_reference=manifest.parent/'references/cli.md'
+                if cli_reference.is_file():reference['cli']=cli_reference.as_posix()
+                reference_text=('Scrum procedure on demand: '+json.dumps(reference,ensure_ascii=False)+
+                    '. Use the supplied scope and finish command for routine work. Open the relevant resolved file only when needed; do not guess installation paths.')
+                with_reference={**candidate,'resume_reference':reference_text}
+                if len('\n'.join(value for value in with_reference.values() if value).encode('utf-8'))<=STARTUP_BUDGET_BYTES:
+                    candidate=with_reference
             adjusted='\n'.join(value for value in candidate.values() if value)
             if len(adjusted.encode('utf-8'))<=STARTUP_BUDGET_BYTES:
                 parts=candidate
