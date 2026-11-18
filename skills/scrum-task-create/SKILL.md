@@ -1,9 +1,9 @@
 ---
 name: scrum-task-create
-description: Create tasks or a scoped backlog in Scrum Studio through its MCP, including priority, acceptance criteria, checklists, and dependencies. Does not execute the tasks.
+description: Create tasks or a scoped backlog in Scrum Studio with acceptance criteria, files, dependencies, and relevant worker context. Does not execute the tasks.
 ---
 
-Use the scrum-studio MCP. Reuse the intended project ID; otherwise resolve it with `projects`, clarifying ambiguous matches. Write task content in English. Apply [scrum-rules](../scrum-rules/SKILL.md) before decomposition: register or reuse the entire known authorized TODO set before any implementation/claim; never alternate creating each already-known deliverable with executing it. Explain justified grouping briefly; creation alone does not authorize execution.
+Use the configured coordination channel. For native CLI, use `scrum.py plan --input FILE` with a JSON array of plan items; for an explicitly selected MCP, use `task_plan`. Reuse the intended project ID; otherwise resolve it with `projects`, clarifying ambiguous matches. Write task content in English. Apply [scrum-rules](../scrum-rules/SKILL.md) before decomposition: register or reuse the entire known authorized TODO set before any implementation/claim. Creation alone does not authorize execution.
 
 - Translate the requested outcome into concrete tasks with concise titles. Put scope/context in description and explicit outcome checks in acceptance_criteria in the same initial write. Avoid speculative work and redundant tiny tasks.
 - Call `task_create(project, title, description, acceptance_criteria, priority, checklist, category, dependencies, actor)` as needed. Category is a concise English label (default General, max 80 characters), such as Feature, Bug, Design or Testing. Reuse an appropriate known category. Priority is 1 High, 2 Normal (default), 3 Low. New tasks default to TODO. Human-authorized parking can use status=Backlog in task_create or new task_plan items with the human actor; agents cannot park work on their own.
@@ -20,6 +20,11 @@ Apply cached task_sizing from project settings (default Small), using scrum-rule
 Every initial task_create MUST include a nonempty description and acceptance_criteria (1..100 explicit, verifiable outcome strings), together with title. Never create a title-only placeholder to fill later. A checklist records implementation steps; it is not a substitute for acceptance criteria. Describe scope and exclusions concisely before the write.
 
 Optional scope_size=Small|Large requires a concise scope_reason; Unknown is default. Assess independent outcome/verification, not only file count. A justified Small estimate can allow Light across several files, but never overrides dependencies, blockers, concurrency or policy. Avoid invented estimates solely to get Light.
+
+When an existing wiki section defines acceptance, inspect its actual heading and pin its page and anchor with `specification`. If a specialist procedure is required, inspect its manifest and use the exact declared skill name in `required_skills`. Keep wiki references out of `files` unless the task edits them. Omit fields without a verified match. The supervisor resolves these references on claim; the plan does not prescribe shell commands or read order.
+
+Example structure, assuming the section and skill exist:
+`{"key":"keyboard-nav","title":"Fix panel keyboard navigation","description":"Restore tab order in the panel.","files":["public/panel.js"],"acceptance_criteria":["Tab and Shift+Tab traverse the panel in the documented order."],"specification":{"page":"docs/agents/ui.md","section":"keyboard-navigation"},"required_skills":["browser-review"]}`
 
 For a small related set, prefer task_plan(project,actor,items): one atomic call for 1..10 outcomes, without claims. Each item has key/title/description/acceptance_criteria, optional id to refine an unlocked unfinished task while preserving its history/state/evidence, and optional priority/category/files/scope_size/scope_reason. dependencies accepts numeric IDs or batch keys, including forward references. No partial plan commits on validation/cycle failure. Keep independent work unclaimed and selectable by another authorized worker. Apply scrum-rules examples in this same planning turn; no extra model call, worker spawn or per-item ceremony. A backlog-only request still does not authorize execution.
 

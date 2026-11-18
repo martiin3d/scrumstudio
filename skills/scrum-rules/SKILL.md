@@ -7,6 +7,8 @@ Before the first claim, map the whole known authorized scope to existing or new 
 
 ## Group or split
 
+For an outcome governed by an existing wiki section or a specialist procedure, bind the verified `specification` and `required_skills` in the plan item. Keep `files` to the edit scope. [Task creation example](../scrum-task-create/SKILL.md).
+
 The unit is **one independently verifiable result**. Do not size work to a fixed number of tasks per session or inflate Done counts by splitting phases. A session may finish many related small outcomes in one CLI; a difficult outcome may need more than one session. Then decide with these criteria:
 
 **Keep in one task** when any applies:
