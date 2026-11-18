@@ -7,6 +7,8 @@
 - In Auto workflow, an individual resume with current continuity, complete scope and no changed-input/recovery diagnostics can also use direct instructions and the exact finish command. The full claim, required skills and verification status remain available. When possible, combine acceptance verification and finish in one tool call with an explicit success guard; any failed check must prevent finish. Stale continuity, dirty planned files, decisions, attachments, review, pending evidence, batches, Git recovery and other complex context retain standard startup. Fresh tasks use their existing renderer.
 - Resume from task continuity and the saved file plan. Check the current branch, changed paths and any stale-continuity marker before reusing evidence. Fetch linked decisions, attachments and diagnostics when relevant to the task. Record the next unfinished action on the same task.
 
+When a task names a wiki section, pass its page path and heading anchor as `page` and `section` to `scrum.py call project_knowledge --stdin`. The response includes the original page path so relative links still resolve. Omit `section` for the full page and navigation.
+
 For a smaller Codex worker catalog on this checkout, put a JSON array of skill directory names in `.scrum/local/codex-skills.json`, for example `["codebase-memory"]`. Add the specialists this project needs. The filter keeps `scrum-work` and preserves explicit Codex skill rules. It covers the immediate skill directories in Codex home, the user's `.agents/skills`, and the project. A skill omitted from the catalog can still be read from its known path.
 
 For changes to this flow, run the relevant CLI, bridge, workflow or context tests listed by `python scripts/verify.py --files PATH`.

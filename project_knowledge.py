@@ -363,7 +363,7 @@ def specification_revision(root, page, section):
     return specification_body_revision(path.read_text(encoding='utf-8-sig'),section)
 
 
-def specification_body_revision(text,section):
+def wiki_section_body(text,section):
     if section:
         headings=list(re.finditer(r'^(#{1,6})\s+([^\n]+)$',text,re.M))
         slug=lambda heading:re.sub(r'[^\w -]','',heading.lower().strip()).replace(' ','-')
@@ -373,7 +373,11 @@ def specification_body_revision(text,section):
             text=text[heading.start():following].rstrip()
             break
         else:raise ValueError('Specification section does not exist')
-    return digest(text.encode())
+    return text
+
+
+def specification_body_revision(text,section):
+    return digest(wiki_section_body(text,section).encode())
 
 
 def approved_wiki_changes(root,workspace,task,settings):
@@ -748,8 +752,18 @@ def operation(db, row, prefix, args):
     if not row['workspace_root'] or not root.is_dir():raise ValueError('Project workspace is unavailable')
     action=args.get('action','view')
     if action=='view':
-        pages=topic_links(root,{})
         name=args.get('page',INDEX.as_posix())
+        section=args.get('section','')
+        if section:
+            if name==SKILLS_PAGE or len(section)>100 or not re.fullmatch(r'[\w-]+',section):
+                raise ValueError('Use a wiki page and a valid heading anchor')
+            relative=INDEX if name==INDEX.as_posix() else wiki_path(name)
+            path=safe_file(root,relative.as_posix())
+            if not path:
+                raise ValueError('Wiki page does not exist')
+            body=wiki_section_body(path.read_text(encoding='utf-8-sig'),section)
+            return {'page':name,'section':section,'body':body}
+        pages=topic_links(root,{})
         if name==SKILLS_PAGE:
             content={'body':None,'skills':project_skills(root)}
         else:

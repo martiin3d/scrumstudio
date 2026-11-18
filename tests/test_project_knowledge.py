@@ -39,6 +39,21 @@ class ProjectKnowledgeTest(unittest.TestCase):
             self.knowledge(project,'source',source='private/SKILL.md')
         self.assertEqual(self.knowledge(project,'view')['body'],index.read_text(encoding='utf-8'))
 
+    def test_wiki_view_section_is_scoped_and_keeps_the_full_page_available(self):
+        project,root=self.project()
+        page='docs/agents/index.md'
+        index=root/page
+        index.parent.mkdir(parents=True)
+        section='## Acceptance criteria\n\nSee [checks](checks.md).\n\n### Edge cases\n\nCheck one.'
+        body='# Wiki\n\n'+section+'\n\n## Other\n\nOther context.\n'
+        index.write_text(body,encoding='utf-8')
+        self.assertEqual(self.knowledge(project,'view',page=page,section='acceptance-criteria'),
+                         {'page':page,'section':'acceptance-criteria','body':section})
+        self.assertEqual(self.knowledge(project,'view',page=page)['body'],body)
+        for target,anchor in ((page,'absent'),('project-skills','acceptance-criteria'),('../index.md','wiki')):
+            with self.subTest(target=target,anchor=anchor), self.assertRaises(ValueError):
+                self.knowledge(project,'view',page=target,section=anchor)
+
     def test_readiness_suggests_only_relevant_installed_skills_for_the_worker(self):
         project,root=self.project()
         home=root/'isolated-home'
