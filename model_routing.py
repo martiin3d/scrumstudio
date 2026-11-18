@@ -38,8 +38,8 @@ def select(task,client,profile_model='',available=None):
         else:
             known=catalog() if available is None else available
             routes={'economy':['gpt-6-luna','gpt-5.6-luna','gpt-5.4-mini'],
-                    'standard':['gpt-6.1-sol','gpt-6-sol','gpt-5.6-sol'],
-                    'advanced':['gpt-6-astra','gpt-6.1-sol','gpt-5.6-sol']}
+                    'standard':['gpt-6.2-sol','gpt-6.1-sol','gpt-6-sol','gpt-5.6-sol'],
+                    'advanced':['gpt-6-astra','gpt-6.2-sol','gpt-6.1-sol','gpt-5.6-sol']}
             chosen=next((name for name in routes[tier] if name in known),'')
             if not chosen:reason+='; no known local catalog route, provider default retained'
     model_name(chosen)

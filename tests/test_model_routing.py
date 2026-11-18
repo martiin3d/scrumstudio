@@ -29,6 +29,12 @@ class RoutingTest(unittest.TestCase):
         with self.assertRaises(ValueError):model_routing.select({'model':'claude-other'},'codex')
         self.assertEqual(model_routing.select({},'codex',available=set())['model'],'')
 
+    def test_standard_prefers_gpt_6_2_sol_when_available(self):
+        available={'gpt-6.2-sol','gpt-6.1-sol','gpt-6-luna','gpt-6-astra'}
+        self.assertEqual(model_routing.select({},'codex',available=available)['model'],'gpt-6.2-sol')
+        self.assertEqual(model_routing.select({},'codex','gpt-6.1-sol',available)['model'],'gpt-6.1-sol')
+        self.assertEqual(model_routing.select({'model':'gpt-6.2-sol'},'codex',available=set())['model'],'gpt-6.2-sol')
+
     def test_human_lock_override_agent_tier_and_portable_models(self):
         p,folder=self.project()
         task=self.task(p)
