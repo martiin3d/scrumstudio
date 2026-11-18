@@ -265,19 +265,28 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
     import shlex
     from scrum_cli import redact
     from context_tools import startup_task
-    from skill_lookup import required_skill_prompt
+    from skill_lookup import catalog as skill_catalog, required_skill_prompt
     cli=('& '+json.dumps(worker_python())+' '+json.dumps(str(ROOT/'scrum.py'))) if os.name=='nt' else shlex.join([worker_python(),str(ROOT/'scrum.py')])
     task=started['task']
     light=light_launch(offer,policy,started)
     resumed=concise_resume_launch(offer,policy,started)
+    resume_reference=''
     if resumed:
+        checkout=Path((started.get('git') or {}).get('worktree') or folder)
+        try:
+            skill=skill_catalog(checkout,client).get('scrum-work')
+        except (OSError, RuntimeError):
+            skill=None
+        if skill:
+            resume_reference='Scrum exceptions: use this resolved manifest only when needed: '+json.dumps(skill['path'],ensure_ascii=False)
         rules=(
             'The supervisor validated quota and already claimed this task in the current checkout. '
             'Use the supplied scope and saved continuity directly; implement only the remaining work. '
-            'Inspect the relevant source and acceptance checks. Preserve unrelated content. '
-            'Run acceptance checks after editing; reuse a successful result only while its inputs match. '
+            'Start with one grouped read of the relevant planned source. Read the check implementation only if its scope is unclear or it fails. Preserve unrelated content. '
+            'The claim below is already current: do not refetch it or repeat checkout diagnostics unless scope is missing or a real discrepancy appears. '
+            'Do not rerun already recorded baseline checks. Run current acceptance after editing; reuse a passing receipt only while its inputs match. '
             'The inherited private SCRUM_CLI_CONTEXT handles ownership. Keep it private. '
-            'For missing information or an actual failure, read the relevant scrum-work reference. '
+            'For routine execution, the supplied instructions suffice. On an exception, follow the resolved Scrum reference if supplied; otherwise locate it via the provider catalog. '
             'Resolve the supplied required skills and use specialist skills when the work needs them. '
             'Respect Stop and permissions. When possible, run acceptance verification and the supplied finish command '
             'in one tool call, with an explicit success guard: any failed check must prevent finish. '
@@ -337,7 +346,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
     git=started.get('git') or {}
     diagnostics.update({key:git[key] for key in ('branch','parent','worktree','error','refreshed_from') if git.get(key)})
     claim=redact(startup_task(task))
-    if light:
+    if light or resumed:
         for field in ('id','version','status','category'):
             claim.pop(field,None)
     def serialize_claim():
@@ -349,6 +358,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         'execution':f'Finish: {cli} finish --task {task["code"]} --evidence TEXT' if light or resumed else f'Project {project}, actor {actor}, checkout {folder}.',
         'claim':serialize_claim(),
         'required_skills':required_skill_prompt(Path(folder),Path(git.get('worktree') or folder),client,task.get('required_skills',[])),
+        'resume_reference':resume_reference,
         'checkout':'Checkout: '+json.dumps(redact(diagnostics),ensure_ascii=False,separators=(',',':')) if diagnostics else '',
     }
     def render():

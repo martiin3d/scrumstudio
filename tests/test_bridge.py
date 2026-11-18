@@ -195,9 +195,15 @@ class BridgeTest(unittest.TestCase):
                                  'verification':[{'status':'unknown'}]}}
         started={'task':task,'workflow':'Standard','file_lock_mode':'checkout'}
         sections={}
-        with patch.object(skill_lookup,'required_skill_prompt',return_value='REQUIRED_SKILL_PATH'):
+        reference=str(SCRIPTS.parent/'skills/scrum-work/SKILL.md')
+        with (patch.object(skill_lookup,'required_skill_prompt',return_value='REQUIRED_SKILL_PATH'),
+              patch.object(skill_lookup,'catalog',return_value={'scrum-work':{'path':reference}})):
             prompt=agent_bridge.cli_prompt(1,Path('.'),9,'codex',{}, {},started,sections=sections)
         self.assertEqual(sections['_budget']['renderer'],'resume')
+        self.assertIn('one grouped read',prompt)
+        self.assertIn('do not refetch it',prompt)
+        self.assertIn('Do not rerun already recorded baseline checks',prompt)
+        self.assertIn(json.dumps(reference),prompt)
         self.assertIn('any failed check must prevent finish',prompt)
         for text in (task['continuity'],'workspace_delta','unknown','REQUIRED_SKILL_PATH',
                      'Stop and permissions','--paths','finish --task FIX-7','Verify changed behavior.'):
