@@ -9,8 +9,8 @@ import sys
 import time
 import uuid
 
-READS={'projects','users','task_get','task_search','task_changes','agent_status','project_metrics','coordination_metrics','session_resume','next_work','worker_readiness','graph_readiness','workflow_status','project_wiki_proposals'}
-ALIASES={'ask':'agent_interaction','show':'task_get','search':'task_search','plan':'task_plan','update':'task_update','claim':'task_claim','release':'task_release','lock':'file_locks','finish':'work_finish','pause':'agent_checkpoint','status':'agent_status','metrics':'coordination_metrics','start':'work_start','projects':'projects'}
+READS={'projects','users','task_get','task_search','task_changes','agent_status','project_mode','project_metrics','coordination_metrics','session_resume','next_work','worker_readiness','graph_readiness','workflow_status','project_wiki_proposals'}
+ALIASES={'ask':'agent_interaction','show':'task_get','search':'task_search','plan':'task_plan','update':'task_update','claim':'task_claim','release':'task_release','lock':'file_locks','finish':'work_finish','pause':'agent_checkpoint','status':'agent_status','mode':'project_mode','metrics':'coordination_metrics','start':'work_start','projects':'projects'}
 
 
 def read_operation(name,args):
@@ -227,7 +227,7 @@ def main(argv=None):
                     report=json.loads(value);value=report.get('evidence')
                     if not isinstance(value,str):raise ValueError('JSON evidence file requires an evidence string')
             if value is not None:args[field]=value
-        if ns.reason is not None:args['reason' if name=='agent_checkpoint' else 'blocked_reason']=ns.reason
+        if ns.reason is not None:args['reason' if name in ('agent_checkpoint','project_control') else 'blocked_reason']=ns.reason
         if ns.decisions_file:
             if ns.decisions_file.stat().st_size>32000:raise ValueError('Decision file too large')
             args['decisions']=json.loads(ns.decisions_file.read_text(encoding='utf-8-sig'))

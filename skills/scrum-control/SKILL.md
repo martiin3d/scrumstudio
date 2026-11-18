@@ -1,7 +1,9 @@
 ---
 name: scrum-control
-description: Stop or wake Scrum Studio project workers, inspect active agents/tasks and connect an explicitly authorized Codex or Claude CLI control bridge.
+description: Turn Scrum on or off per project, play or stop its workers, inspect activity and connect an authorized Codex or Claude CLI bridge.
 ---
+
+For a human asking to turn Scrum off or on, identify the project by checkout and the active human actor. Use `python scrum.py mode --project CHECKOUT` to read the switch. Use `python scrum.py call project_control --project CHECKOUT --actor HUMAN_ID --action disable` to turn it off, or `--action enable` to turn it on. With the explicitly selected MCP, use `project_mode` and `project_control` with the same actions. Off persists for this project and requests safe handoff. On restores Scrum participation and leaves workers stopped until Play/Wakeup. Respect pending handoffs; do not enable Scrum on behalf of a chat that is continuing directly.
 
 Managed profiles may save an optional `model` via agent_manage create/update with a human actor. Blank uses the provider default; explicit IDs/aliases pass as `--model` on the next authorized run, without restarting current work. Syntax errors are immediate; unavailable models surface provider errors in Agents/Chat. No catalog probing, paid discovery calls or automatic substitution occurs. Claude initialization metadata is compared for exact IDs; aliases may resolve dynamically. See [scrum-agents](../scrum-agents/SKILL.md).
 

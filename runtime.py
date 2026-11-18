@@ -16,7 +16,9 @@ def migrate(db, separate=False):
     db.execute(f'''CREATE TABLE IF NOT EXISTS {ns}project_control(
         project INTEGER PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
         generation INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
-        changed REAL NOT NULL, actor INTEGER)''')
+        changed REAL NOT NULL, actor INTEGER, enabled INTEGER NOT NULL DEFAULT 1)''')
+    if 'enabled' not in {r['name'] for r in db.execute(f'PRAGMA {ns}table_info(project_control)')}:
+        db.execute(f'ALTER TABLE {ns}project_control ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
     columns={r['name'] for r in db.execute(f'PRAGMA {ns}table_info(agent_sessions)')}
     if 'bridge_heartbeat' not in columns:
         db.execute(f'ALTER TABLE {ns}agent_sessions ADD COLUMN bridge_heartbeat REAL NOT NULL DEFAULT 0')
@@ -72,7 +74,15 @@ def quota_resume(db,project,actor,mode,why,old,running=False,automatic=False):
 
 def control(db, project):
     row=db.execute('SELECT * FROM project_control WHERE project=?',(project,)).fetchone()
-    return dict(row) if row else {'project':project,'paused':0,'generation':0,'reason':'','changed':0,'actor':None}
+    return dict(row) if row else {'project':project,'paused':0,'generation':0,'reason':'','changed':0,'actor':None,'enabled':1}
+
+
+def has_agent_work(db, project):
+    import feature_planning
+    return bool(feature_planning.active_actors(db,project) or db.execute('''
+        SELECT 1 FROM tasks t JOIN users u ON u.id=t.owner_id
+        WHERE t.project=? AND t.status='In Progress' AND t.lock_until>? AND u.kind='agent' LIMIT 1
+    ''',(project,time.time())).fetchone())
 
 def quota_reason(policy, session, at=None):
     at=time.time() if at is None else at
@@ -93,6 +103,8 @@ def reason(db, project, actor):
     user=db.execute('SELECT kind FROM users WHERE id=?',(actor,)).fetchone()
     if user and user['kind']=='human':
         return ''
+    if not c['enabled']:
+        return 'SCRUM is off for this project'
     if c['paused']:
         return c['reason'] or 'Project stopped by human'
     policy=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
@@ -118,7 +130,11 @@ def wakeup_readiness(policy,sessions,project_control,at):
         why=quota_reason(policy,session,at)
         if why:held.append({'actor':session['actor'],'name':session['name'],'reason':why})
         elif session not in running and session not in failed:ready+=1
-    if project_control['paused']:
+    if not project_control.get('enabled',1):
+        status='disabled'
+        message='SCRUM is off for this project.'
+        next_step='Turn SCRUM on to use the project workflow again. Play starts workers separately.'
+    elif project_control['paused']:
         status='stopped'
         message='Project stopped. Wakeup clears the project Stop signal; each agent still checks its quota.'
         next_step='Click Wakeup to request continuation, or open Agents to inspect individual workers.'
@@ -161,7 +177,9 @@ def summary(db, project):
             active.add(s['actor'])
     tasks=[r['id'] for r in db.execute("SELECT t.id,t.owner_id,u.kind FROM tasks t JOIN users u ON u.id=t.owner_id WHERE t.project=? AND t.status='In Progress' AND t.lock_until>?",(project,at)) if r['kind']=='human' or r['owner_id'] in active]
     import coordination
-    return {'workflow':coordination.workflow_mode(db,project),'control':c,'active_agents':len(active),'active_tasks':len(tasks),'active_task_ids':tasks,'agents':sessions,'wakeup':wakeup_readiness(policy,sessions,c,at),'basis':'Recent cooperative heartbeat plus valid claim; not OS process detection'}
+    readiness=wakeup_readiness(policy,sessions,c,at)
+    return {'workflow':coordination.workflow_mode(db,project),'control':c,'active_agents':len(active),'active_tasks':len(tasks),'active_task_ids':tasks,'agents':sessions,'wakeup':readiness,
+            'execution_active':bool(readiness['running_bridges']) or has_agent_work(db,project),'basis':'Recent cooperative heartbeat plus valid claim; not OS process detection'}
 
 def handoff(db, project, actor, why, text, now, activity):
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone():
@@ -204,19 +222,27 @@ def handoff(db, project, actor, why, text, now, activity):
 def operation(db, action, a, project, actor_user, required, now, activity):
     if action=='agent_status':
         return summary(db,project)
+    if action=='project_mode':
+        current=control(db,project)
+        return {'enabled':bool(current['enabled']), 'pending_handoff':not current['enabled'] and has_agent_work(db,project)}
     actor=actor_user(db,a)
     db.execute('BEGIN IMMEDIATE')
     if action=='project_control':
         if actor['kind']!='human':
-            raise ValueError('Only a human profile can Stop or Wakeup a project')
+            raise ValueError('Only a human profile can change project controls')
         mode=a.get('action')
-        if mode not in ['stop','wakeup']:
-            raise ValueError('action must be stop or wakeup')
+        if mode not in ('stop','wakeup','enable','disable'):
+            raise ValueError('action must be stop, wakeup, enable or disable')
         previous=control(db,project)
+        if mode=='wakeup' and not previous['enabled']:
+            raise ValueError('SCRUM is off for this project. Turn it on before starting workers.')
+        enabled=int(mode=='enable') if mode in ('enable','disable') else previous['enabled']
+        if mode in ('enable','disable') and enabled==previous['enabled']:
+            return {'control':previous}
         # Wakeup requests are consumed by an optional external bridge, not a model polling loop.
         generation=previous['generation']+1
         why=required(a.get('reason','Human requested '+mode),'reason',500)
-        db.execute('INSERT INTO project_control(project,paused,generation,reason,changed,actor) VALUES(?,?,?,?,?,?) ON CONFLICT(project) DO UPDATE SET paused=excluded.paused,generation=excluded.generation,reason=excluded.reason,changed=excluded.changed,actor=excluded.actor',(project,int(mode=='stop'),generation,why,time.time(),actor['id']))
+        db.execute('INSERT INTO project_control(project,paused,generation,reason,changed,actor,enabled) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project) DO UPDATE SET paused=excluded.paused,generation=excluded.generation,reason=excluded.reason,changed=excluded.changed,actor=excluded.actor,enabled=excluded.enabled',(project,int(mode!='wakeup'),generation,why,time.time(),actor['id'],enabled))
         db.execute("UPDATE agent_sessions SET resume_reset=NULL,auto_resume_status='cancelled by human control' WHERE project=?",(project,))
         result={'control':control(db,project),'delivery':'Cooperative checkpoint or connected CLI bridge; does not wake unrelated desktop chats'}
         if mode=='wakeup':

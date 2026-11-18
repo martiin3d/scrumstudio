@@ -8,6 +8,7 @@ let auditPatternFocus=null;
 const workerReadinessCache=new Map();
 let readinessSelection='';
 let lastControlSignal=null;
+const pendingProjectControl=new Set();
 const taskSortFields=['updated','code','title','status','priority','owner','context','batch','model'];
 const taskGroupFields=['none','status','priority','owner','context','batch','category'];
 function taskView(){
@@ -1197,12 +1198,17 @@ function mountFeaturePlanner(root,selected){
   root.innerHTML=`<h2>Request a feature</h2><form id="feature-request-form">
     <label for="feature-request">What do you want to add or change?</label>
     <textarea id="feature-request" name="text" rows="4" required maxlength="4000" placeholder="Describe the outcome, who needs it and any constraints…"></textarea>
-    <p>Asking starts the local Codex planner and uses model tokens. Review its draft before creating tasks.</p>
+    <p id="feature-availability"></p>
     <div class="guided-actions"><button type="button" id="feature-profile" hidden>Choose a human profile</button><button type="submit" class="primary">Ask planner</button></div></form>
     <p class="feature-feedback" role="status"></p><div class="feature-requests"></div>`;
   const list=root.querySelector('.feature-requests'), form=root.querySelector('form'), feedback=root.querySelector('.feature-feedback');
   const profile=root.querySelector('#feature-profile'), submit=form.querySelector('[type=submit]');
-  const updateIdentity=()=>{profile.hidden=!!actor;submit.disabled=!actor;};
+  const updateIdentity=()=>{
+    const enabled=state.runtime?.control?.enabled!==0;
+    profile.hidden=!!actor;
+    submit.disabled=!actor||!enabled;
+    root.querySelector('#feature-availability').textContent=enabled?'Asking starts the local Codex planner and uses model tokens. Review its draft before creating tasks.':'SCRUM is off for this project. Turn it on to ask the planner.';
+  };
   profile.onclick=chooseHumanProfile;
   let version='', loading, pendingId='', pendingText='';
   const showError=err=>{if(live())feedback.textContent=err.message;};
@@ -1284,25 +1290,52 @@ function renderAgentControls(){
   const panel=$('#agent-controls');panel.hidden=!project||['Projects','Wiki'].includes(page);
   const r=state.runtime;
   $('#agent-feedback').hidden=panel.hidden||!r;
+  const runButton=$('#project-run'), modeButton=$('#project-scrum-mode');
+  modeButton.hidden=panel.hidden||!r;
+  modeButton.disabled=runButton.disabled=true;
   if(!r)return;
   $('#agent-counts').textContent=`${r.active_agents} active agents · ${r.active_tasks} active tasks · ${r.workflow?.effective||'Standard'} workflow (${r.workflow?.configured||'Auto'})`;
   $('#agent-counts').title=r.workflow?.reason||'';
+  const enabled=r.control.enabled!==0, busy=pendingProjectControl.has(project);
   let readiness=r.wakeup;
   const recorded=lastControlSignal?.project===project&&lastControlSignal.generation===r.control.generation&&lastControlSignal.action==='wakeup';
-  if(recorded&&lastControlSignal.report&&((lastControlSignal.report.status==='starting'&&!readiness?.connected_bridges&&Date.now()-lastControlSignal.at<20000)||['launch_failed','profiles_stopped'].includes(lastControlSignal.report.status)))readiness=lastControlSignal.report;
-  $('#control-status').textContent=r.control.paused?'Stop requested — agents close at their next safe checkpoint.':readiness?recorded&&readiness.status==='ready'?`Wakeup recorded for ${readiness.connected_bridges} connected agent(s). Check Agents or Chat for the launch result.`:`${recorded?'Wakeup recorded. ':''}${readiness.message}`:'Open Agents to check worker connections before sending Wakeup.';
-  $('#control-status').dataset.state=readiness?.status||'';
+  const recent=recorded&&Date.now()-lastControlSignal.at<20000;
+  if(recorded&&lastControlSignal.report&&((recent&&lastControlSignal.report.status==='starting'&&!readiness?.connected_bridges)||['launch_failed','profiles_stopped'].includes(lastControlSignal.report.status)))readiness=lastControlSignal.report;
+  const starting=enabled&&!r.control.paused&&recent&&['starting','ready'].includes(readiness?.status);
+  const running=!!r.execution_active;
+  const stopping=!!r.control.paused&&running;
+  runButton.dataset.action=running||starting?'stop':'wakeup';
+  runButton.querySelector('span').textContent=runButton.dataset.action==='stop'?'■':'▶';
+  runButton.querySelector('b').textContent=stopping?'Stopping…':runButton.dataset.action==='stop'?'Stop':'Play';
+  runButton.disabled=busy||!enabled||stopping;
+  modeButton.disabled=busy;
+  modeButton.setAttribute('aria-checked',String(enabled));
+  modeButton.querySelector('.project-mode-label').textContent=enabled?'On':'Off';
+  $('#control-status').textContent=!enabled?(stopping?'SCRUM is off. Agents are handing off their current work.':'SCRUM is off. Coding chats can continue directly.'):
+    stopping?'Stop requested. Agents close at their next safe checkpoint.':r.control.paused?'Workers stopped. Play starts them again.':
+    readiness?recorded&&readiness.status==='ready'?`Play requested for ${readiness.connected_bridges} connected agent(s). Check Agents or Chat for the result.`:readiness.message:'Open Agents to check worker connections before pressing Play.';
+  $('#control-status').dataset.state=enabled?readiness?.status||'':'disabled';
   $('#control-next-step').textContent=readiness?.next_step||'';
-  $('#control-next-step').hidden=!readiness;
+  $('#control-next-step').hidden=!readiness||!enabled||!!r.control.paused;
   $('#control-agents').hidden=page==='Agents';
 }
 async function signalProject(action){
-  if(!actor){error(Error('Choose a human user first.'));return;}
-  const button=action==='stop'?$('#project-stop'):$('#project-wakeup');button.disabled=true;
-  try{const result=await api('project_control',{project,actor,action});lastControlSignal={project,action,generation:result.control.generation,report:result.wakeup,at:Date.now()};if(state.runtime){state.runtime.control=result.control;if(result.wakeup)state.runtime.wakeup=result.wakeup;renderAgentControls();}await refresh();}catch(e){error(e);}finally{button.disabled=false;}
+  const selected=project;
+  if(!selected||pendingProjectControl.has(selected))return;
+  if(!actor){chooseHumanProfile();return;}
+  pendingProjectControl.add(selected);renderAgentControls();
+  try{
+    const result=await api('project_control',{project:selected,actor,action});
+    if(project!==selected)return;
+    lastControlSignal={project:selected,action,generation:result.control.generation,report:result.wakeup,at:Date.now()};
+    if(state.runtime){state.runtime.control=result.control;if(result.wakeup)state.runtime.wakeup=result.wakeup;renderAgentControls();}
+    if(action==='wakeup')setTimeout(()=>{if(project===selected)renderAgentControls();},20000);
+    await refresh();
+  }catch(e){if(project===selected)error(e);}
+  finally{pendingProjectControl.delete(selected);if(project===selected)renderAgentControls();}
 }
-$('#project-stop').onclick=()=>signalProject('stop');
-$('#project-wakeup').onclick=()=>signalProject('wakeup');
+$('#project-run').onclick=()=>signalProject($('#project-run').dataset.action);
+$('#project-scrum-mode').onclick=()=>signalProject($('#project-scrum-mode').getAttribute('aria-checked')==='true'?'disable':'enable');
 $('#control-agents').onclick=async()=>{if(!leaveInspector())return;page='Agents';try{await refresh();$('#create-agent-profile')?.focus();}catch(e){error(e);}};
 function bindWorkerReadiness(profiles,sessions){
   const workers=new Map();

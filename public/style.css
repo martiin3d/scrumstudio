@@ -189,8 +189,19 @@ html.desktop-mode[data-theme] .view-switch button[aria-pressed=true] { color: va
 .agent-controls[hidden], .agent-feedback[hidden] { display: none; }
 .agent-controls button span { margin-right: 4px; font-size: 10px; }
 .agent-controls button:disabled { opacity: .65; cursor: wait; }
-#project-stop { background: #a3303f; border-color: #a3303f; color: #fff; font-weight: 650; }
-#project-stop:hover { background: #852633; border-color: #852633; }
+#project-run { color: #fff; background: #237349; border-color: #237349; min-width: 86px; }
+#project-run:hover { background: #185c3a; border-color: #185c3a; }
+#project-run[data-action=stop] { background: #a3303f; border-color: #a3303f; }
+#project-run[data-action=stop]:hover { background: #852633; border-color: #852633; }
+.header-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px; margin-left: auto; }
+#project-scrum-mode { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; padding: 4px 0 4px 4px; border: 0; background: transparent; color: inherit; font-size: 12px; font-weight: 650; }
+#project-scrum-mode[hidden] { display: none; }
+#project-scrum-mode:disabled { opacity: .65; cursor: wait; }
+.project-mode-label { min-width: 2em; text-align: left; }
+.project-mode-track { position: relative; width: 34px; height: 20px; border-radius: 999px; background: #626b78; }
+.project-mode-track::before { content: ""; position: absolute; left: 4px; top: 4px; width: 12px; height: 12px; border-radius: 50%; background: #fff; }
+#project-scrum-mode[aria-checked=true] .project-mode-track { background: var(--action); }
+#project-scrum-mode[aria-checked=true] .project-mode-track::before { transform: translateX(14px); }
 #feature-request-shortcut { color: #fff; background: #623aa1; border-color: #623aa1; font-weight: 650; }
 #feature-request-shortcut:hover { background: #512e87; border-color: #512e87; }
 .agent-feedback { display: flex; flex-wrap: wrap; flex: 1 0 100%; align-items: baseline; gap: 4px 14px; min-width: 0; padding: 9px 12px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--panel-bg); font-size: 12px; }

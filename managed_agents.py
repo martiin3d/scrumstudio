@@ -85,7 +85,10 @@ def operation(a,call):
     if mode in ('create','update','start','stop'):
         human=next((u for u in call('users',{}) if u['id']==a.get('actor') and u['kind']=='human' and u.get('active',1)),None)
         if not human:raise ValueError('Choose an active human to authorize agent control')
-    sessions=call('agent_status',{'project':a['project']})['agents']
+    status=call('agent_status',{'project':a['project']})
+    if not status['control'].get('enabled',1) and (mode=='start' or mode=='create' and a.get('start_immediately',True)):
+        raise ValueError('SCRUM is off for this project. Turn it on before starting agents.')
+    sessions=status['agents']
     with closing(connect(p['path'])) as db,db:
         if mode=='list':
             active={u['id'] for u in call('users',{}) if u.get('active',1)}

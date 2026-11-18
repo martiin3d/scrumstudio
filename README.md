@@ -36,6 +36,12 @@ The web and desktop views use the same light and dark palettes. **Metrics** show
 
 Choose **Request a feature** beside **Create task** on the board, or open **Chat → Request a feature**, and describe the outcome. **Ask planner** starts one local, read-only Codex planning run with the configured Codex account and consumes provider tokens. It respects project Stop, usage limits and parallel capacity. Answer any clarification in the same view. When the proposal is ready, **Create tasks on board** applies it through the normal task planner, including duplicate and dependency validation. Applying does not send Wakeup or launch an implementation worker.
 
+### Project controls
+
+The board shows green **Play** when workers are idle and red **Stop** while work is active or a launch is starting. The **On/Off** switch at the top right is saved for the selected project and uses no model tokens. Off requests a safe handoff and holds new Scrum runs. It leaves the board, wiki and tasks accessible and lets an interactive Codex chat proceed without Scrum coordination. Turning Scrum On leaves the workers stopped until Play.
+
+From a chat, use the bundled `scrum-control` skill to turn Scrum off or on for that project. The native read-only check is `python scrum.py mode --project CHECKOUT`. An active human can set the same switch with `python scrum.py call project_control --project CHECKOUT --actor HUMAN_ID --action disable` or `--action enable`. Existing sessions should respect any outstanding handoff before editing the same files.
+
 ## MCP connection
 
 Task codes use the first three letters of the project name in uppercase and a project-local sequence starting at 1 (for example, Website: `WEB-1`, `WEB-2`). Spaces and punctuation are ignored; accents are normalized. Short names use their available letters; names without letters use `PRJ`. Existing tasks are numbered automatically in creation order per project. Codes appear on cards, in search, and in MCP results. The local numeric internal `id` remains the input for task updates and dependencies. Projects with the same first three letters share a prefix, so always include the project when referring to a code.

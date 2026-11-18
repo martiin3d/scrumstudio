@@ -26,6 +26,12 @@ def board(cwd):
     matches=[p for p in run('projects',{}) if p.get('available') and p.get('path') and inside(cwd,p['path'])]
     if not matches:return None,None,None
     project=max(matches,key=lambda p:len(str(p['path'])))
+    mode=run('project_mode',{'project':project['id']})
+    if not mode['enabled']:
+        if mode['pending_handoff']:
+            actor=next((u['id'] for u in run('users',{}) if u['identity']==IDENTITY and u.get('active',1)),None)
+            if actor:run('agent_checkpoint',{'project':project['id'],'actor':actor,'client':'claude','action':'pause','reason':'SCRUM is off for this project'})
+        return None,None,None
     actor=run('user_register',{'identity':IDENTITY,'name':NAME,'kind':'agent'})['id']
     return run,project,actor
 

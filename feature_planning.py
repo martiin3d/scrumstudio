@@ -78,6 +78,8 @@ def operation(db, project, args):
         if args.get('capability') is not PRIVATE:raise ValueError('Internal planner action')
     elif kind not in ('list','submit','answer','retry','apply'):
         raise ValueError('Unknown feature planning action')
+    if kind in ('submit','answer','retry') and not runtime.control(db,project)['enabled']:
+        raise ValueError('SCRUM is off for this project. Turn it on before asking the planner.')
     ensure(db)
     if kind=='list':
         return {'requests':[view(row) for row in db.execute('SELECT * FROM feature_requests WHERE project=? ORDER BY updated DESC LIMIT 20',(project,))]}

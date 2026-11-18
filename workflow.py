@@ -16,6 +16,11 @@ def operation(action, a, call):
     project = a['project']
     seen = {k: a[k] for k in ('retro_seen', 'settings_seen','task_seen') if k in a}
     if action == 'work_start':
+        mode=call('project_mode',{'project':project})
+        if not mode['enabled']:
+            return {'scrum_enabled':False,'pending_handoff':mode['pending_handoff'],
+                    'checkpoint':{'should_stop':True,'status':'disabled','reason':'SCRUM is off for this project'},
+                    'next_step':'Continue the user request without Scrum. Respect any in-flight handoff before editing overlapping files.'}
         actor = a.get('actor')
         if actor is None:
             if not a.get('identity') or not a.get('name'):

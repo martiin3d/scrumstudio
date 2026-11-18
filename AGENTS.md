@@ -6,6 +6,8 @@ Use the [agent knowledge map](docs/agents/index.md) when the task needs reposito
 
 ## Work coordination
 
+Before starting interactive Scrum coordination, run `python scrum.py mode` from this checkout. When `enabled` is false, handle the user's request directly without starting a Scrum session, planning tasks or requesting quota. Respect any pending handoff and existing file reservations. A supervisor-supplied claim already passed the startup gate.
+
 Prefer the first-party native `scrum.py` CLI for Scrum coordination; use the `scrum-studio` MCP when explicitly selected. Follow the `scrum-work` skill (it covers start, resume, planning, claims, verification, finish and handoff). The board is **SCRUM**, stored in this checkout's ignored `.scrum/`; find it with `projects` by matching this checkout folder, never a hardcoded ID or path. If none exists, open/create one for this folder through the selected coordination channel.
 
 - Identity: Codex `agent:scrum:codex-primary`, Claude `agent:scrum:claude-primary`, or the distinct worker actor a CLI bridge supplies. Concurrent workers need distinct identities.

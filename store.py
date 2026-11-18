@@ -582,7 +582,7 @@ def legacy_run(action, a, path=None, locks=None):
         if action == 'task_search':
             import context_tools
             return context_tools.search(db,project,prefix,a)
-        if action in ['agent_checkpoint','agent_status','project_control']:
+        if action in ['agent_checkpoint','agent_status','project_control','project_mode']:
             return runtime.operation(db,action,a,project,actor_user,required,now,activity)
         if action == 'agent_interaction':
             import agent_interactions
