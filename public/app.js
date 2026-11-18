@@ -78,7 +78,6 @@ function initDesktopWorkspace(){
   const profile=sidebar.querySelector('.aside-bottom');
   tools.append(profile.querySelector('[data-page="AI workflow"]'));
   profile.replaceChildren($('.user-controls'));
-  $('#content').after($('#agent-controls'));
 }
 
 function renderDesktopProjects(){
@@ -1145,7 +1144,9 @@ function renderProjects(){
 
 function renderAgentControls(){
   const panel=$('#agent-controls');panel.hidden=!project||['Projects','Wiki'].includes(page);
-  const r=state.runtime;if(!r)return;
+  const r=state.runtime;
+  $('#agent-feedback').hidden=panel.hidden||!r;
+  if(!r)return;
   $('#agent-counts').textContent=`${r.active_agents} active agents · ${r.active_tasks} active tasks · ${r.workflow?.effective||'Standard'} workflow (${r.workflow?.configured||'Auto'})`;
   $('#agent-counts').title=r.workflow?.reason||'';
   let readiness=r.wakeup;
