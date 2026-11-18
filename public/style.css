@@ -257,6 +257,13 @@ html.desktop-mode[data-theme] .column { background: var(--column-bg); min-height
 .desktop-inspector .modal-heading h2 { font-size: 16px; }
 .desktop-inspector .task-editor-layout { grid-template-columns: minmax(0,1fr); gap: 14px; }
 .desktop-inspector .task-editor-meta { border-left: 0; border-top: 1px solid var(--border-color); padding: 0; }
+.desktop-inspector #reference-file { max-width: 100%; min-width: 0; }
+.desktop-inspector .timing-content .lock-table td:first-child { min-width: 0; }
+@media (min-width: 1000px) {
+  html.desktop-mode { --desktop-inspector-width: clamp(560px, 48vw, 760px); }
+  .desktop-inspector .task-editor-layout { grid-template-columns: minmax(0, 1fr) minmax(205px, 36%); gap: 20px; }
+  .desktop-inspector .task-editor-meta { border-left: 1px solid var(--border-color); border-top: 0; padding-left: 16px; }
+}
 .desktop-inspector .form-footer {
   position: sticky;
   bottom: 0;
