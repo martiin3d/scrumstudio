@@ -284,6 +284,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
             'Use the supplied scope and saved continuity directly; implement only the remaining work. '
             'Start with one grouped read of the relevant planned source. Read the check implementation only if its scope is unclear or it fails. Preserve unrelated content. '
             'The claim below is already current: do not refetch it or repeat checkout diagnostics unless scope is missing or a real discrepancy appears. '
+            'For missing task context, use the native CLI show with the supplied task code; avoid wildcard or recursive reads of .scrum metadata. '
             'Do not rerun already recorded baseline checks. Run current acceptance after editing; reuse a passing receipt only while its inputs match. '
             'The inherited private SCRUM_CLI_CONTEXT handles ownership. Keep it private. '
             'For routine execution, the supplied instructions suffice. On an exception, follow the resolved Scrum reference if supplied; otherwise locate it via the provider catalog. '

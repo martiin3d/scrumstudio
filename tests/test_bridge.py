@@ -202,6 +202,8 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(sections['_budget']['renderer'],'resume')
         self.assertIn('one grouped read',prompt)
         self.assertIn('do not refetch it',prompt)
+        self.assertIn('native CLI show with the supplied task code',prompt)
+        self.assertIn('avoid wildcard or recursive reads of .scrum metadata',prompt)
         self.assertIn('Do not rerun already recorded baseline checks',prompt)
         self.assertIn(json.dumps(reference),prompt)
         self.assertIn('any failed check must prevent finish',prompt)
