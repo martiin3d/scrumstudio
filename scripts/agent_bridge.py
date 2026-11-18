@@ -425,7 +425,8 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
         if prepared:
             guidance=(' For facts covered by the prepared section or diff, use the supplied snapshot directly. '
                       'Read the relevant source when acceptance needs details outside the snapshot, it changed, or before editing it. '
-                      'Run all required acceptance checks and use the exact finish command. Refer to scrum-work for exceptions.')
+                      f'Skip routine status/show. If context is missing, use the same CLI prefix with show --task {task["code"]}; status is project-wide. '
+                      'Run required checks and finish.')
             exact=f'Finish: {cli} finish --task {task["code"]} --evidence TEXT'
             candidate={**parts,'rules':parts['rules'].replace(
                 'Use scrum-work for the supplied project, actor and checkout. ', '',1).replace(
@@ -438,7 +439,7 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
                 cli_reference=manifest.parent/'references/cli.md'
                 if cli_reference.is_file():reference['cli']=cli_reference.as_posix()
                 reference_text=('Scrum procedure on demand: '+json.dumps(reference,ensure_ascii=False)+
-                    '. Use the supplied scope and finish command for routine work. Open the relevant resolved file only when needed; do not guess installation paths.')
+                    '. Skip these files in routine work. Read the relevant one for a required skill or missing procedure; use the resolved path.')
                 with_reference={**candidate,'resume_reference':reference_text}
                 if len('\n'.join(value for value in with_reference.values() if value).encode('utf-8'))<=STARTUP_BUDGET_BYTES:
                     candidate=with_reference

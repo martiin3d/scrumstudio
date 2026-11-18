@@ -249,7 +249,8 @@ class BridgeTest(unittest.TestCase):
                 with patch.object(agent_bridge,'scrum_work_manifest',return_value=manifest):
                     prompt=agent_bridge.cli_prompt(1,root,9,'codex',{}, {},started)
                     self.assertIn(reference.as_posix(),prompt)
-                    self.assertIn('only when needed; do not guess installation paths',prompt)
+                    self.assertIn('Skip these files in routine work',prompt)
+                    self.assertIn('for a required skill or missing procedure',prompt)
                     with patch.object(agent_bridge,'scrum_work_manifest',return_value=Path('x'*5000)):
                         bounded=agent_bridge.cli_prompt(1,root,9,'codex',{}, {},started)
                         self.assertIn('Supervisor prepared read-only context:',bounded)
@@ -257,6 +258,8 @@ class BridgeTest(unittest.TestCase):
                 self.assertIn('use the supplied snapshot directly',prompt)
                 self.assertIn('details outside the snapshot',prompt)
                 self.assertIn('finish --task FIX-7 --evidence TEXT',prompt)
+                self.assertIn('Skip routine status/show',prompt)
+                self.assertIn('show --task FIX-7; status is project-wide',prompt)
                 self.assertFalse(agent_bridge.prepared_resume_context(root,{'batch':[1]},started))
                 self.assertFalse(agent_bridge.prepared_resume_context(root,{},started|{'dirty_planned':['other.py']}))
                 review.return_value={'diff':'+partial','truncated':True}
