@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 from unittest.mock import Mock,patch
 import test_storage
@@ -55,6 +56,35 @@ class IdleRefreshTest(unittest.TestCase):
             self.assertEqual(result['data']['metrics']['end_at'],now)
             self.assertTrue(result['data']['coordination']['interval_filtered'])
             spy.assert_any_call('project_metrics',{'project':p,'days':30,'include_series':True,'filter_period':'wakeup:1'})
+
+    def test_metrics_show_scoped_tokens_by_provider_and_keep_unknown_counts(self):
+        project,_=self.project()
+        other,_=self.project('Other')
+        now=time.time()
+
+        def record(run_id,client,input_tokens,cached,output,write=0,at=now,scope=project):
+            source={'claude':'claude-run-summary','codex':'codex-terminal-turn'}[client]
+            report=dict(run_id=run_id,model='',tasks=[],source=source if input_tokens is not None else 'unavailable',
+                        input_tokens=input_tokens,cached_input_tokens=cached,output_tokens=output,
+                        cache_write_input_tokens=write,reasoning_output_tokens=None)
+            with patch('execution_usage.time.time',return_value=at):
+                run('agent_checkpoint',dict(project=scope,actor=self.agent,client=client,action='offline',cli_usage_report=report))
+
+        record('codex-known','codex',100,80,10)
+        record('claude-known','claude',30,40,5,write=10)
+        record('codex-missing','codex',None,None,None,write=None)
+        record('old','codex',500,300,20,at=now-10*86400)
+        record('separate-workspace','codex',900,100,20,scope=other)
+        spy=Mock(wraps=run)
+        usage=web_refresh.refresh({'project':project,'page':'Metrics','days':7},spy)['data']['tokenUsage']
+        self.assertEqual((usage['known_runs'],usage['runs'],usage['partial']),(2,3,True))
+        self.assertEqual((usage['input_tokens'],usage['cached_input_tokens'],usage['uncached_input_tokens'],usage['output_tokens'],usage['total_tokens']),(180,120,60,15,195))
+        self.assertEqual([(r['client'],r['known_runs'],r['runs'],r['total_tokens']) for r in usage['providers']],
+                         [('claude',1,1,85),('codex',1,2,110)])
+        self.assertNotIn('cli_usage_audit',[call.args[0] for call in spy.call_args_list])
+        empty=run('cli_usage_overview',dict(project=project,start_at=0,end_at=1))
+        self.assertEqual(empty['runs'],0)
+        self.assertIsNone(empty['total_tokens'])
 
     def test_control_signal_is_only_updated_by_control_mutations(self):
         p,folder=self.project();before=idle_signals.stamp(folder)

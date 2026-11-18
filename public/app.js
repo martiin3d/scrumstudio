@@ -27,14 +27,79 @@ async function loadUsers(){
   $('#current-user').value=actor||'';
 }
 async function moveTask(id,status,fields={}){
+  const selected=project,auth=credentials(id);
   if(status==='In Progress'){
-    const claim=await api('task_update',{project,id,...credentials(id),...fields,status,claim:true});
+    const claim=await api('task_update',{project:selected,id,...auth,...fields,status,claim:true});
     if(claim.claimed===false)throw Error('Files reserved by another task: '+claim.conflicts.map(c=>c.path).join(', '));
-    claims[`${project}:${id}`]={actor,token:claim.token};saveClaims();
-  }else await api('task_update',{project,id,...credentials(id),...fields,status});
+    claims[`${selected}:${id}`]={actor:auth.actor,token:claim.token};saveClaims();
+  }else await api('task_update',{project:selected,id,...auth,...fields,status});
 }
 let project = Number(localStorage.getItem('scrum-project')) || null, page = 'Board', state = {tasks:[],notes:[]}, projects = [], editing;
+const editor = $('#editor');
+const desktopMode = new URLSearchParams(location.search).get('desktop') === '1';
+let taskOpenSerial = 0, editorCleanup, inspectorDirty = false;
+let chatView;
+const chatDrafts = new Map();
+document.documentElement.classList.toggle('desktop-mode', desktopMode);
+if(desktopMode){
+  $('.brand').href='/?desktop=1';
+  $('.brand').onclick=canLeaveInspector;
+  initDesktopWorkspace();
+}
+editor.setAttribute('aria-labelledby','dialog-title');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function initDesktopWorkspace(){
+  const sidebar=$('body > aside'), tools=sidebar.querySelector('nav');
+  const workspace=document.createElement('nav');
+  workspace.className='desktop-workspace-nav';
+  workspace.setAttribute('aria-label','Workspace views');
+  for(const name of ['Board','Wiki','Notes','Chat'])workspace.append(tools.querySelector(`[data-page="${name}"]`));
+
+  const section=document.createElement('section');
+  section.className='desktop-projects';
+  section.setAttribute('aria-labelledby','desktop-project-heading');
+  section.innerHTML='<div class="desktop-project-heading"><h2 id="desktop-project-heading">Projects</h2></div><div id="desktop-project-list"></div>';
+  section.querySelector('#desktop-project-list').onclick=e=>{
+    const button=e.target.closest('[data-project-id]');
+    if(button)selectProject(Number(button.dataset.projectId));
+  };
+  const add=$('#new-project');
+  add.textContent='＋';
+  add.setAttribute('aria-label','New project');
+  add.title='New project';
+  section.firstElementChild.append(add);
+  tools.before(section,workspace);
+  sidebar.querySelectorAll('.workspace-label').forEach(label=>label.remove());
+  $('#project').hidden=true;
+
+  tools.className='desktop-tools';
+  tools.setAttribute('aria-label','Workspace tools');
+  const profile=sidebar.querySelector('.aside-bottom');
+  tools.append(profile.querySelector('[data-page="AI workflow"]'));
+  profile.replaceChildren($('.user-controls'));
+  $('#content').after($('#agent-controls'));
+}
+
+function renderDesktopProjects(){
+  const list=$('#desktop-project-list');
+  if(list.childElementCount!==projects.length){
+    list.replaceChildren(...projects.map(()=>{
+      const button=document.createElement('button');
+      button.type='button';
+      return button;
+    }));
+  }
+  projects.forEach((p,i)=>{
+    const button=list.children[i];
+    button.dataset.projectId=p.id;
+    button.textContent=p.name;
+    button.title=p.available===false?`${p.name} · unavailable`:p.name;
+    button.disabled=p.available===false;
+    if(p.id===project)button.setAttribute('aria-current','true');
+    else button.removeAttribute('aria-current');
+  });
+}
 async function api(action, args={}) {
   const r = await fetch('/api/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(args)});
   const data = await r.json(); if(!r.ok) throw Error(data.error); return data;
@@ -61,6 +126,15 @@ async function refresh(conditional=false){
     state={tasks:[],notes:[],wiki:data};
     render();return;
   }
+  if(selected && selectedPage==='Chat'){
+    const [snapshot,chat,interactions]=await Promise.all([
+      api('snapshot',{project:selected}),api('project_chat',{project:selected}),api('agent_interaction',{project:selected})
+    ]);
+    if(selected!==project||selectedPage!==page||serial!==refreshSerial)return;
+    state={...snapshot,chat,interactions};users=state.users||users;
+    localStorage.setItem('scrum-project',selected);
+    render();return;
+  }
   if(project&&!['Projects','Settings','Chat'].includes(page)){
     const key=`${project}:${page}:${metricDays}:${metricSession}`;
     const result=await api('web_refresh',{project,page,days:metricDays,...(metricSession?{filter_period:metricSession}:{}),...(conditional&&refreshVersions[key]?{version_seen:refreshVersions[key]}:{})});
@@ -75,7 +149,6 @@ async function refresh(conditional=false){
   if(project&&page==='Settings')state.mcpServers=await api('mcp_servers',{project});
   if(project&&page==='File locks')state.fileLocks=await api('file_locks',{project});
   if(project&&page==='Agents')state.managedAgents=await api('agent_manage',{project,action:'list'});
-  if(project&&page==='Chat'){state.chat=await api('project_chat',{project});state.interactions=await api('agent_interaction',{project});}
   if(project&&page==='Metrics'){
     const flow=await api('project_metrics',{project,days:metricDays,include_series:true,...(metricSession?{filter_period:metricSession}:{})});
     const coordination=await api('coordination_metrics',{project,include_periods:true,start_at:flow.start_at,end_at:flow.end_at,...(metricSession?{filter_period:metricSession}:{})});
@@ -87,13 +160,15 @@ async function refresh(conditional=false){
 function humanReviewTag(t){return t.status==='In Review'&&t.review?.awaiting_human?'<span class="human-review-tag">Waiting for human review</span>':'';}
 function render(){
   renderAgentControls();
+  if(desktopMode){$('main').dataset.page=page;renderDesktopProjects();}
   const name=projects.find(p=>p.id===project)?.name || 'Your workspace';
-  $('#breadcrumb').textContent=`${name} / ${page}`;
-  $('#heading').textContent=page==='Board' ? name : page;
-  $('#subtitle').textContent=({Board:'A clear view of what’s next, what’s moving, and what’s done.',Notes:'Human notes and explicit task reminders. Only pending AI reminders enter agent context.','AI workflow':'A compact workflow that keeps your agent and board in sync.',Users:'Manage local user profiles while preserving authored history.',Agents:'Activity, real provider usage and project control signals.',Projects:'Open project folders, export portable data and manage this local panel.',Chat:'Project coordination for humans and agents. Refresh only when needed.',Metrics:'Understand flow, waiting time and completion trends.',Settings:'Project policies, workspace and completion requirements.','File locks':'Coordinate file edits before work starts. File reservations are isolated to this project checkout.'})[page];
+  $('#breadcrumb').textContent=desktopMode?name:`${name} / ${page}`;
+  $('#heading').textContent=page==='Board' && !desktopMode ? name : page;
+  $('#subtitle').textContent=({Board:'A clear view of what’s next, what’s moving, and what’s done.',Notes:'Human notes and explicit task reminders. Only pending AI reminders enter agent context.','AI workflow':'A compact workflow that keeps your agent and board in sync.',Users:'Manage local user profiles while preserving authored history.',Agents:'Activity, real provider usage and project control signals.',Projects:'Open project folders, export portable data and manage this local panel.',Chat:'Project messages and requests from agents.',Metrics:'Understand flow, waiting time and completion trends.',Settings:'Project policies, workspace and completion requirements.','File locks':'Coordinate file edits before work starts. File reservations are isolated to this project checkout.'})[page];
   const view=taskView();
   $('#view-label').textContent=page==='Board'?(view.mode==='list'?'Task list':'Kanban board'):page==='AI workflow'?'Agent workspace':page==='Projects'?'Project directory':page==='Agents'?'Agent activity':page==='Notes'?'Project notes':`${page} notes`;
   $('#board-views').hidden=page!=='Board';$('#list-options').hidden=page!=='Board'||view.mode!=='list';
+  $('main > .toolbar').hidden=['Chat','Wiki'].includes(page);
   document.querySelectorAll('[data-board-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.boardView===view.mode)));
   $('#task-group').value=view.group;$('#task-sort').value=view.sort;
   $('#task-sort-direction').textContent=view.direction==='asc'?'↑ Ascending':'↓ Descending';
@@ -121,9 +196,13 @@ function render(){
   if(page==='File locks'){renderFileLocks();return;}
   if(page==='Board'){
     if(view.mode==='list'){renderTaskList(tasks,view);return;}
+    const boardScroll=desktopMode?$('.board')?.scrollLeft:0;
+    const columnScroll=desktopMode?[...document.querySelectorAll('.board .column')].map(c=>c.scrollTop):[];
     $('#content').innerHTML='<div class="board">'+statuses.map((s,i)=>`<section class="column" data-status="${s}" title="${s==='Backlog'?'Parked until you move the task to To do; agents never activate it automatically.':''}" style="--tone:${tones[i]}"><div class="column-head"><span class="status-dot"></span>${s==='TODO'?'To do':s}<i>${tasks.filter(t=>t.status===s).length}</i><button data-create="${s}" aria-label="Add task">＋</button></div>${tasks.filter(t=>t.status===s).map(t=>`<button draggable="true" class="card" data-task="${t.id}"><span class="card-id">${state.runtime?.active_task_ids.includes(t.id)?'<span class="active-task-dot" role="img" aria-label="Active on this task" title="Recent agent heartbeat and live task claim"></span>':''}${esc(t.code)}</span><span class="category-tag">${esc(t.category)}</span><h3>${esc(t.title)}</h3>${humanReviewTag(t)}${t.description?`<p>${esc(t.description.slice(0,130))}</p>`:''}${t.dependencies.length?`<p>Prerequisites: ${t.dependencies.map(id=>{const d=state.tasks.find(d=>d.id===id);return esc(d?`${d.code} (${d.status})`:id);}).join(', ')}</p>`:''}${t.status==='Cancelled'?`<p>Cancelled: ${esc(t.cancel_reason.slice(0,130))}</p>`:''}${t.blocked_reason?`<p>⚑ ${esc(t.blocked_reason)}</p>`:''}${t.continuity&&!t.locked&&['TODO','Blocked','In Progress'].includes(t.status)?`<p class="resume-hint" title="${esc(t.continuity)}">⏸ Resumable · ${esc(t.continuity.split('\n')[0].slice(0,110))}</p>`:''}${t.checklist.length?`<p class="checklist-progress">☑ ${t.checklist.filter(i=>i.done).length}/${t.checklist.length} completed</p>`:''}<div class="card-footer"><span class="priority p${t.priority}">${t.priority===1?'↑ High':t.priority===3?'↓ Low':'＝ Normal'}</span><span class="task-owner">${t.locked?'🔒 ':''}${esc(users.find(u=>u.id===t.owner_id)?.name||'Unassigned')}</span></div></button>`).join('')||'<div class="empty-column">No tasks here yet</div>'}</section>`).join('')+'</div>';
     document.querySelectorAll('[data-task]').forEach(b=>{b.onclick=()=>openTask(state.tasks.find(t=>t.id===+b.dataset.task));b.ondragstart=e=>e.dataTransfer.setData('text/plain',b.dataset.task);});
     document.querySelectorAll('[data-create]').forEach(b=>b.onclick=()=>openTask(undefined,b.dataset.create==='Backlog'?'Backlog':'TODO'));
+    if(boardScroll)$('.board').scrollLeft=boardScroll;
+    columnScroll.forEach((top,i)=>{if(top)$('.board').children[i].scrollTop=top;});
     document.querySelectorAll('.column').forEach(c=>{c.ondragover=e=>e.preventDefault();c.ondrop=async e=>{e.preventDefault();const id=Number(e.dataTransfer.getData('text/plain'));const t=state.tasks.find(t=>t.id===id);if(!t)return;if(c.dataset.status==='Blocked'||(['Done','Cancelled'].includes(c.dataset.status)&&t.status!==c.dataset.status)){openTask({...t,status:c.dataset.status});return;}try{await moveTask(id,c.dataset.status);await refresh();}catch(e){error(e);}};});
   }else{
     const notes=state.notes;
@@ -171,15 +250,29 @@ function field(label,name,value='',type='text'){return `<label class="field">${l
 function duration(seconds){if(seconds===null||seconds===undefined)return '—';if(seconds<60)return `${Math.round(seconds)}s`;if(seconds<3600)return `${Math.round(seconds/60)}m`;if(seconds<86400)return `${(seconds/3600).toFixed(1)}h`;return `${(seconds/86400).toFixed(1)}d`;}
 function metricBars(entries,format=String){
   const max=Math.max(1,...entries.map(e=>e.value||0));
-  return entries.map(e=>`<div class="metric-bar-row"><span>${esc(e.label)}</span><div class="metric-bar-track"><i style="width:${100*(e.value||0)/max}%;background:${e.color||'#6ca48a'}"></i></div><b>${esc(format(e.value))}</b></div>`).join('');
+  return entries.map(e=>`<div class="metric-bar-row"><span>${esc(e.label)}</span><div class="metric-bar-track"><i style="width:${100*(e.value||0)/max}%;background:${e.color||'#5f86cf'}"></i></div><b>${esc(format(e.value))}</b></div>`).join('');
 }
+function renderTokenUsage(usage){
+  const panel=document.createElement('article');
+  panel.className='metric-panel token-usage';
+  const count=n=>n==null?'—':Number(n).toLocaleString();
+  const coverage=usage.runs?`${count(usage.known_runs)} of ${count(usage.runs)} recorded executions reported both input and output.`:'No execution records in this period.';
+  const counters=[['Recorded total',usage.total_tokens],['Input',usage.input_tokens],['Cache reads',usage.cached_input_tokens],['Input outside cache reads',usage.uncached_input_tokens],['Output',usage.output_tokens]];
+  panel.innerHTML=`<h2>Token usage</h2><p>${coverage} Totals cover those executions. Runs are counted at the time their usage was recorded.</p>
+    <div class="metric-kpis">${counters.map(([label,value])=>`<article><span>${label}</span><strong>${count(value)}</strong></article>`).join('')}</div>
+    ${usage.providers.length?`<div class="lock-table-wrap"><table class="lock-table"><thead><tr><th>Provider</th><th>Measured / recorded</th><th>Input</th><th>Cache reads</th><th>Output</th><th>Total</th></tr></thead><tbody>${usage.providers.map(r=>`<tr><td>${esc(({codex:'Codex',claude:'Claude'})[r.client]||r.client)}</td><td>${count(r.known_runs)} / ${count(r.runs)}</td><td>${count(r.input_tokens)}</td><td>${count(r.cached_input_tokens)}</td><td>${count(r.output_tokens)}</td><td>${count(r.total_tokens)}</td></tr>`).join('')}</tbody></table></div>`:''}
+    <p>Input includes cache reads. Input outside cache reads includes Claude cache writes when reported. A dash means unavailable. Unreported or in-flight usage may be missing.</p>`;
+  $('#content .metrics-range').after(panel);
+}
+
 function renderMetrics(){
   const m=state.metrics;
   const series=m.daily||[];
   const max=Math.max(1,...series.map(d=>Math.max(d.done,d.cancelled)));
   const line=key=>series.map((d,i)=>`${24+i*552/Math.max(1,series.length-1)},${154-130*d[key]/max}`).join(' ');
   const states=statuses.filter(s=>!['Done','Cancelled'].includes(s));
-  $('#content').innerHTML=`<section class="metrics"><div class="metrics-range"><label>Period <select id="metric-days"><option value="7">Last 7 UTC dates</option><option value="30">Last 30 UTC dates</option><option value="90">Last 90 UTC dates</option><option value="session">By session</option></select></label><span>Interval: ${esc(new Date(m.from_utc).toLocaleString())} → ${esc(new Date(m.as_of_utc).toLocaleString())}. Calendar time, including waiting.</span></div><div class="metric-kpis"><article><span>Tasks worked on · selection</span><strong>${m.worked_tasks??m.total_tasks}</strong><small>Recorded activity in this interval</small></article><article><span>Tasks completed · period</span><strong>${m.completed_tasks}</strong><small>${m.done_transitions} Done transitions, including re-completions</small></article><article><span>Average cycle time</span><strong>${duration(m.average_cycle_seconds)}</strong><small>${m.cycle_samples} complete tracked samples</small></article><article><span>Time blocked · period</span><strong>${m.blocked_time_percent}%</strong><small>Share of observed nonterminal state time</small></article></div><div class="metric-panels"><article class="metric-panel"><h2>Worked tasks by status</h2><p>Status at interval end. Activity includes planning/metadata edits; it does not mean every task was executed.</p>${metricBars(statuses.map((s,i)=>({label:s,value:(m.period_distribution||m.distribution)[s],color:tones[i]})))}<details><summary>Current board · ${m.open_tasks} open / ${m.total_tasks} total (not interval-filtered)</summary>${metricBars(statuses.map((s,i)=>({label:s,value:m.distribution[s],color:tones[i]})))}</details></article><article class="metric-panel"><h2>Average observed time per state</h2><p>Per task observed in the state during this period; partial visits included.</p>${metricBars(states.map(s=>({label:s,value:m.average_observed_state_seconds[s],color:tones[statuses.indexOf(s)]})),duration)}<p>Average lead time: <b>${duration(m.average_lead_seconds)}</b> (${m.lead_samples} samples).</p></article><article class="metric-panel flow-panel"><h2>Completion & cancellation flow</h2><p>State transitions per UTC date; a reopened task can finish more than once.</p><svg class="flow-chart" role="img" aria-label="Daily Done and Cancelled transitions" viewBox="0 0 600 190"><line x1="24" x2="576" y1="154" y2="154" stroke="currentColor" opacity=".2"/><text x="2" y="22" fill="currentColor" font-size="11">${max}</text><polyline points="${line('done')}" fill="none" stroke="#65a887" stroke-width="3"/><polyline points="${line('cancelled')}" fill="none" stroke="#ba8c8c" stroke-width="2"/><text x="24" y="181" fill="currentColor" font-size="11">${esc(series[0]?.date||'')}</text><text x="576" y="181" text-anchor="end" fill="currentColor" font-size="11">${esc(series.at(-1)?.date||'')}</text></svg><div class="chart-legend"><span>● Done</span><span>● Cancelled</span></div><details><summary>View daily data</summary><table class="lock-table"><thead><tr><th>UTC date</th><th>Done</th><th>Cancelled</th></tr></thead><tbody>${series.map(d=>`<tr><td>${esc(d.date)}</td><td>${d.done}</td><td>${d.cancelled}</td></tr>`).join('')}</tbody></table></details></article></div><p class="metrics-note">${m.legacy_tasks} tasks have history from before time tracking. Their earlier time is unknown; they are excluded from lead/cycle averages. Cycle time runs from first In Progress to latest Done; lead time runs from creation. These measure calendar flow, not agent CPU time or token usage.</p></section>`;
+  $('#content').innerHTML=`<section class="metrics"><div class="metrics-range"><label>Period <select id="metric-days"><option value="7">Last 7 UTC dates</option><option value="30">Last 30 UTC dates</option><option value="90">Last 90 UTC dates</option><option value="session">By session</option></select></label><span>Interval: ${esc(new Date(m.from_utc).toLocaleString())} → ${esc(new Date(m.as_of_utc).toLocaleString())}. Calendar time, including waiting.</span></div><div class="metric-kpis"><article><span>Tasks worked on · selection</span><strong>${m.worked_tasks??m.total_tasks}</strong><small>Recorded activity in this interval</small></article><article><span>Tasks completed · period</span><strong>${m.completed_tasks}</strong><small>${m.done_transitions} Done transitions, including re-completions</small></article><article><span>Average cycle time</span><strong>${duration(m.average_cycle_seconds)}</strong><small>${m.cycle_samples} complete tracked samples</small></article><article><span>Time blocked · period</span><strong>${m.blocked_time_percent}%</strong><small>Share of observed nonterminal state time</small></article></div><div class="metric-panels"><article class="metric-panel"><h2>Worked tasks by status</h2><p>Status at interval end. Activity includes planning/metadata edits; it does not mean every task was executed.</p>${metricBars(statuses.map((s,i)=>({label:s,value:(m.period_distribution||m.distribution)[s],color:tones[i]})))}<details><summary>Current board · ${m.open_tasks} open / ${m.total_tasks} total (not interval-filtered)</summary>${metricBars(statuses.map((s,i)=>({label:s,value:m.distribution[s],color:tones[i]})))}</details></article><article class="metric-panel"><h2>Average observed time per state</h2><p>Per task observed in the state during this period; partial visits included.</p>${metricBars(states.map(s=>({label:s,value:m.average_observed_state_seconds[s],color:tones[statuses.indexOf(s)]})),duration)}<p>Average lead time: <b>${duration(m.average_lead_seconds)}</b> (${m.lead_samples} samples).</p></article><article class="metric-panel flow-panel"><h2>Completion & cancellation flow</h2><p>State transitions per UTC date; a reopened task can finish more than once.</p><svg class="flow-chart" role="img" aria-label="Daily Done and Cancelled transitions" viewBox="0 0 600 190"><line x1="24" x2="576" y1="154" y2="154" stroke="currentColor" opacity=".2"/><text x="2" y="22" fill="currentColor" font-size="11">${max}</text><polyline points="${line('done')}" fill="none" stroke="var(--accent)" stroke-width="3"/><polyline points="${line('cancelled')}" fill="none" stroke="#ba8c8c" stroke-width="2"/><text x="24" y="181" fill="currentColor" font-size="11">${esc(series[0]?.date||'')}</text><text x="576" y="181" text-anchor="end" fill="currentColor" font-size="11">${esc(series.at(-1)?.date||'')}</text></svg><div class="chart-legend"><span>● Done</span><span>● Cancelled</span></div><details><summary>View daily data</summary><table class="lock-table"><thead><tr><th>UTC date</th><th>Done</th><th>Cancelled</th></tr></thead><tbody>${series.map(d=>`<tr><td>${esc(d.date)}</td><td>${d.done}</td><td>${d.cancelled}</td></tr>`).join('')}</tbody></table></details></article></div><p class="metrics-note">${m.legacy_tasks} tasks have history from before time tracking. Their earlier time is unknown; they are excluded from lead/cycle averages. Cycle time runs from first In Progress to latest Done; lead time runs from creation. These measure calendar flow, not agent CPU time or token usage.</p></section>`;
+  if(state.tokenUsage)renderTokenUsage(state.tokenUsage);
   const activityNote=document.createElement('p');activityNote.className='metrics-note';activityNote.textContent=`Actual In Progress overlap: ${m.attempted_tasks??'unknown'} tasks; planning/metadata only: ${m.metadata_only_tasks??'unknown'}. Returns from In Progress to TODO: ${m.todo_returns_after_work??'unknown'}; Done tasks reopened: ${m.reopened_done_tasks??'unknown'}. These counts are not tokens or failure counts.`;$('#content .metrics').append(activityNote);
   $('#metric-days').value=metricBySession?'session':metricDays;
   const sessions=state.coordination?.periods||[];
@@ -335,7 +428,34 @@ function openFileReservation(){
   const tasks=state.tasks.filter(t=>!['Done','In Review','Cancelled'].includes(t.status));
   modal('Claim task & reserve files',`<label class="field">Task<select name="task" required><option value="">Choose task</option>${tasks.map(t=>`<option value="${t.id}">${esc(t.code)} · ${esc(t.title)}</option>`).join('')}</select></label>${field('Files (one relative or absolute path per line)','paths','','textarea')}<p>The task and files are claimed together. A conflict leaves the task unchanged.</p>`,async f=>{const id=Number(f.get('task'));const paths=f.get('paths').split('\n').map(p=>p.trim()).filter(Boolean);if(!paths.length)throw Error('Enter at least one file path.');const r=await api('task_claim',{project,id,...credentials(id),files:paths});if(r.claimed===false)throw Error('File conflict: '+r.conflicts.map(c=>c.path).join(', '));claims[`${project}:${id}`]={actor,token:r.token};saveClaims();await refresh();});
 }
-function modal(title,fields,save,saveLabel='Save changes'){$('#editor').classList.remove('task-editor');$('#editor-form button[type=submit]').textContent=saveLabel;$('#dialog-title').textContent=title;$('#fields').innerHTML=fields;$('#form-error').textContent='';editing=save;$('#editor').showModal();}
+function canLeaveInspector(){
+  return !editor.matches('.desktop-inspector[open]') || !inspectorDirty || confirm('Discard unsaved task edits?');
+}
+function leaveInspector(){
+  if(!canLeaveInspector())return false;
+  ++taskOpenSerial;
+  if(editor.matches('.desktop-inspector[open]'))editor.close();
+  return true;
+}
+function modal(title,fields,save,saveLabel='Save changes',docked=false){
+  if(!docked && !leaveInspector())return false;
+  editorCleanup?.();
+  editorCleanup=undefined;
+  inspectorDirty=false;
+  editor.classList.remove('task-editor');
+  editor.classList.toggle('desktop-inspector',docked);
+  $('#editor-form button[type=submit]').textContent=saveLabel;
+  $('#dialog-title').textContent=title;
+  $('#fields').innerHTML=fields;
+  $('#form-error').textContent='';
+  editing=save;
+  if(docked){
+    if(!editor.open)editor.show();
+    editor.scrollTop=0;
+    $('#close').focus({preventScroll:true});
+  }else editor.showModal();
+  return true;
+}
 const wikiPages=new Map();
 
 function openProject(){
@@ -359,33 +479,65 @@ function wikiPath(pagePath,target){
 }
 
 function renderWikiText(body,pagePath,pages){
-  let code=false;
-  const renderLine=line=>{
-    if(/^\s{0,3}(`{3,}|~{3,})/.test(line)){code=!code;return code?'<pre><code>':'</code></pre>';}
-    if(code)return esc(line)+'\n';
-    if(/^\s*<!--.*-->\s*$/.test(line))return '';
-    let inline='',last=0;
-    const links=/\[([^\]]+)\]\(([^\s)]+)\)/g;
-    for(const match of line.matchAll(links)){
-      inline+=esc(line.slice(last,match.index));
-      const link=wikiPath(pagePath,match[2]),label=esc(match[1]);
-      if(link?.external)inline+='<a rel="noreferrer" href="'+esc(link.external)+'">'+label+'</a>';
-      else if(link&&(pages.includes(link.path)||link.path==='docs/agents/index.md'))inline+='<button class="wiki-link" data-wiki-page="'+esc(link.path)+'" data-wiki-anchor="'+esc(link.anchor)+'">'+label+'</button>';
-      else if(link)inline+='<button class="wiki-link" data-wiki-source="'+esc(link.path)+'">'+label+'</button>';
-      else inline+=label;
+  const inline=text=>{
+    const tokens=/`([^`]+)`|\[([^\]]+)\]\(([^\s)]+)\)|\*\*([^*]+)\*\*|\*([^*]+)\*/g;
+    let html='', last=0;
+    for(const match of text.matchAll(tokens)){
+      const [,code,label,target,bold,emphasis]=match;
+      html+=esc(text.slice(last,match.index));
+      if(code)html+=`<code>${esc(code)}</code>`;
+      else if(bold)html+=`<strong>${esc(bold)}</strong>`;
+      else if(emphasis)html+=`<em>${esc(emphasis)}</em>`;
+      else {
+        const link=wikiPath(pagePath,target);
+        if(link?.external)html+=`<a target="_blank" rel="noopener noreferrer" href="${esc(link.external)}">${esc(label)}</a>`;
+        else if(link&&(pages.includes(link.path)||link.path==='docs/agents/index.md'))html+=`<button type="button" class="wiki-link" data-wiki-page="${esc(link.path)}" data-wiki-anchor="${esc(link.anchor)}">${esc(label)}</button>`;
+        else if(link)html+=`<button type="button" class="wiki-link" data-wiki-source="${esc(link.path)}">${esc(label)}</button>`;
+        else html+=esc(label);
+      }
       last=match.index+match[0].length;
     }
-    inline+=esc(line.slice(last));
-    inline=inline.replace(/`([^`]+)`/g,'<code>$1</code>');
-    const heading=line.match(/^(#{1,6})\s+(.*)$/);
-    if(heading){
+    return html+esc(text.slice(last));
+  };
+  const tableCells=line=>line.trim().replace(/^\||\|$/g,'').split(/(?<!\\)\|/).map(cell=>cell.trim().replaceAll('\\|','|'));
+  const lines=body.split(/\r?\n/), blocks=[], anchors=new Map();
+  const fence=/^ {0,3}(`{3,}|~{3,})/;
+  const list=/^ {0,3}([-+*]|\d+[.)])\s+(.+)$/;
+  let paragraph=[];
+  const flush=()=>{if(paragraph.length){blocks.push(`<p>${inline(paragraph.join(' '))}</p>`);paragraph=[];}};
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i], marker=line.match(fence), heading=line.match(/^ {0,3}(#{1,6})\s+(.+)$/);
+    const item=line.match(list), divider=lines[i+1]?.includes('|')?tableCells(lines[i+1]):[];
+    if(marker){
+      flush();const code=[];
+      while(++i<lines.length){
+        const close=lines[i].match(fence);
+        if(close?.[1].startsWith(marker[1])&&!lines[i].slice(close[0].length).trim())break;
+        code.push(lines[i]);
+      }
+      blocks.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
+    }else if(heading){
+      flush();
       const tag='h'+Math.min(heading[1].length+1,6);
       const anchor=heading[2].toLowerCase().replace(/[^\p{L}\p{N}_ -]/gu,'').replace(/ /g,'-');
-      return '<'+tag+' id="wiki-'+esc(anchor)+'">'+inline.slice(heading[1].length+1)+'</'+tag+'>';
-    }
-    return line.trim()?'<p>'+inline+'</p>':'';
-  };
-  return body.split(/\r?\n/).map(renderLine).join('')+(code?'</code></pre>':'');
+      const duplicate=anchors.get(anchor)||0;
+      anchors.set(anchor,duplicate+1);
+      blocks.push(`<${tag} id="wiki-${esc(anchor)}${duplicate?'-'+duplicate:''}">${inline(heading[2])}</${tag}>`);
+    }else if(line.includes('|')&&divider.length&&divider.every(cell=>/^:?-{3,}:?$/.test(cell))){
+      flush();const header=tableCells(line), rows=[];
+      while(lines[i+2]?.trim().startsWith('|')){rows.push(tableCells(lines[i+2]));i++;}
+      i++;
+      blocks.push(`<div class="wiki-table"><table><thead><tr>${header.map(cell=>`<th scope="col">${inline(cell)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map(cell=>`<td>${inline(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+    }else if(item){
+      flush();const tag=/^\d/.test(item[1])?'ol':'ul', items=[item[2]];
+      let next;
+      while((next=lines[i+1]?.match(list))&&(/^\d/.test(next[1])===(tag==='ol'))){items.push(next[2]);i++;}
+      blocks.push(`<${tag}>${items.map(text=>`<li>${inline(text)}</li>`).join('')}</${tag}>`);
+    }else if(!line.trim()||/^\s*<!--.*-->\s*$/.test(line))flush();
+    else paragraph.push(line.trim());
+  }
+  flush();
+  return blocks.join('');
 }
 
 function renderLearning(list){
@@ -434,19 +586,29 @@ function renderWiki(){
   const skillContent=showingSkills?'<h2>Project skills</h2>'+((wiki.skills??[]).length?
     '<ul>'+wiki.skills.map(item=>`<li><button type="button" class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.name)}</button><p>${esc(item.description)}</p></li>`).join('')+'</ul>':
     '<p>No project skills found.</p>'):'';
-  $('#content').innerHTML=`<section class="wiki-layout"><div class="workflow wiki-nav"><h2>Pages</h2>
-    ${pages.map(path=>`<button data-wiki-page="${esc(path)}" aria-current="${path===wiki.page?'page':'false'}">${esc(path.split('/').at(-1).replace(/\.md$/,'').replace(/-/g,' '))}</button>`).join('')}
-    <button data-wiki-page="project-skills" aria-current="${showingSkills?'page':'false'}">Skills</button>
-    <button id="wiki-check">Check links</button><button id="wiki-reassess">Check sources</button><button id="wiki-spec-impact">Specification impact</button><p id="wiki-result" role="status"></p></div>
-    <article class="workflow wiki-body">${showingSkills?skillContent:wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}
+  const pageLabel=path=>path===pages[0]?'Overview':path.split('/').at(-1).replace(/\.md$/,'').replace(/[-_]/g,' ').replace(/^./,c=>c.toUpperCase());
+  $('#content').innerHTML=`<section class="wiki-layout"><div class="wiki-nav">
+    <nav class="wiki-page-navigation" aria-label="Wiki pages"><h2>Pages</h2>
+      ${pages.map(path=>`<button type="button" data-wiki-page="${esc(path)}" aria-current="${path===wiki.page?'page':'false'}">${esc(pageLabel(path))}</button>`).join('')}
+      <button type="button" data-wiki-page="project-skills" aria-current="${showingSkills?'page':'false'}">Skills</button>
+    </nav>
+    <details class="wiki-tools"><summary>Wiki tools</summary>
+      <button type="button" id="wiki-check">Check links</button><button type="button" id="wiki-reassess">Check sources</button><button type="button" id="wiki-spec-impact">Specification impact</button><p id="wiki-result" role="status"></p>
+    </details></div>
+    <article class="wiki-body"><div class="wiki-article-text">${showingSkills?skillContent:wiki.body!==null?renderWikiText(wiki.body,wiki.page,pages):'<h2>Set up project knowledge</h2><p>Inspect the project and prepare the first milestone.</p>'}</div>
     ${wiki.onboarding!=='applied'?'<button id="wiki-onboarding">Project setup</button>':''}
     <div id="wiki-onboard-content"></div><div id="wiki-source-content"></div><div id="wiki-spec-impact-content"></div>
     ${wiki.page!=='docs/agents/index.md'&&!showingSkills?`<h3>Linked sources</h3>
     ${wiki.sources.filter(item=>item.page===wiki.page).map(item=>`<p><button class="wiki-link" data-wiki-source="${esc(item.path)}">${esc(item.path)}</button> ${esc(item.note)}
       ${actor?`<button data-source-summary="${esc(item.path)}">${item.summary?'Review summary':'Draft summary'}</button>`:''}</p>`).join('')}
-    <button id="wiki-ingest">Link a source</button>`:''}</article></section>
+    <button id="wiki-ingest">Link a source</button>`:''}</article>
+    <nav class="wiki-contents" aria-label="Article contents" hidden><h2>Contents</h2><ol></ol></nav></section>
     ${wiki.proposals.length?`<section class="workflow wiki-proposals"><h2>Proposed updates</h2>${wiki.proposals.map(item=>`<details><summary>${esc(item.page)} · ${esc(item.source_code)}</summary><label class="field">Draft<textarea maxlength="5000" data-wiki-draft="${esc(item.proposal_id)}">${esc(item.draft_markdown)}</textarea></label><p>${esc(item.evidence_excerpt)}</p><button data-wiki-task="${item.source_task}">Open ${esc(item.source_code)}</button> <button data-wiki-publish="${esc(item.proposal_id)}">Apply to wiki</button> <button data-wiki-dismiss="${esc(item.proposal_id)}">Dismiss</button></details>`).join('')}</section>`:''}
     ${wiki.learning?.items.length?'<section class="workflow wiki-proposals" id="wiki-learning"></section>':''}`;
+  const article=$('.wiki-article-text'), contents=$('.wiki-contents');
+  const sections=[...article.querySelectorAll('h2[id],h3[id],h4[id],h5[id],h6[id]')].filter(h=>h!==article.firstElementChild||h.tagName!=='H2');
+  contents.hidden=!sections.length;
+  contents.querySelector('ol').innerHTML=sections.map(h=>`<li class="wiki-content-${h.tagName.toLowerCase()}"><a href="#${esc(h.id)}">${esc(h.textContent)}</a></li>`).join('');
   renderLearning(wiki.learning);
   const showImpact=async(after=0)=>{
     try{
@@ -469,9 +631,13 @@ function renderWiki(){
   };
   $('#wiki-spec-impact').onclick=()=>showImpact();
   $('#content').querySelectorAll('[data-wiki-page]').forEach(button=>button.onclick=async()=>{
-    wikiPages.set(project,button.dataset.wikiPage);
-    await refresh();
-    if(button.dataset.wikiAnchor)document.getElementById('wiki-'+decodeURIComponent(button.dataset.wikiAnchor.slice(1)))?.scrollIntoView();
+    const selected=project, target=button.dataset.wikiPage, anchor=button.dataset.wikiAnchor;
+    try{
+      if(target!==wiki.page){wikiPages.set(selected,target);await refresh();}
+      if(selected!==project||page!=='Wiki')return;
+      if(anchor)document.getElementById('wiki-'+decodeURIComponent(anchor.slice(1)))?.scrollIntoView();
+      else if(target!==wiki.page)$('.wiki-article-text')?.scrollIntoView({block:'nearest'});
+    }catch(e){error(e);}
   });
   $('#content').querySelectorAll('[data-wiki-source]').forEach(button=>button.onclick=async()=>{try{
     const source=await api('project_knowledge',{project,action:'source',source:button.dataset.wikiSource});
@@ -591,8 +757,8 @@ function mountChecklist(items){
   function add(item={text:'',done:false},focus=false){
     const row=document.createElement('div');row.className='checklist-row';
     row.innerHTML=`<input type="checkbox" data-item-done aria-label="Item completed" ${item.done?'checked':''}><input data-item-text aria-label="Checklist item" placeholder="What needs to be done?" required maxlength="500" value="${esc(item.text)}"><button type="button" aria-label="Remove checklist item">✕</button>`;
-    row.querySelector('button').onclick=()=>{row.remove();count();};row.querySelector('[data-item-done]').onchange=count;
-    $('#checklist-rows').append(row);count();if(focus)row.querySelector('[data-item-text]').focus();
+    row.querySelector('button').onclick=()=>{row.remove();count();inspectorDirty=true;};row.querySelector('[data-item-done]').onchange=count;
+    $('#checklist-rows').append(row);count();if(focus){inspectorDirty=true;row.querySelector('[data-item-text]').focus();}
   }
   items.forEach(item=>add(item));$('#add-checklist').onclick=()=>add(undefined,true);count();
 }
@@ -636,8 +802,11 @@ function mountReview(t){
     const buttons=[...section.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);message.textContent='Saving review…';
     try{
       const result=await api('task_review',{project:selected,id:t.id,actor,decision,comment:decision==='request_changes'?feedback.value.trim():'',expected_version:t.review?.version});
-      if(project!==selected||!section.isConnected)return;
-      $('#editor').close();await refresh();await openTask({id:t.id});
+      if(project!==selected||!section.isConnected||!editor.open)return;
+      const interaction=taskOpenSerial;
+      editor.close();await refresh();
+      if(interaction!==taskOpenSerial)return;
+      await openTask({id:t.id});
       const status=$('#review-result');
       if(status)status.textContent=decision==='approve'?(result.status==='Done'?'Approved.':'Approval recorded. Git integration is still pending.'):(result.review_resume?.message||'Changes saved. The task is ready for the agent.');
     }catch(e){message.textContent=e.message;buttons.forEach(b=>b.disabled=false);if(!panel.hidden)approve.disabled=true;}
@@ -646,7 +815,14 @@ function mountReview(t){
 }
 async function openTask(t,initialStatus='TODO'){
   if(!project)return openProject();
-  if(t){const selected=project;try{t=await api('task_get',{project,id:t.id,include_cost:true,full:true});if(project!==selected)return;}catch(e){error(e);return;}}
+  const serial=++taskOpenSerial, selected=project, selectedPage=page;
+  if(t){
+    try{t=await api('task_get',{project,id:t.id,include_cost:true,full:true});}
+    catch(e){if(serial===taskOpenSerial)error(e);return;}
+    if(serial!==taskOpenSerial || project!==selected || page!==selectedPage)return;
+  }
+  const docked=desktopMode && !!t && page==='Board';
+  if(docked && !canLeaveInspector())return;
   const continuityField=t?`<label class="field">Continuity summary<textarea name="continuity" maxlength="2000">${esc(t.continuity||'')}</textarea></label><p>${t.continuity_stale?'Summary may be outdated: task context changed.':'Optional: current result, relevant files, verification and next step.'}</p>`:'';
   const verificationFields='<label class="field">Verification intent<select name="verification_level">' + ['auto','minimal','targeted','full'].map(v=>'<option '+(v===(t?.verification_level||'auto')?'selected':'')+'>'+v+'</option>').join('') + '</select></label>'+field('Verification rationale','verification_reason',t?.verification_reason||'')+'<p>Intent guides check selection. Acceptance evidence and mandatory checks still apply.</p>';
   const scopeField=`<label class="field">Estimated scope<select name="scope_size">${['Unknown','Small','Large'].map(v=>`<option ${v===(t?.scope_size||'Unknown')?'selected':''}>${v}</option>`).join('')}</select></label><label class="field">Scope reason<input name="scope_reason" maxlength="500" value="${esc(t?.scope_reason||'')}"></label><p>Small means one bounded, verifiable outcome; explain why. Auto can use Light despite file count. Dependencies and concurrency still require Standard.</p>`;
@@ -660,7 +836,7 @@ async function openTask(t,initialStatus='TODO'){
     (t?`<label class="field">Status<select name="status">${statuses.map(s=>`<option ${t.status===s?'selected':''}>${s}</option>`).join('')}</select></label>`:`<label class="field">Initial status<select name="status"><option value="TODO" ${initialStatus==='TODO'?'selected':''}>To do</option><option value="Backlog" ${initialStatus==='Backlog'?'selected':''}>Backlog</option></select></label><p>Backlog stays parked until you move it to To do. Agents never activate it automatically.</p>`)+
     `<label class="field">Priority<select name="priority"><option value="1" ${t?.priority===1?'selected':''}>High</option><option value="2" ${!t||t.priority===2?'selected':''}>Normal</option><option value="3" ${t?.priority===3?'selected':''}>Low</option></select></label>`+(t?ownerField(t):'')+scopeField+verificationFields+modelFields+costFields;
   const fields=`<div class="task-editor-layout"><div class="task-editor-main">${mainFields}</div><section class="task-editor-meta" aria-label="Task properties">${metaFields}</section></div>`;
-  modal(t?`Edit ${t.code}`:'Create task',fields,async f=>{
+  if(!modal(t?`Edit ${t.code}`:'Create task',fields,async f=>{
     const a={...(t&&f.get('continuity')!==(t.continuity||'')?{continuity:f.get('continuity')}:{}),...(f.get('model')!==(t?.model||'')?{model:f.get('model')}:{}),verification_level:f.get('verification_level'),verification_reason:f.get('verification_reason'),model_tier:f.get('model_tier'),model_reason:f.get('model_reason'),scope_size:f.get('scope_size'),scope_reason:f.get('scope_reason'),title:f.get('title'),description:f.get('description'),acceptance_criteria:f.get('acceptance_criteria').split('\n').map(c=>c.trim()).filter(Boolean),category:f.get('category'),context_group:f.get('context_group'),priority:+f.get('priority'),checklist:readChecklist(),dependencies:f.getAll('dependencies').map(Number),files:f.get('files').split('\n').map(p=>p.trim()).filter(Boolean)};
     for(const k of ['estimated_tokens','estimated_quota_percent']){const v=f.get(k);a[k]=v===''?null:Number(v);}
     if(t){
@@ -673,37 +849,45 @@ async function openTask(t,initialStatus='TODO'){
       await moveTask(t.id,f.get('status'),a);
     }else await api('task_create',{project,...a,status:f.get('status'),...(actor?{actor}:{})});
     await refresh();
-  });
+  },'Save changes',docked))return;
   $('#editor').classList.add('task-editor');
   mountChecklist(t?.checklist || []);
   if(t)mountReview(t);
   const decisionSection=$('#task-intent-decisions');
-  if(decisionSection)decisionSection.onclick=e=>{const button=e.target.closest('[data-decision-source]');if(button){$('#editor').close();openTask({id:Number(button.dataset.decisionSource)});}};
+  if(decisionSection)decisionSection.onclick=e=>{const button=e.target.closest('[data-decision-source]');if(button&&leaveInspector()){editor.close();openTask({id:Number(button.dataset.decisionSource)});}};
   const moreDecisions=$('#task-decisions-more');
-  if(moreDecisions){const decisionProject=project;const seen=new Set(t.decision_context.items.map(d=>d.ref));moreDecisions.onclick=async()=>{moreDecisions.disabled=true;try{const result=await api('task_get',{project:decisionProject,id:t.id,full:true,decisions_after:Number(moreDecisions.dataset.after),decisions_limit:10});if(project!==decisionProject)return;const page=result.decision_context;if(!page){moreDecisions.hidden=true;return;}$('#current-task-decisions').insertAdjacentHTML('beforeend',page.items.filter(d=>!seen.has(d.ref)).map(d=>{seen.add(d.ref);return decisionRecordMarkup(d);}).join(''));moreDecisions.dataset.after=page.next_after;moreDecisions.hidden=!page.has_more;}catch(e){error(e);}finally{moreDecisions.disabled=false;}};}
+  if(moreDecisions){const decisionProject=project;const seen=new Set(t.decision_context.items.map(d=>d.ref));moreDecisions.onclick=async()=>{moreDecisions.disabled=true;try{const result=await api('task_get',{project:decisionProject,id:t.id,full:true,decisions_after:Number(moreDecisions.dataset.after),decisions_limit:10});if(project!==decisionProject||!moreDecisions.isConnected)return;const page=result.decision_context;if(!page){moreDecisions.hidden=true;return;}$('#current-task-decisions').insertAdjacentHTML('beforeend',page.items.filter(d=>!seen.has(d.ref)).map(d=>{seen.add(d.ref);return decisionRecordMarkup(d);}).join(''));moreDecisions.dataset.after=page.next_after;moreDecisions.hidden=!page.has_more;}catch(e){error(e);}finally{moreDecisions.disabled=false;}};}
 
   if(t){
     const section=document.createElement('section');
     if(t.context_batch){
       const group=document.createElement('section');group.className='task-history';
       group.innerHTML=`<h3>Grouped tasks</h3><p>Reserved for ${esc(t.context_batch.name)} until ${esc(new Date(t.context_batch.expires*1000).toLocaleString())}. Tasks run sequentially; only the current task is In Progress. Reservations expire if the worker stops responding.</p><ul>${t.context_batch.tasks.map(item=>`<li><button type="button" data-group-task="${item.id}">${esc(item.code)} · ${esc(item.title)}</button> · ${esc(item.status)}${item.id===t.context_batch.current?' · current':''}</li>`).join('')}</ul>`;
-      group.querySelectorAll('[data-group-task]').forEach(button=>button.onclick=()=>{$('#editor').close();openTask({id:Number(button.dataset.groupTask)});});
+      group.querySelectorAll('[data-group-task]').forEach(button=>button.onclick=()=>{if(leaveInspector()){editor.close();openTask({id:Number(button.dataset.groupTask)});}});
       $('#fields').append(group);
     }
     section.innerHTML=`<p>${t.locked?'🔒 Locked until '+esc(new Date(t.lock_until*1000).toLocaleString()):'No active lock'}</p><button type="button" id="claim-task">Claim / renew lock</button> <button type="button" id="release-task">Release lock</button> <button type="button" id="force-release">Force release (human)</button>`;
     $('#fields').append(section);
-    const reopen=async()=>{$('#editor').close();await refresh();openTask(state.tasks.find(x=>x.id===t.id));};
-    $('#claim-task').onclick=async()=>{try{const r=await api('task_claim',{project,id:t.id,...credentials(t.id)});if(r.claimed===false)throw Error('File conflict: '+r.conflicts.map(c=>c.path).join(', '));claims[`${project}:${t.id}`]={actor,token:r.token};saveClaims();await reopen();}catch(e){$('#form-error').textContent=e.message;}};
-    const release=async force=>{try{await api('task_release',{project,id:t.id,...credentials(t.id),force});delete claims[`${project}:${t.id}`];saveClaims();await reopen();}catch(e){$('#form-error').textContent=e.message;}};
+    const showFailure=e=>{if(editor.open&&section.isConnected)$('#form-error').textContent=e.message;};
+    const reopen=async()=>{
+      if(!editor.open||!section.isConnected)return;
+      const interaction=taskOpenSerial;
+      editor.close();await refresh();
+      if(interaction===taskOpenSerial)openTask({id:t.id});
+    };
+    $('#claim-task').onclick=async()=>{const auth=credentials(t.id);try{const r=await api('task_claim',{project:selected,id:t.id,...auth});if(r.claimed===false)throw Error('File conflict: '+r.conflicts.map(c=>c.path).join(', '));claims[`${selected}:${t.id}`]={actor:auth.actor,token:r.token};saveClaims();await reopen();}catch(e){showFailure(e);}};
+    const release=async force=>{try{await api('task_release',{project:selected,id:t.id,...credentials(t.id),force});delete claims[`${selected}:${t.id}`];saveClaims();await reopen();}catch(e){showFailure(e);}};
     $('#release-task').onclick=()=>release(false);
     $('#force-release').onclick=()=>{if(confirm('Release this lock? The current worker may still be running. Coordinate with them before taking over.'))release(true);};
-    const modelButton=document.createElement('button');modelButton.type='button';modelButton.textContent='Apply model override only';modelButton.onclick=async()=>{try{await api('task_update',{project,id:t.id,actor,model:$('#fields [name=model]').value});await reopen();}catch(e){$('#form-error').textContent=e.message;}};$('#fields').append(modelButton);
+    const modelButton=document.createElement('button');modelButton.type='button';modelButton.textContent='Apply model override only';modelButton.onclick=async()=>{try{await api('task_update',{project:selected,id:t.id,actor,model:$('#fields [name=model]').value});await reopen();}catch(e){showFailure(e);}};$('#fields').append(modelButton);
     mountTiming(t);
     mountActivity(t);
     mountTaskNotes(t);
     mountAttachments(t);
   }
-  for(const section of [...$('#fields').children]){if(!section.classList.contains('task-editor-layout'))$('.task-editor-main').append(section);}
+  if(!docked){
+    for(const section of [...$('#fields').children]){if(!section.classList.contains('task-editor-layout'))$('.task-editor-main').append(section);}
+  }
 }
 function mountTaskNotes(t){
   const selected=project,section=document.createElement('section');section.className='task-history';
@@ -725,47 +909,52 @@ function mountAttachments(t){
   section.innerHTML='<h3>Reference attachments</h3><p>Up to ten files, 5 MiB each. Images preview only when requested; downloads load content on demand. JSON exports preserve metadata only. Save local attachment blobs separately for transfer.</p><label class="field">Reference file<input type="file" id="reference-file" accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.csv,.json,.zip,.docx,.xlsx,.pptx"></label><button type="button" id="reference-add">Attach file</button><div id="reference-list"></div><p id="reference-result" role="status"></p>';
   $('#fields').append(section);
   const urls=[];const clear=()=>{urls.forEach(url=>URL.revokeObjectURL(url));urls.length=0;};
-  $('#editor').addEventListener('close',clear,{once:true});
+  editorCleanup=clear;
+  const active=()=>editor.open&&editorCleanup===clear;
+  const message=section.querySelector('#reference-result');
   async function load(){
     const result=await api('task_attachment',{project:selected,id:t.id,action:'list'});
-    if(!section.isConnected)return;clear();
+    if(!active())return;clear();
     $('#reference-list').innerHTML=result.items.map(item=>`<article class="activity-entry"><b>${esc(item.name)}</b><p>${esc(item.mime)} · ${item.size.toLocaleString()} bytes${item.available?'':' · Content missing; copy local attachment blobs from the source checkout.'}</p>${item.previewable&&item.available?`<button type="button" data-reference-preview="${item.id}">Preview image</button> `:''}<button type="button" data-reference-download="${item.id}" ${item.available?'':'disabled'}>Download</button> <button type="button" data-reference-remove="${item.id}">Remove reference</button><div data-reference-image="${item.id}"></div></article>`).join('')||'<p>No reference files attached.</p>';
     async function content(key){
       const item=await api('task_attachment',{project:selected,id:t.id,action:'get',attachment_id:key,include_content:true});
+      if(!active())return null;
       const bytes=Uint8Array.from(atob(item.content_base64),c=>c.charCodeAt(0));
       const url=URL.createObjectURL(new Blob([bytes],{type:item.mime}));urls.push(url);return {item,url};
     }
-    section.querySelectorAll('[data-reference-preview]').forEach(button=>button.onclick=async()=>{try{const {item,url}=await content(button.dataset.referencePreview);const image=document.createElement('img');image.src=url;image.alt=item.name;image.style.maxWidth='100%';image.style.maxHeight='360px';section.querySelector(`[data-reference-image="${item.id}"]`).replaceChildren(image);}catch(e){$('#reference-result').textContent=e.message;}});
-    section.querySelectorAll('[data-reference-download]').forEach(button=>button.onclick=async()=>{try{const {item,url}=await content(button.dataset.referenceDownload);const link=document.createElement('a');link.href=url;link.download=item.name;link.click();}catch(e){$('#reference-result').textContent=e.message;}});
-    section.querySelectorAll('[data-reference-remove]').forEach(button=>button.onclick=async()=>{if(!confirm('Remove this reference and its local file content?'))return;try{const result=await api('task_attachment',{project:selected,id:t.id,action:'remove',attachment_id:button.dataset.referenceRemove,...credentials(t.id)});await load();$('#reference-result').textContent=result.warning||'Reference removed.';}catch(e){$('#reference-result').textContent=e.message;}});
+    section.querySelectorAll('[data-reference-preview]').forEach(button=>button.onclick=async()=>{try{const result=await content(button.dataset.referencePreview);if(!result)return;const {item,url}=result;const image=document.createElement('img');image.src=url;image.alt=item.name;image.style.maxWidth='100%';image.style.maxHeight='360px';section.querySelector(`[data-reference-image="${item.id}"]`).replaceChildren(image);}catch(e){message.textContent=e.message;}});
+    section.querySelectorAll('[data-reference-download]').forEach(button=>button.onclick=async()=>{try{const result=await content(button.dataset.referenceDownload);if(!result)return;const {item,url}=result;const link=document.createElement('a');link.href=url;link.download=item.name;link.click();}catch(e){message.textContent=e.message;}});
+    section.querySelectorAll('[data-reference-remove]').forEach(button=>button.onclick=async()=>{if(!confirm('Remove this reference and its local file content?'))return;try{const result=await api('task_attachment',{project:selected,id:t.id,action:'remove',attachment_id:button.dataset.referenceRemove,...credentials(t.id)});await load();message.textContent=result.warning||'Reference removed.';}catch(e){message.textContent=e.message;}});
   }
   $('#reference-add').onclick=async()=>{
-    const file=$('#reference-file').files[0];if(!file)return;
+    const input=section.querySelector('#reference-file'),file=input.files[0];if(!file)return;
     if(file.size>5*1024*1024){$('#reference-result').textContent='File exceeds 5 MiB.';return;}
     const button=$('#reference-add');button.disabled=true;
-    try{const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(Error('Could not read selected reference'));reader.readAsDataURL(file);});await api('task_attachment',{project:selected,id:t.id,action:'add',name:file.name,content_base64:encoded,...credentials(t.id)});await load();$('#reference-result').textContent='Reference attached.';$('#reference-file').value='';}catch(e){$('#reference-result').textContent=e.message;}finally{button.disabled=false;}
+    const auth=credentials(t.id);
+    try{const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(Error('Could not read selected reference'));reader.readAsDataURL(file);});await api('task_attachment',{project:selected,id:t.id,action:'add',name:file.name,content_base64:encoded,...auth});await load();message.textContent='Reference attached.';input.value='';}catch(e){message.textContent=e.message;}finally{button.disabled=false;}
   };
-  load().catch(e=>$('#reference-result').textContent=e.message);
+  load().catch(e=>message.textContent=e.message);
 }
 function mountActivity(t){
   const section=document.createElement('section');section.className='task-history';
   section.innerHTML='<h3>Updates & comments</h3><p>Record progress, findings and next steps here. Change the task specification only when its scope changes.</p><div id="activity-list" aria-live="polite"></div><button type="button" id="activity-older" hidden>Load older entries</button><label class="field">Entry type<select id="activity-kind"><option value="work">Work log</option><option value="comment">Comment</option></select></label><label class="field">Update<textarea id="activity-text" maxlength="2000" placeholder="What changed? Include results or the next step."></textarea></label><button type="button" id="activity-add">Post update</button><p id="activity-error" role="alert"></p>';
   $('#fields').append(section);
   let oldest=null;
+  const selected=project, entry=section.querySelector('#activity-text'), message=section.querySelector('#activity-error');
   async function load(older=false){
-    const result=await api('task_activity',{project,id:t.id,...(older&&oldest?{before:oldest}:{})});
+    const result=await api('task_activity',{project:selected,id:t.id,...(older&&oldest?{before:oldest}:{})});
     if(!section.isConnected)return;
     const html=result.items.map(e=>`<article class="activity-entry"><small>${esc(e.kind)} · ${esc(users.find(u=>u.id===e.actor)?.name||'System')} · ${esc(new Date(e.created).toLocaleString())}</small><p>${esc(e.text)}</p></article>`).join('');
     if(older)$('#activity-list').insertAdjacentHTML('afterbegin',html);else $('#activity-list').innerHTML=html||'<p>No activity yet.</p>';
     oldest=result.oldest;$('#activity-older').hidden=!result.has_more;
   }
-  $('#activity-older').onclick=()=>load(true).catch(e=>$('#activity-error').textContent=e.message);
+  $('#activity-older').onclick=()=>load(true).catch(e=>message.textContent=e.message);
   $('#activity-add').onclick=async()=>{
     const button=$('#activity-add');button.disabled=true;
-    try{await api('task_activity',{project,id:t.id,...credentials(t.id),text:$('#activity-text').value,kind:$('#activity-kind').value});$('#activity-text').value='';$('#activity-error').textContent='';await load();}
-    catch(e){$('#activity-error').textContent=e.message;}finally{button.disabled=false;}
+    try{await api('task_activity',{project:selected,id:t.id,...credentials(t.id),text:entry.value,kind:section.querySelector('#activity-kind').value});entry.value='';message.textContent='';await load();}
+    catch(e){message.textContent=e.message;}finally{button.disabled=false;}
   };
-  load().catch(e=>{if(section.isConnected)$('#activity-error').textContent=e.message;});
+  load().catch(e=>message.textContent=e.message);
 }
 async function deleteNote(id,selected=project){
   if(!actor)throw Error('Choose a human user before deleting a note.');
@@ -780,11 +969,16 @@ function openNote(){
     await api('note_add',{project,kind:'Review',audience:f.get('audience'),title:f.get('title'),items:f.get('items').split('\n').map(s=>s.trim()).filter(Boolean),...(f.get('task')?{task:Number(f.get('task'))}:{})});await refresh();
   });
 }
-$('#new-user').onclick=()=>modal('Create human user',field('Name','name','','required'),async f=>{const r=await api('user_register',{identity:'human:'+crypto.randomUUID(),name:f.get('name'),kind:'human'});actor=r.id;localStorage.setItem('scrum-user',actor);await loadUsers();render();});
-$('#current-user').onchange=()=>{actor=Number($('#current-user').value)||null;localStorage.setItem('scrum-user',actor||'');};
+$('#new-user').onclick=()=>modal('Create human user',field('Name','name','','required'),async f=>{const r=await api('user_register',{identity:'human:'+crypto.randomUUID(),name:f.get('name'),kind:'human'});actor=r.id;localStorage.setItem('scrum-user',actor);await loadUsers();if(page==='Chat')await refresh();else render();});
+$('#current-user').onchange=()=>{actor=Number($('#current-user').value)||null;localStorage.setItem('scrum-user',actor||'');chatView?.updateComposer();};
 $('#new-project').onclick=openProject;
-$('#project').onchange=()=>{project=+$('#project').value;metricSession='';metricBySession=false;refresh().catch(error);};
-document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{page=b.dataset.page;refresh().catch(error);});
+function selectProject(id){
+  if(id===project)return;
+  if(!leaveInspector()){$('#project').value=project;return;}
+  project=id;$('#project').value=id;metricSession='';metricBySession=false;refresh().catch(error);
+}
+$('#project').onchange=()=>selectProject(Number($('#project').value));
+document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{if(leaveInspector()){page=b.dataset.page;refresh().catch(error);}});
 document.querySelectorAll('[data-board-view]').forEach(b=>b.onclick=()=>setTaskView({mode:b.dataset.boardView}));
 $('#task-group').onchange=e=>setTaskView({group:e.target.value});
 $('#task-sort').onchange=e=>setTaskView({sort:e.target.value,direction:e.target.value==='updated'?'desc':'asc'});
@@ -795,28 +989,148 @@ function applyTheme(theme){document.documentElement.dataset.theme=theme;$('#them
 applyTheme(localStorage.getItem('scrum-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));
 $('#theme-toggle').onclick=()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';localStorage.setItem('scrum-theme',theme);applyTheme(theme);};
 $('#add').onclick=()=>page==='Board'?openTask():page==='File locks'?openFileReservation():openNote();
-$('#close').onclick=$('#cancel').onclick=()=>$('#editor').close();
-$('#editor-form').onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{await editing(new FormData(e.target));$('#editor').close();}catch(e){$('#form-error').textContent=e.message;}finally{b.disabled=false;}};
-window.addEventListener('focus',()=>{if(!$('#editor').open&&!['Settings','Chat','Projects','Wiki'].includes(page))refresh(true).catch(error);});
-setInterval(()=>{if(document.hidden||$('#editor').open)return;if(page==='Chat')refreshInteractions().catch(error);else if(!['Settings','Projects','Wiki'].includes(page))refresh(true).catch(error);},15000);
+$('#close').onclick=$('#cancel').onclick=()=>{if(leaveInspector() && editor.open)editor.close();};
+editor.addEventListener('input',()=>{if(editor.matches('.desktop-inspector[open]'))inspectorDirty=true;});
+editor.addEventListener('close',()=>{
+  if(editor.open)return;
+  editorCleanup?.();
+  editorCleanup=undefined;
+  inspectorDirty=false;
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && editor.matches('.desktop-inspector[open]'))leaveInspector();
+});
+$('#editor-form').onsubmit=async e=>{
+  e.preventDefault();
+  const b=e.submitter, save=editing;
+  b.disabled=true;
+  try{await save(new FormData(e.target));if(editing===save)editor.close();}
+  catch(e){if(editing===save)$('#form-error').textContent=e.message;}
+  finally{b.disabled=false;}
+};
+const editorBlocksRefresh=()=>editor.open && !editor.classList.contains('desktop-inspector');
+function refreshVisiblePage(){
+  if(document.hidden||editorBlocksRefresh())return;
+  if(page==='Chat'){chatView?.refresh();return;}
+  if(!['Settings','Projects','Wiki'].includes(page))refresh(true).catch(error);
+}
+window.addEventListener('focus',refreshVisiblePage);
+setInterval(refreshVisiblePage,15000);
 loadProjects().catch(error);
 
 function renderChat(){
-  const data=state.chat;
-  $('#content').innerHTML=`<section class="workflow"><div id="chat-interactions" aria-live="polite"></div><div id="chat-messages"></div><button id="chat-older" ${data.has_more?'':'hidden'}>Load older</button> <button id="chat-refresh">Check new messages</button><form id="chat-form"><label class="field">Recipient (visible to everyone in this project)<select name="recipient"><option value="">Everyone</option>${users.filter(u=>u.active!==0).map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></label><label class="field">Task (optional)<select name="task"><option value="">No task</option>${state.tasks.map(t=>`<option value="${t.id}">${esc(t.code)} · ${esc(t.title)}</option>`).join('')}</select></label><label class="field">Message<textarea name="text" required maxlength="2000"></textarea></label><button type="submit" class="primary">Send message</button></form><p id="chat-error" role="alert"></p></section>`;
-  renderInteractions(state.interactions);
-  let oldest=data.oldest,latest=data.latest;
-  const html=items=>items.map(m=>`<article class="activity-entry"><small>${esc(m.author_name)} · ${esc(new Date(m.created).toLocaleString())}${m.recipient?' → '+esc(users.find(u=>u.id===m.recipient)?.name||m.recipient):''}${m.task?' · '+esc(state.tasks.find(t=>t.id===m.task)?.code||m.task):''}</small><p style="white-space:pre-wrap">${esc(m.text)}</p></article>`).join('');
-  $('#chat-messages').innerHTML=html(data.items);
-  async function read(older=false){
-    const result=await api('project_chat',{project,...(older?{before:oldest}:{after:latest})});
-    $('#chat-messages').insertAdjacentHTML(older?'afterbegin':'beforeend',html(result.items));
-    if(older){oldest=result.oldest||oldest;$('#chat-older').hidden=!result.has_more;}
-    else {latest=result.latest;$('#chat-refresh').textContent=result.has_more?'Load more new messages':'Check new messages';}
+  const {chat:data,tasks}=state, selected=project;
+  const people=new Map(users.map(u=>[u.id,u.name])), codes=new Map(tasks.map(t=>[t.id,t.code]));
+  $('#content').innerHTML=`<div class="project-chat">
+    <section class="chat-thread" aria-labelledby="chat-thread-title">
+      <div class="chat-thread-heading"><h2 id="chat-thread-title">Project messages</h2><button type="button" id="chat-refresh">Refresh</button></div>
+      <div class="chat-history" tabindex="0" aria-label="Message history">
+        <button type="button" id="chat-older" ${data.has_more?'':'hidden'}>Load older messages</button>
+        <p id="chat-empty" ${data.items.length?'hidden':''}>No messages yet. Start the conversation below.</p>
+        <div id="chat-messages" role="log" aria-label="Project messages"></div>
+      </div>
+      <form id="chat-form">
+        <label class="sr" for="chat-text">Message</label>
+        <textarea id="chat-text" name="text" rows="3" placeholder="Write a project message…" required maxlength="2000"></textarea>
+        <div class="chat-compose-actions">
+          <details><summary>Recipient and task</summary>
+            <label class="field">Send to<select name="recipient"><option value="">Everyone</option>${users.filter(u=>u.active!==0).map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></label>
+            <label class="field">Link a task<select name="task"><option value="">No task</option>${tasks.map(t=>`<option value="${t.id}">${esc(t.code)} · ${esc(t.title)}</option>`).join('')}</select></label>
+            <p>Everyone in the project can read these messages. A recipient adds a mention. Agents see messages when they read the project chat.</p>
+          </details>
+          <button type="submit" class="primary">Send message</button>
+        </div>
+        <button type="button" id="chat-choose-user" hidden>Choose a human profile to send messages</button>
+      </form>
+      <p id="chat-error" role="alert"></p>
+    </section>
+    <section class="chat-requests" aria-labelledby="chat-requests-title">
+      <h2 id="chat-requests-title">Agent requests <span id="chat-request-count" hidden></span></h2>
+      <div id="chat-interactions" aria-live="polite"></div>
+    </section>
+  </div>`;
+  const root=$('.project-chat'), history=root.querySelector('.chat-history'), messages=$('#chat-messages');
+  const form=$('#chat-form'), chooseUser=$('#chat-choose-user'), send=form.querySelector('[type=submit]');
+  const olderButton=$('#chat-older'), refreshButton=$('#chat-refresh'), empty=$('#chat-empty'), feedback=$('#chat-error');
+  const live=()=>root.isConnected&&page==='Chat'&&project===selected;
+  const showError=e=>{if(live())feedback.textContent=e.message;};
+  const scrollToEnd=()=>{history.scrollTop=history.scrollHeight;};
+  const draft=chatDrafts.get(selected)||{};
+  const fields=['text','recipient','task'];
+  for(const key of fields)form.elements[key].value=draft[key]||'';
+  let sending=false, oldest=data.oldest, latest=data.latest;
+  const pending={};
+
+  function updateComposer(){
+    chooseUser.hidden=!!actor;
+    send.disabled=!actor||sending||!form.elements.text.value.trim();
+    messages.querySelectorAll('[data-author]').forEach(entry=>entry.classList.toggle('is-own',Number(entry.dataset.author)===actor));
   }
-  $('#chat-older').onclick=()=>read(true).catch(e=>$('#chat-error').textContent=e.message);
-  $('#chat-refresh').onclick=()=>Promise.all([read(),refreshInteractions()]).catch(e=>$('#chat-error').textContent=e.message);
-  $('#chat-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{const f=new FormData(e.target);await api('project_chat',{project,actor,text:f.get('text'),...(f.get('recipient')?{recipient:Number(f.get('recipient'))}:{}),...(f.get('task')?{task:Number(f.get('task'))}:{})});e.target.elements.text.value='';await read();}catch(err){$('#chat-error').textContent=err.message;}finally{button.disabled=false;}};
+  function saveDraft(){
+    const current=Object.fromEntries(fields.map(key=>[key,form.elements[key].value]));
+    chatDrafts.set(selected,current);
+    updateComposer();
+  }
+  const html=items=>items.map(m=>`<article class="chat-message${m.actor===actor?' is-own':''}" data-author="${m.actor}">
+    <div class="chat-message-meta"><strong>${esc(m.author_name)}</strong><time datetime="${esc(new Date(m.created).toISOString())}">${esc(new Date(m.created).toLocaleString())}</time></div>
+    ${m.recipient||m.task?`<small>${[m.recipient?'To '+esc(people.get(m.recipient)||m.recipient):'',m.task?esc(codes.get(m.task)||m.task):''].filter(Boolean).join(' · ')}</small>`:''}
+    <p>${esc(m.text)}</p></article>`).join('');
+  messages.innerHTML=html(data.items);
+  renderInteractions(state.interactions);
+
+  function read(older=false){
+    const direction=older?'older':'newer';
+    if(pending[direction])return pending[direction];
+    const button=older?olderButton:refreshButton;
+    button.disabled=true;
+    pending[direction]=(async()=>{
+      const result=await api('project_chat',{project:selected,...(older?{before:oldest}:{after:latest})});
+      if(!live())return;
+      const previousHeight=history.scrollHeight;
+      const atEnd=previousHeight-history.scrollTop-history.clientHeight<48;
+      messages.insertAdjacentHTML(older?'afterbegin':'beforeend',html(result.items));
+      if(result.items.length)empty.hidden=true;
+      if(older){
+        oldest=result.oldest??oldest;
+        button.hidden=!result.has_more;
+        history.scrollTop+=history.scrollHeight-previousHeight;
+      }else{
+        latest=result.latest;
+        button.textContent=result.has_more?'Load new messages':'Refresh';
+        if(atEnd)scrollToEnd();
+      }
+    })().finally(()=>{delete pending[direction];button.disabled=false;});
+    return pending[direction];
+  }
+  async function refreshChat(){
+    if(live())await Promise.all([read(),refreshInteractions()]).catch(showError);
+  }
+
+  chatView={refresh:refreshChat,updateComposer:()=>{if(live())updateComposer();}};
+  olderButton.onclick=()=>read(true).catch(showError);
+  refreshButton.onclick=()=>{feedback.textContent='';refreshChat();};
+  form.oninput=saveDraft;
+  chooseUser.onclick=()=>{if(users.some(u=>u.kind==='human'&&u.active!==0))$('#current-user').focus();else $('#new-user').click();};
+  form.onsubmit=async e=>{
+    e.preventDefault();
+    const {text,recipient,task}=Object.fromEntries(new FormData(form));
+    if(!live()||!actor||sending||!text.trim())return;
+    sending=true;
+    updateComposer();
+    feedback.textContent='';
+    try{
+      await api('project_chat',{project:selected,actor,text,...(recipient?{recipient:Number(recipient)}:{}),...(task?{task:Number(task)}:{})});
+      if(chatDrafts.get(selected)?.text===text)chatDrafts.set(selected,{recipient,task});
+      if(!live())return;
+      if(form.elements.text.value===text)form.elements.text.value='';
+      await pending.newer?.catch(()=>{});
+      await read();
+      if(live())scrollToEnd();
+    }catch(e){showError(e);}
+    finally{sending=false;if(live())updateComposer();}
+  };
+  updateComposer();
+  scrollToEnd();
 }
 
 function openFolder(){modal('Open / import project',field('Folder containing .scrum (absolute path)','path','','required')+'<p>Imports snapshot.json only when no local project data exists. Opening an existing database preserves local work.</p>',async f=>{const r=await api('project_open',{path:f.get('path')});project=r.id;await loadProjects();});}
@@ -830,7 +1144,7 @@ function renderProjects(){
 }
 
 function renderAgentControls(){
-  const panel=$('#agent-controls');panel.hidden=!project||page==='Projects';
+  const panel=$('#agent-controls');panel.hidden=!project||['Projects','Wiki'].includes(page);
   const r=state.runtime;if(!r)return;
   $('#agent-counts').textContent=`${r.active_agents} active agents · ${r.active_tasks} active tasks · ${r.workflow?.effective||'Standard'} workflow (${r.workflow?.configured||'Auto'})`;
   $('#agent-counts').title=r.workflow?.reason||'';
@@ -850,7 +1164,7 @@ async function signalProject(action){
 }
 $('#project-stop').onclick=()=>signalProject('stop');
 $('#project-wakeup').onclick=()=>signalProject('wakeup');
-$('#control-agents').onclick=async()=>{page='Agents';try{await refresh();$('#create-agent-profile')?.focus();}catch(e){error(e);}};
+$('#control-agents').onclick=async()=>{if(!leaveInspector())return;page='Agents';try{await refresh();$('#create-agent-profile')?.focus();}catch(e){error(e);}};
 function bindWorkerReadiness(profiles,sessions){
   const workers=new Map();
   for(const agent of [...sessions,...profiles.filter(item=>!item.deleted)]){
@@ -970,22 +1284,26 @@ function renderUsers(){
 }
 
 
-let interactionVersion='';
 async function refreshInteractions(){
-  if(page!=='Chat'||!project)return;
-  const selected=project;
-  const result=await api('agent_interaction',{project,version_seen:interactionVersion});
-  if(project!==selected||page!=='Chat')return;
+  const container=$('#chat-interactions');
+  if(page!=='Chat'||!project||!container)return;
+  const selected=project, version=container.dataset.version||'';
+  const result=await api('agent_interaction',{project:selected,version_seen:version});
+  if(project!==selected||page!=='Chat'||!container.isConnected||container.dataset.version!==version)return;
   if(result.changed===false)return;
   renderInteractions(result);
 }
 function renderInteractions(data){
   const container=$('#chat-interactions');if(!container)return;
-  interactionVersion=data?.version||'';
+  const selected=project, items=data?.items||[];
+  const count=$('#chat-request-count'), pending=items.filter(q=>q.state==='pending').length;
+  count.hidden=!pending;
+  count.textContent=pending;
+  container.dataset.version=data?.version||'';
   const drafts=new Map(Array.from(container.querySelectorAll('[data-interaction]')).map(card=>[card.dataset.interaction,card.querySelector('input[name=answer]')?.value||'']));
-  container.innerHTML=(data?.items||[]).map(q=>`<article class="interaction-card" data-interaction="${esc(q.id)}"><small>${q.kind==='permission'?'Permission request':'Agent question'} - ${esc(users.find(u=>u.id===q.actor)?.name||q.actor)} - ${esc(state.tasks.find(t=>t.id===q.task)?.code||q.task)} - ${esc(q.state)}</small><p class="interaction-question">${esc(q.question)}</p>${q.human_requirement?`<p><strong>Why human input:</strong> ${esc(q.human_requirement)}</p>`:""}${q.deferred?"<p>Only this task is waiting. Other ready work may continue; answering resumes it when Stop and quota allow.</p>":""}${q.state==='pending'?`<div class="interaction-options">${q.options.map(option=>`<button type="button" data-answer="${esc(option)}">${esc(option)}</button>`).join('')}</div>${q.kind==='question'?'<form class="interaction-answer"><label class="field">Your answer<input name="answer" maxlength="2000" required></label><button type="submit">Send answer</button></form>':''}`:`<p>${esc(q.answer||'This request is no longer active. No new action will be approved.')}</p>`}<p class="interaction-result" role="status"></p></article>`).join('');
+  container.innerHTML=items.map(q=>`<article class="interaction-card" data-interaction="${esc(q.id)}"><small>${q.kind==='permission'?'Permission request':'Agent question'} · ${esc(users.find(u=>u.id===q.actor)?.name||q.actor)} · ${esc(state.tasks.find(t=>t.id===q.task)?.code||q.task)} · ${esc(q.state)}</small><p class="interaction-question">${esc(q.question)}</p>${q.human_requirement?`<p><strong>Why human input</strong> ${esc(q.human_requirement)}</p>`:""}${q.deferred?"<p>Other ready work may continue. Answering resumes this task when Stop and quota allow.</p>":""}${q.state==='pending'?`<div class="interaction-options">${q.options.map(option=>`<button type="button" data-answer="${esc(option)}">${esc(option)}</button>`).join('')}</div>${q.kind==='question'?'<form class="interaction-answer"><label class="field">Your answer<input name="answer" maxlength="2000" required></label><button type="submit">Send answer</button></form>':''}`:`<p>${esc(q.answer||'This request has closed.')}</p>`}<p class="interaction-result" role="status"></p></article>`).join('')||'<p class="chat-quiet">Agent questions and approvals will appear here.</p>';
   container.querySelectorAll('[data-interaction]').forEach(card=>{
-    const answer=async text=>{const controls=card.querySelectorAll('button,input');controls.forEach(b=>b.disabled=true);try{await api('agent_interaction',{project,actor,action:'answer',id:card.dataset.interaction,answer:text});await refreshInteractions();}catch(e){card.querySelector('.interaction-result').textContent=e.message;controls.forEach(b=>b.disabled=false);}};
+    const answer=async text=>{const controls=card.querySelectorAll('button,input');controls.forEach(b=>b.disabled=true);try{await api('agent_interaction',{project:selected,actor,action:'answer',id:card.dataset.interaction,answer:text});if(card.isConnected&&selected===project)await refreshInteractions();}catch(e){card.querySelector('.interaction-result').textContent=e.message;}finally{controls.forEach(b=>b.disabled=false);}};
     card.querySelectorAll('[data-answer]').forEach(button=>button.onclick=()=>answer(button.dataset.answer));
     const form=card.querySelector('form');if(form){form.elements.answer.value=drafts.get(card.dataset.interaction)||'';form.onsubmit=e=>{e.preventDefault();answer(new FormData(form).get('answer'));};}
   });

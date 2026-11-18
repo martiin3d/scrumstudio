@@ -1134,12 +1134,14 @@ def legacy_run(action, a, path=None, locks=None):
                 if git:result['git']=git
                 if strict_completion:result['integration_pending']=True
             return result
-        if action=='cli_usage_audit':
+        if action in ('cli_usage_audit','cli_usage_overview'):
             import usage_audit
             start=a.get('start_at');end=a.get('end_at')
             import math
-            if start is not None or end is not None:
+            if action=='cli_usage_overview' or start is not None or end is not None:
                 if any(type(v) not in (int,float) or not math.isfinite(v) for v in (start,end)) or not 0<=start<=end:raise ValueError('Invalid audit interval')
+            if action=='cli_usage_overview':
+                return usage_audit.token_overview(db,project,start,end)
             return usage_audit.audit(db,project,project_row['workspace_root'],start,end,a.get('include_logs',False))
         if action=='cli_usage_summary':
             import execution_usage

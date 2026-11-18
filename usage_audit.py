@@ -108,25 +108,49 @@ def verification_events(root,start=None,end=None,*,pattern_id=None):
             'repeat_passes':sum(n-1 for n in passes.values()),'limited':limited,
             'patterns':patterns,'patterns_limited':patterns_limited}
 
-def audit(db,project,root,start=None,end=None,include_logs=False):
+def recorded_runs(db,project,start=None,end=None):
     import execution_usage
-    import git_revert_evidence
-    from store import project_prefix
     execution_usage.ensure(db)
     query='SELECT payload,recorded_at FROM cli_execution_usage WHERE project=?';params=[project]
     if start is not None:query+=' AND recorded_at>=? AND recorded_at<=?';params += [start,end]
-    runs=[]
     for row in db.execute(query,params):
         r=json.loads(row['payload'])
         # Claude cache reads/writes are additional to its input, unlike Codex.
         if r.get('client')=='claude':
             vals=[r.get(k) for k in ('input_tokens','cached_input_tokens','cache_write_input_tokens')]
             r['input_tokens']=sum(vals) if all(type(v) is int for v in vals) else None
+        yield {**r,'recorded_at':row['recorded_at']}
+
+
+def token_overview(db,project,start,end):
+    def summarize(runs):
+        result=totals(runs)
+        counts=result.pop('known_totals')
+        if result['known_runs']:
+            counts['total_tokens']=counts['input_tokens']+counts['output_tokens']
+        else:
+            counts=dict.fromkeys((*counts,'total_tokens'))
+        return {**result,**counts}
+
+    runs=list(recorded_runs(db,project,start,end))
+    by_client=collections.defaultdict(list)
+    for run in runs:
+        by_client[run['client']].append(run)
+    return {**summarize(runs),'providers':[
+        {'client':client,**summarize(items)} for client,items in sorted(by_client.items())
+    ]}
+
+
+def audit(db,project,root,start=None,end=None,include_logs=False):
+    import git_revert_evidence
+    from store import project_prefix
+    runs=[]
+    for r in recorded_runs(db,project,start,end):
         tasks=[]
         for task in r.get('tasks',[]):
             t=db.execute('SELECT number,title,category FROM tasks WHERE project=? AND id=?',(project,task)).fetchone()
             if t:tasks.append({'id':task,'number':t['number'],'title':t['title'],'category':t['category']})
-        runs.append({**{k:r.get(k) for k in COUNTERS},'run_id':r['run_id'],'model':r['model'],'client':r['client'],'recorded_at':row['recorded_at'],'tasks':tasks})
+        runs.append({**{k:r.get(k) for k in COUNTERS},'run_id':r['run_id'],'model':r['model'],'client':r['client'],'recorded_at':r['recorded_at'],'tasks':tasks})
     result={'schema':1,'generated_at':time.time(),'scope':'Selected interval by local completion-record time; in-flight and earlier uninstrumented executions may be missing.',
             'recorded':totals(runs),'top_runs':sorted(runs,key=lambda r:r.get('input_tokens') or -1,reverse=True)[:15],
             'verification':verification_events(root,start,end),

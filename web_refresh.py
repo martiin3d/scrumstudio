@@ -37,6 +37,7 @@ def refresh(args,call):
         if page=='Metrics':
             selected={'filter_period':args['filter_period']} if args.get('filter_period') else {}
             data['metrics']=call('project_metrics',{'project':project,'days':args.get('days',30),'include_series':True,**selected})
+            data['tokenUsage']=call('cli_usage_overview',{'project':project,'start_at':data['metrics']['start_at'],'end_at':data['metrics']['end_at']})
             data['coordination']=call('coordination_metrics',{'project':project,'include_periods':True,**({'filter_session':args['filter_session']} if args.get('filter_session') else {}),**selected,'start_at':data['metrics']['start_at'],'end_at':data['metrics']['end_at']})
     # Never mark a concurrent mutation as seen with older data.
     after=revision(project,page)+hashlib.sha256(scope.encode()).hexdigest()[:8]

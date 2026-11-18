@@ -10,6 +10,22 @@ A local, English-language project workspace with a Kanban board, Daily notes, bu
 
 Double-click **start.bat**, or run `python server.py`. Open http://127.0.0.1:8765. Use Project folders to create a project in an existing absolute folder or open/import a folder containing .scrum; then add tasks or notes. Click cards to edit details, priority, dependencies and status; drag cards between columns. New tasks start in TODO. The browser refreshes every 15 seconds while visible and on focus to pick up MCP changes. Close the console to stop the website. Data remains on disk. Set `SCRUM_PORT` to change the port, or `SCRUM_REGISTRY` to select another local registry (use the same value for web and MCP). `SCRUM_DB` without SCRUM_REGISTRY explicitly selects the old shared single-file compatibility mode; omit it for folder isolation.
 
+## Desktop preview for Windows
+
+Scrum Studio Desktop opens from a Windows executable with no console window. Pick a project in the sidebar and navigate between Board, Wiki, Notes and Chat in the workspace. The board stays available beside the open task. The desktop app shares the project registry and task data with the website and CLI. Browsing, searching and editing use the local server and consume no AI tokens. Starting an AI worker uses its configured provider account as usual.
+
+Install Python 3.10+ and the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) if needed. From the checkout, run the one-time setup in PowerShell:
+
+```powershell
+python -m venv data\desktop-venv
+.\data\desktop-venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+.\scripts\build_desktop.ps1
+```
+
+Double-click **data\desktop\Scrum Studio.exe**. Keep the executable in its build folder so it can find the checkout and desktop runtime. The local app server listens on `8766` until you close the window. The web app can run alongside it on port `8765`. Set `SCRUM_DESKTOP_PORT` before launch to choose another port. The desktop window stores its selected project, theme and human profile in `data/desktop-profile`. Projects use the same storage settings (`SCRUM_REGISTRY` and `SCRUM_DB`) as the web app. Startup diagnostics go to `data/desktop/desktop.log`.
+
+The web and desktop views use the same light and dark palettes. **Metrics** shows locally reported token usage for the selected interval, including input, cache reads, output and coverage by provider. Executions with unavailable counters remain visible in the coverage count. Calendar flow metrics and the optional local audit remain available below the token summary.
+
 ## MCP connection
 
 Task codes use the first three letters of the project name in uppercase and a project-local sequence starting at 1 (for example, Website: `WEB-1`, `WEB-2`). Spaces and punctuation are ignored; accents are normalized. Short names use their available letters; names without letters use `PRJ`. Existing tasks are numbered automatically in creation order per project. Codes appear on cards, in search, and in MCP results. The local numeric internal `id` remains the input for task updates and dependencies. Projects with the same first three letters share a prefix, so always include the project when referring to a code.
@@ -186,7 +202,7 @@ Storage failures include a stable error code, recovery step and diagnostic refer
 
 Keep permission-required operations sequential so a new prompt does not supersede an outstanding approval. These messages come from the host approval interface, not SQLite. Unity `PROJECT_REGISTRY_UNREADABLE`/`LockUnavailable` and package-host DNS failures belong to Unity or networking; verify the resulting Unity project before retrying creation. Scrum cannot repair Unity's registry or grant filesystem permissions. Updated bundled startup/work skills teach these recovery steps; install them using `python scripts/setup.py --skills-only --client codex` (backs up matching installed skills) and reopen the client chat to load them.
 
-The **Chat** section and `project_chat` MCP tool share an append-only project conversation, with author, UTC timestamp, optional recipient and project task. Recipients are routing hints, not private messages. Reads default to latest20, max50; `after=latest` reads incrementally and `before=oldest` loads older messages. Follow `has_more` without skipping pages. No chat data is added to routine snapshots or next_work. The web chat uses manual refresh; no automatic agent polling, notifications or wakeups. Use `scrum-chat` for authorized coordination; messages never grant execution authority or bypass locks. Persist decisions and verification on tasks.
+The **Chat** section and `project_chat` MCP tool share an append-only project conversation. Everyone can read it. Choosing a recipient adds a visible mention. The web and desktop views refresh while Chat is visible. Agents see messages when they explicitly read the conversation. The service stores messages without sending agent notifications or wakeups. Reads default to the latest 20 messages, up to 50 per request. Use `after=latest` to read new messages and `before=oldest` for earlier ones. Follow `has_more` without skipping pages. Routine snapshots and `next_work` omit the conversation. Use `scrum-chat` for authorized coordination and record decisions and verification on tasks.
 
 Folder storage, portable snapshots and project-isolated file reservations are implemented; existing shared databases need explicit project_migrate before using this mode. Local clones do not coordinate locks or chat across computers; that needs a shared server. macOS launchers require validation on a real Mac; Windows tests do not establish native macOS execution.
 
