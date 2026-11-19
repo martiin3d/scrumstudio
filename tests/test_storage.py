@@ -49,6 +49,26 @@ class StorageTest(unittest.TestCase):
             run('agent_checkpoint',{'project':opened['id'],'actor':actor,'client':'codex','session_used_percent':10,'weekly_used_percent':20})
         return opened,clone
 
+    def test_local_settings_template_applies_only_to_new_projects(self):
+        existing, folder = self.project()
+        template = storage.registry_path().with_suffix('.project-defaults.json')
+        storage.atomic_json(template, {
+            'max_active_per_agent': 2,
+            'execution_instructions': 'Use indexed code search.',
+            'git_mode': 'Branches',
+        })
+        new_folder = self.root / 'new'
+        new_folder.mkdir()
+        created = run('project_create', {'path': str(new_folder), 'name': 'New'})
+        settings = run('project_settings', {'project': created['id']})
+        self.assertEqual(settings['max_active_per_agent'], 2)
+        self.assertEqual(settings['execution_instructions'], 'Use indexed code search.')
+        self.assertEqual(settings['git_mode'], 'Branches')
+        self.assertEqual(settings['workspace_root'], str(new_folder))
+        self.assertEqual(run('project_settings', {'project': existing})['execution_instructions'], '')
+        imported, _ = self.clone(folder)
+        self.assertEqual(run('project_settings', {'project': imported['id']})['execution_instructions'], '')
+
     def test_layout_registry_and_checkout_isolation(self):
         p,path = self.project()
         for name in ['project.json','snapshot.json','local/scrum.db','local/locks.db','local/checkout.json','.gitignore']:

@@ -24,6 +24,26 @@ def registry_path():
     return Path(os.environ.get('SCRUM_REGISTRY', ROOT / 'data' / 'registry.db'))
 
 
+def new_project_settings():
+    from coordination import POLICY_DEFAULTS, validate_policy
+
+    path = registry_path().with_suffix('.project-defaults.json')
+    try:
+        settings = read_json(path)
+    except FileNotFoundError:
+        return {}
+    allowed = {'max_active_per_agent', 'require_evidence', *POLICY_DEFAULTS}
+    if not isinstance(settings, dict) or settings.keys() - allowed:
+        raise ValueError('Invalid new project settings template')
+    limit = settings.get('max_active_per_agent', 1)
+    if type(limit) is not int or not 1 <= limit <= 20:
+        raise ValueError('max_active_per_agent must be 1..20')
+    if type(settings.get('require_evidence', True)) is not bool:
+        raise ValueError('require_evidence must be boolean')
+    validate_policy(settings)
+    return settings
+
+
 @contextmanager
 def registry():
     path = registry_path()
@@ -364,6 +384,7 @@ def open_project(args, connect):
             raise ValueError('Folder already contains a project; use project_open')
         if (folder / '.scrum').exists():
             raise ValueError('Folder already contains .scrum metadata; inspect it before creating')
+        defaults = new_project_settings()
         meta = {'schema_version': VERSION, 'uuid': str(uuid.uuid4()), 'name': required(args['name'],'name',120), 'description': description(args.get('description',''))}
         if not atomic_json(manifest, meta, exclusive=True):
             raise ValueError('Folder already contains a project; use project_open')
@@ -384,6 +405,9 @@ def open_project(args, connect):
                 restore_into(db, read_json(snapshot), meta)
             else:
                 db.execute('INSERT INTO projects(id,name,description,workspace_root) VALUES(1,?,?,?)', (meta['name'],meta.get('description',''),str(folder)))
+                if defaults:
+                    assignments = ','.join(f'{key}=?' for key in defaults)
+                    db.execute(f'UPDATE projects SET {assignments} WHERE id=1', tuple(defaults.values()))
         db.execute('UPDATE projects SET workspace_root=?', (str(folder),))
         ensure_uids(db)
     project_id = register(folder, meta['uuid'], checkout)

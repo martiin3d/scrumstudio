@@ -156,6 +156,13 @@ Prefer `next_work` over snapshots and `task_get` for known codes. Pass `retro_se
 
 ## Project settings and completion policy
 
+For new folder projects, a local JSON object can override the initial project
+settings. Save it as `data/registry.project-defaults.json`, or replace the
+extension of your custom `SCRUM_REGISTRY` path with `.project-defaults.json`.
+Use the fields returned by `project_settings`, omitting `workspace_root` and
+`settings_version`. Each project gets its own workspace path. Opening an
+existing folder or importing a snapshot preserves its own settings.
+
 The **Settings** page and `project_settings(project)` expose:
 
 | Setting | Default | Behavior |
