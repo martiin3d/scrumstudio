@@ -41,3 +41,18 @@ class CliRuntimeTest(unittest.TestCase):
     def test_path_remains_fallback_without_desktop(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'data') as folder,patch.object(cli_runtime.Path,'home',return_value=Path(folder)),patch.dict(os.environ,{'LOCALAPPDATA':folder,'SCRUM_CODEX_EXECUTABLE':''}),patch.object(cli_runtime.shutil,'which',return_value='path-codex'):
             self.assertEqual(cli_runtime.codex_executable(),'path-codex')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows desktop discovery')
+    def test_appx_runtime_when_path_has_no_codex(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / 'data') as folder:
+            executable = Path(folder) / 'package/app/resources/codex.exe'
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            with (
+                patch.object(cli_runtime.Path, 'home', return_value=Path(folder)),
+                patch.dict(os.environ, {'LOCALAPPDATA': folder, 'SCRUM_CODEX_EXECUTABLE': ''}),
+                patch.object(cli_runtime.shutil, 'which', return_value=None),
+                patch.object(cli_runtime.subprocess, 'run') as appx,
+            ):
+                appx.return_value.stdout = str(Path(folder) / 'package') + '\n'
+                self.assertEqual(cli_runtime.codex_executable(), str(executable))

@@ -3,6 +3,7 @@ import os
 import re
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 
@@ -35,4 +36,24 @@ def codex_executable():
         candidates=[p for p in [Path('/Applications/Codex.app/Contents/Resources/codex'),Path.home()/'Applications/Codex.app/Contents/Resources/codex'] if p.is_file()]
     if candidates:
         return str(max(candidates,key=lambda path:path.stat().st_mtime).resolve())
-    return shutil.which('codex')
+    executable = shutil.which('codex')
+    if executable or os.name != 'nt':
+        return executable
+
+    # WindowsApps is normally inaccessible to directory enumeration.
+    powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    try:
+        result = subprocess.run(
+            [str(powershell), '-NoProfile', '-NonInteractive', '-Command',
+             'Get-AppxPackage -Name OpenAI.Codex | Select-Object -ExpandProperty InstallLocation'],
+            capture_output=True, text=True, check=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for location in result.stdout.splitlines():
+        if location.strip():
+            packaged = Path(location.strip()) / 'app/resources/codex.exe'
+            if packaged.is_file():
+                return str(packaged)
+    return None
