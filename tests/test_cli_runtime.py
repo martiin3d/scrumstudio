@@ -35,8 +35,6 @@ class CliRuntimeTest(unittest.TestCase):
             executable=Path(folder)/'explicit.exe';executable.touch()
             with patch.dict(os.environ,{'SCRUM_CODEX_EXECUTABLE':str(executable)}):
                 self.assertEqual(cli_runtime.codex_executable(),str(executable.resolve()))
-            with patch.dict(os.environ,{'SCRUM_CODEX_EXECUTABLE':str(executable)+'-missing'}):
-                with self.assertRaisesRegex(RuntimeError,'existing Codex'):cli_runtime.codex_executable()
 
     def test_path_remains_fallback_without_desktop(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'data') as folder,patch.object(cli_runtime.Path,'home',return_value=Path(folder)),patch.dict(os.environ,{'LOCALAPPDATA':folder,'SCRUM_CODEX_EXECUTABLE':''}),patch.object(cli_runtime.shutil,'which',return_value='path-codex'):
@@ -50,9 +48,11 @@ class CliRuntimeTest(unittest.TestCase):
             executable.touch()
             with (
                 patch.object(cli_runtime.Path, 'home', return_value=Path(folder)),
-                patch.dict(os.environ, {'LOCALAPPDATA': folder, 'SCRUM_CODEX_EXECUTABLE': ''}),
+                patch.dict(os.environ, {'LOCALAPPDATA': folder, 'SCRUM_CODEX_EXECUTABLE': str(Path(folder) / 'missing.exe')}),
                 patch.object(cli_runtime.shutil, 'which', return_value=None),
                 patch.object(cli_runtime.subprocess, 'run') as appx,
             ):
                 appx.return_value.stdout = str(Path(folder) / 'package') + '\n'
                 self.assertEqual(cli_runtime.codex_executable(), str(executable))
+                appx.return_value.stdout = ''
+                self.assertIsNone(cli_runtime.codex_executable())

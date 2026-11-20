@@ -25,8 +25,8 @@ def codex_executable():
     explicit=os.environ.get('SCRUM_CODEX_EXECUTABLE')
     if explicit:
         path=Path(explicit).expanduser()
-        if not path.is_file():raise RuntimeError('SCRUM_CODEX_EXECUTABLE must point to an existing Codex executable')
-        return str(path.resolve())
+        if path.is_file():
+            return str(path.resolve())
     candidates=[]
     if os.name=='nt':
         roots={Path.home()/'AppData'/'Local'}
