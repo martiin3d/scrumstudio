@@ -29,7 +29,7 @@ class BridgeTest(BridgeTestCase):
             message = 'windows sandbox failed: app runtime provisioning service is unavailable'
             run.return_value = Mock(returncode=1, stderr=message)
             self.assertEqual(self.sandbox_probe(SCRIPTS, 'codex', {}), message)
-            self.assertIn('workspace-write', run.call_args.args[0])
+            self.assertEqual(run.call_args.args[0][:5], ['codex', '-s', 'workspace-write', 'sandbox', '--'])
             run.reset_mock()
             self.assertIsNone(self.sandbox_probe(SCRIPTS, 'codex', {'agent_approval_mode': 'Full access'}))
             run.assert_not_called()

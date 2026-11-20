@@ -580,7 +580,7 @@ def windows_sandbox_failure(folder, client, policy):
         return None
     try:
         result = subprocess.run(
-            [executable, '-s', 'workspace-write', 'sandbox', 'windows', '--',
+            [executable, '-s', 'workspace-write', 'sandbox', '--',
              str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/cmd.exe'),
              '/d', '/c', 'exit', '0'],
             cwd=folder, capture_output=True, text=True, encoding='utf-8', errors='replace',
