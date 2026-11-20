@@ -15,7 +15,27 @@ import provider_usage
 import agent_bridge
 import skill_lookup
 
-class BridgeTest(unittest.TestCase):
+class BridgeTestCase(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(agent_bridge, 'windows_sandbox_failure', return_value=None))
+
+
+class BridgeTest(BridgeTestCase):
+    sandbox_probe = staticmethod(agent_bridge.windows_sandbox_failure)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows sandbox probe')
+    def test_windows_sandbox_probe_reports_provisioning_failure(self):
+        with patch.object(agent_bridge, 'codex_executable', return_value='codex'), patch.object(agent_bridge.subprocess, 'run') as run:
+            message = 'windows sandbox failed: app runtime provisioning service is unavailable'
+            run.return_value = Mock(returncode=1, stderr=message)
+            self.assertEqual(self.sandbox_probe(SCRIPTS, 'codex', {}), message)
+            self.assertIn('workspace-write', run.call_args.args[0])
+            run.reset_mock()
+            self.assertIsNone(self.sandbox_probe(SCRIPTS, 'codex', {'agent_approval_mode': 'Full access'}))
+            run.assert_not_called()
+            run.return_value = Mock(returncode=0, stderr='')
+            self.assertIsNone(self.sandbox_probe(SCRIPTS, 'codex', {}))
+
     def test_execution_prompt_is_bounded_and_preclaim_instructions_are_unambiguous(self):
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temp,patch.object(agent_bridge,'worker_filesystem',return_value={}):
             offer={'id':1,'code':'FIX-1','batch':[{'id':i,'code':f'FIX-{i}','title':'Related outcome'} for i in range(1,7)]}
@@ -816,7 +836,7 @@ class BridgeChatTest(unittest.TestCase):
         self.assertEqual(len(args['text']),2000)
 
 
-class ManagedBridgeTest(unittest.TestCase):
+class ManagedBridgeTest(BridgeTestCase):
     def test_deferred_git_failure_starts_recovery_without_another_wakeup(self):
         import git_sync
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:

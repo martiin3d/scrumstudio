@@ -572,6 +572,28 @@ def claude_mcp_config(folder=None,with_mode=False,include_scrum=True):
     return (path,strict) if with_mode else path
 
 
+def windows_sandbox_failure(folder, client, policy):
+    if sys.platform != 'win32' or client != 'codex' or policy.get('agent_approval_mode') == 'Full access':
+        return None
+    executable = codex_executable()
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, '-s', 'workspace-write', 'sandbox', 'windows', '--',
+             str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/cmd.exe'),
+             '/d', '/c', 'exit', '0'],
+            cwd=folder, capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=15, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return next((line.strip()[:500] for line in result.stderr.splitlines()
+                     if 'windows sandbox failed:' in line.lower()), None)
+    return None
+
+
 def preclaim(rpc,project,actor,client,task,observed):
     """Claim the offered task before inference; never launch an unclaimed worker."""
     try:
@@ -949,6 +971,14 @@ def main():
                             chat_event(rpc,args.project,actor,'Capacity retry cancelled: model selection changed; send Wakeup to authorize the new selection.')
                             continue
                     checkout_watch=None;checkout_seen=None
+                    sandbox_error = windows_sandbox_failure(folder, args.client, policy)
+                    if sandbox_error:
+                        release_launch(rpc,args.project,actor)
+                        reason = ('Wakeup held before claiming a task. Repair the Codex Windows sandbox '
+                                  'and press Play again. '+sandbox_error)
+                        print(reason,flush=True)
+                        chat_event(rpc,args.project,actor,reason)
+                        continue
                     # Supervisor pre-claim: start the session and claim the offered task
                     # in local code, so the model spends no turns on work_start/task_get.
                     started=preclaim(rpc,args.project,actor,args.client,offer['id'],observed)
