@@ -40,7 +40,13 @@ Run `python scripts/setup.py --doctor --client both` to inspect bundled skill dr
 
 ## Wiki maintenance
 
-Choose **Add project** in Scrum Studio to scan its folder and preview proposed pages. Answer the goal, first milestone and acceptance questions before applying the plan. **Wiki → Project setup** reopens a saved preview or an interrupted application. Existing topic files are kept and the index gains links to generated topics.
+### Complete project setup
+
+1. For a new project, choose **Add project** in Scrum Studio to scan the folder. If the project is already registered, select it and open **Wiki → Project setup**. CLI registration and task seeding are intermediate steps.
+2. Answer the onboarding questions and choose **Review plan**. Review the proposed Wiki pages and first task, including any overlap with tasks already seeded. Existing topic files are kept and the index gains links to generated topics. An authorized human approves the plan before applying it with **Create wiki and first task**.
+3. Open **Wiki** and verify that it opens with `docs/agents/index.md` before reporting setup complete.
+
+If the plan awaits approval or has yet to be applied, report Wiki setup as pending and direct the user to **Wiki → Project setup** on the existing project. This opens the saved preview when one exists. If application was interrupted, choose **Resume application** there and verify the Wiki after it finishes. For a project with an applied plan, open **Wiki** directly and verify the index.
 
 In **Wiki → Proposed updates**, open the source task to inspect its evidence. Edit the draft before applying it to the working folder, or dismiss it. Publish the reviewed files through the usual Git flow.
 
