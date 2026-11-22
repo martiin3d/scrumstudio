@@ -1,9 +1,12 @@
+import base64
 import json
 from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 import uuid
+from urllib.request import Request, urlopen
 
+from desktop import desktop_backend
 from feature_planning import PRIVATE
 from scripts import feature_planner
 from store import run
@@ -30,6 +33,22 @@ class FeaturePlanningTest(unittest.TestCase):
 
     def submit(self):
         return self.call('submit',actor=self.human,text='Support this feature')
+
+    @patch('feature_planning.launch')
+    def test_shared_http_backend_accepts_feature_upload(self,launch):
+        self.setUpRequest()
+        content=base64.b64encode(b'a'*100_000).decode('ascii')
+        payload={**self.context,'action':'submit','actor':self.human,'text':'Support this feature',
+                 'attachments':[{'name':'reference.txt','content_base64':content}]}
+        with desktop_backend(0) as url:
+            for client in ('','?desktop=1'):
+                with urlopen(url+'/'+client,timeout=3) as response:
+                    self.assertIn(b'app.js',response.read())
+            request=Request(url+'/api/feature_planning',data=json.dumps(payload).encode(),
+                            headers={'Content-Type':'application/json'})
+            with urlopen(request,timeout=3) as response:
+                self.assertEqual(json.load(response)['state'],'queued')
+        self.assertEqual(self.call('list')['requests'][0]['attachments'][0]['size'],100_000)
 
     @patch('feature_planning.launch')
     def test_approval_creates_native_linked_tasks_once(self,launch):
@@ -92,12 +111,28 @@ class FeaturePlanningTest(unittest.TestCase):
     @patch('feature_planning.launch')
     def test_fake_codex_run_records_usage_and_only_proposes(self,launch):
         self.setUpRequest()
-        self.submit()
+        upload={'name':'requirements.txt','content_base64':'aGVsbG8='}
+        with self.assertRaisesRegex(ValueError,'base64'):
+            self.call('submit',actor=self.human,text='Support this feature',
+                      attachments=[upload,dict(upload,content_base64='!!!!')])
+        self.assertEqual(self.call('list')['requests'],[])
+        values={'actor':self.human,'text':'Support this feature','attachments':[upload]}
+        self.call('submit',**values)
+        self.call('submit',**values)
+        launch.assert_called_once()
+        with self.assertRaisesRegex(ValueError,'different attachments'):
+            self.call('submit',**dict(values,attachments=[]))
+        self.call('finish',attempt=1,capability=PRIVATE,error='Planner unavailable')
+        self.call('retry',actor=self.human,attempt=1)
 
         def spawn(argv, **kwargs):
             self.assertIn('read-only',argv)
             self.assertIn('approval_policy="never"',argv)
             self.assertIn('mcp_servers.scrum-studio.enabled=false',argv)
+            payload=json.loads(kwargs['stdin'].read().decode('utf-8').split('\n',1)[1])
+            reference,=payload['attachments']
+            self.assertEqual(reference['name'],'requirements.txt')
+            self.assertEqual((Path(kwargs['cwd'])/reference['path']).read_bytes(),b'hello')
             output=Path(argv[argv.index('--output-last-message')+1])
             output.write_text(json.dumps({'message':'Draft','question':'','items':[task()]}),encoding='utf-8')
             kwargs['stdout'].write(b'{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":10,"cached_input_tokens":20}}\n')
@@ -108,9 +143,10 @@ class FeaturePlanningTest(unittest.TestCase):
              patch.object(feature_planner,'codex_executable',return_value='codex'), \
              patch.object(feature_planner,'discover',return_value=({},[])), \
              patch.object(feature_planner.subprocess,'Popen',side_effect=spawn):
-            feature_planner.main(self.p,self.context['id'],1)
+            feature_planner.main(self.p,self.context['id'],2)
         latest=run('feature_planning',{'project':self.p})['requests'][0]
         self.assertEqual(latest['state'],'ready')
+        self.assertEqual(latest['attachments'],[{'name':'requirements.txt','mime':'text/plain','size':5}])
         self.assertEqual(run('snapshot',{'project':self.p})['tasks'],[])
         usage=run('coordination_metrics',{'project':self.p,'include_cli_usage':True})['cli_usage']
         self.assertEqual((usage['input_tokens'],usage['output_tokens']),(50,10))

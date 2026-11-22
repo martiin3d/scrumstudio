@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 
+import attachments
 import coordination
 import planning
 import runtime
@@ -24,6 +25,35 @@ def ensure(db):
         attempt INTEGER NOT NULL, deadline REAL NOT NULL, updated REAL NOT NULL,
         planner INTEGER, result TEXT NOT NULL DEFAULT '{}', tasks TEXT NOT NULL DEFAULT '[]',
         PRIMARY KEY (project, id))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS feature_request_attachments (
+        project INTEGER NOT NULL, request_id TEXT NOT NULL, position INTEGER NOT NULL,
+        name TEXT NOT NULL, mime TEXT NOT NULL, content BLOB NOT NULL,
+        PRIMARY KEY (project, request_id, position))''')
+
+
+def request_files(db,project,request_id,include_content=False):
+    columns='name,mime,length(content) AS size'
+    if include_content:
+        columns+=',content'
+    return [dict(row) for row in db.execute(
+        f'SELECT {columns} FROM feature_request_attachments WHERE project=? AND request_id=? ORDER BY position',
+        (project,request_id))]
+
+
+def decode_files(items):
+    if not isinstance(items,list) or len(items)>attachments.MAX_FILES:
+        raise ValueError('Choose up to ten attachments per request')
+    files=[]
+    total=0
+    for item in items:
+        if not isinstance(item,dict) or set(item)!={'name','content_base64'}:
+            raise ValueError('Invalid feature attachment fields')
+        name,mime,content=attachments.decode(item['name'],item['content_base64'])
+        total+=len(content)
+        if total>attachments.MAX_BYTES:
+            raise ValueError('Feature attachments must total at most 5 MiB')
+        files.append((name,mime,content))
+    return files
 
 
 def active_actors(db, project):
@@ -82,7 +112,8 @@ def operation(db, project, args):
         raise ValueError('SCRUM is off for this project. Turn it on before asking the planner.')
     ensure(db)
     if kind=='list':
-        return {'requests':[view(row) for row in db.execute('SELECT * FROM feature_requests WHERE project=? ORDER BY updated DESC LIMIT 20',(project,))]}
+        return {'requests':[{**view(row),'attachments':request_files(db,project,row['id'])}
+                            for row in db.execute('SELECT * FROM feature_requests WHERE project=? ORDER BY updated DESC LIMIT 20',(project,))]}
     if kind not in ('begin','finish') and actor_user(db,args)['kind']!='human':
         raise ValueError('Choose an active human profile to manage feature requests')
     request_id=args.get('id')
@@ -94,11 +125,17 @@ def operation(db, project, args):
     row=current()
     if kind=='submit':
         text=required(args.get('text'),'feature request',4000)
+        files=decode_files(args.get('attachments',[]))
         if row:
             if row['request']!=text:raise ValueError('Request ID already exists with different text')
+            saved=request_files(db,project,request_id,include_content=True)
+            if files!=[(item['name'],item['mime'],item['content']) for item in saved]:
+                raise ValueError('Request ID already exists with different attachments')
             return view(row)
         db.execute("INSERT INTO feature_requests(project,id,author,request,state,attempt,deadline,updated) VALUES (?,?,?,?,'queued',1,?,?)",
                    (project,request_id,args['actor'],text,now+LEASE_SECONDS,now))
+        db.executemany('INSERT INTO feature_request_attachments VALUES (?,?,?,?,?,?)',
+                       ((project,request_id,index,*file) for index,file in enumerate(files)))
         return {**view(current()),'_launch':True}
     if not row:raise ValueError('Feature request not found in this project')
     state=live_state(row,now)
@@ -128,7 +165,7 @@ def operation(db, project, args):
         if active_actors(db,project) or not coordination.parallel_available(db,project,planner):raise ValueError('Planner is busy or the project agent limit is reached. Retry when a slot is free.')
         db.execute("UPDATE feature_requests SET state='running',planner=?,updated=?,deadline=? WHERE project=? AND id=?",
                    (planner,now,now+LEASE_SECONDS,project,request_id))
-        return view(current())
+        return {**view(current()),'attachments':request_files(db,project,request_id,include_content=True)}
     expected='running' if args.get('started') or 'draft' in args else 'queued'
     if state!=expected:raise ValueError('The planner attempt is no longer active')
     if 'error' in args:

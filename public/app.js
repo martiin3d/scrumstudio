@@ -1198,20 +1198,68 @@ function mountFeaturePlanner(root,selected){
   root.innerHTML=`<h2>Request a feature</h2><form id="feature-request-form">
     <label for="feature-request">What do you want to add or change?</label>
     <textarea id="feature-request" name="text" rows="4" required maxlength="4000" placeholder="Describe the outcome, who needs it and any constraints…"></textarea>
+    <div class="feature-drop">
+      <label for="feature-files">Attach files or drop them here (optional)</label>
+      <input id="feature-files" type="file" multiple aria-describedby="feature-file-limit" accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.csv,.json,.zip,.docx,.xlsx,.pptx">
+      <small id="feature-file-limit">Up to 10 files, 5 MiB total.</small>
+      <ul class="feature-files"></ul>
+    </div>
     <p id="feature-availability"></p>
     <div class="guided-actions"><button type="button" id="feature-profile" hidden>Choose a human profile</button><button type="submit" class="primary">Ask planner</button></div></form>
     <p class="feature-feedback" role="status"></p><div class="feature-requests"></div>`;
   const list=root.querySelector('.feature-requests'), form=root.querySelector('form'), feedback=root.querySelector('.feature-feedback');
   const profile=root.querySelector('#feature-profile'), submit=form.querySelector('[type=submit]');
+  const input=form.querySelector('#feature-files'), drop=form.querySelector('.feature-drop');
+  const fileList=drop.querySelector('.feature-files');
+  let files=[], submitting=false;
   const updateIdentity=()=>{
     const enabled=state.runtime?.control?.enabled!==0;
     profile.hidden=!!actor;
-    submit.disabled=!actor||!enabled;
+    submit.disabled=submitting||!actor||!enabled;
     root.querySelector('#feature-availability').textContent=enabled?'Asking starts the local Codex planner and uses model tokens. Review its draft before creating tasks.':'SCRUM is off for this project. Turn it on to ask the planner.';
   };
   profile.onclick=chooseHumanProfile;
   let version='', loading, pendingId='', pendingText='';
   const showError=err=>{if(live())feedback.textContent=err.message;};
+
+  function updateFiles(next){
+    files=next;
+    pendingId='';
+    fileList.replaceChildren(...files.map((file,index)=>{
+      const item=document.createElement('li'), remove=document.createElement('button');
+      remove.type='button';remove.textContent='Remove';
+      remove.setAttribute('aria-label','Remove '+file.name);
+      remove.onclick=()=>{if(!submitting)updateFiles(files.filter((_,i)=>i!==index));};
+      item.append(file.name,' ',remove);
+      return item;
+    }));
+  }
+  function addFiles(incoming){
+    if(submitting||!incoming.length)return;
+    const next=[...files,...incoming];
+    if(next.length>10||next.some(file=>!file.size)||next.reduce((total,file)=>total+file.size,0)>5*1024*1024){
+      feedback.textContent='Choose up to 10 nonempty files totaling no more than 5 MiB.';
+      return;
+    }
+    feedback.textContent='';
+    updateFiles(next);
+  }
+  input.onchange=()=>{addFiles(input.files);input.value='';};
+  drop.ondragover=e=>{
+    if(!e.dataTransfer.types.includes('Files'))return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect=submitting?'none':'copy';
+  };
+  drop.ondrop=e=>{e.preventDefault();addFiles(e.dataTransfer.files);};
+
+  function encodeFile(file){
+    return new Promise((resolve,reject)=>{
+      const reader=new FileReader();
+      reader.onload=()=>resolve({name:file.name,content_base64:String(reader.result).split(',')[1]});
+      reader.onerror=()=>reject(Error('Could not read '+file.name));
+      reader.readAsDataURL(file);
+    });
+  }
 
   function show(items){
     const signature=JSON.stringify(items);
@@ -1226,6 +1274,7 @@ function mountFeaturePlanner(root,selected){
         ${state==='question'?`<form class="feature-clarify"><label>Answer<textarea data-feature-answer="${esc(id)}" name="text" required maxlength="1500">${esc(drafts.get(id)||'')}</textarea></label><button type="submit" class="primary">Send and continue</button></form>`:''}
         ${state==='ready'?`<ol>${result.items.map(task=>`<li><strong>${esc(task.title)}</strong><p>${esc(task.description)}</p><ul>${task.acceptance_criteria.map(item=>`<li>${esc(item)}</li>`).join('')}</ul>${task.files.length?`<p>Files · ${esc(task.files.join(', '))}</p>`:''}${task.dependencies.length?`<p>After · ${esc(task.dependencies.map(key=>result.items.find(item=>item.key===key)?.title||key).join(', '))}</p>`:''}${task.specification?`<p>Wiki · ${esc(task.specification.page)} #${esc(task.specification.section)}</p>`:''}${task.required_skills.length?`<p>Skills · ${esc(task.required_skills.join(', '))}</p>`:''}</li>`).join('')}</ol><button type="button" data-feature-action="apply" class="primary">Create tasks on board</button>
         <details><summary>Ask for changes</summary><form class="feature-clarify"><label>Changes<textarea data-feature-answer="${esc(id)}" name="text" required maxlength="1500">${esc(drafts.get(id)||'')}</textarea></label><button type="submit">Revise plan</button></form></details>`:''}
+        ${request.attachments?.length?`<ul aria-label="Attached files">${request.attachments.map(file=>`<li>${esc(file.name)}</li>`).join('')}</ul>`:''}
         ${state==='failed'?'<button type="button" data-feature-action="retry">Retry planning</button>':''}
         ${state==='applied'?`<p>${request.tasks.map(task=>`${esc(task.code)}${task.existing?' (existing)':''}`).join(' · ')}</p>`:''}</article>`;
     }).join('');
@@ -1251,11 +1300,19 @@ function mountFeaturePlanner(root,selected){
       if(live()&&!root.hidden)list.querySelector(`[data-feature-id="${CSS.escape(values.id)}"]`)?.scrollIntoView({block:'nearest'});
     }catch(err){showError(err);}finally{button.disabled=false;updateIdentity();}
   }
-  form.onsubmit=e=>{
+  form.onsubmit=async e=>{
     e.preventDefault();const text=form.elements.text.value.trim();
-    if(!text)return;
+    if(!text||submit.disabled)return;
     if(pendingText!==text||!pendingId){pendingId=crypto.randomUUID().replaceAll('-','');pendingText=text;}
-    send('submit',{id:pendingId,text},e.submitter,()=>{if(form.elements.text.value.trim()===text)form.reset();pendingId='';});
+    submitting=true;input.disabled=true;updateIdentity();
+    try{
+      const attachments=await Promise.all(files.map(encodeFile));
+      await send('submit',{id:pendingId,text,attachments},submit,()=>{
+        if(form.elements.text.value.trim()===text)form.reset();
+        updateFiles([]);
+      });
+    }catch(err){showError(err);}
+    finally{submitting=false;input.disabled=false;updateIdentity();}
   };
   list.onclick=e=>{
     const button=e.target.closest('[data-feature-action]');if(!button)return;

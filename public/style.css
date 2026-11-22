@@ -287,6 +287,9 @@ main > .toolbar[hidden] { display: none; }
 .guided-chat summary { cursor: pointer; }
 .feature-request { border-top: 1px solid var(--border-color); margin-top: 14px; padding-top: 12px; }
 .feature-request li p { margin: 4px 0; }
+.feature-drop { display: grid; gap: 6px; border: 1px dashed var(--border-color); border-radius: 8px; padding: 12px; margin-top: 10px; }
+.feature-files { margin: 0; overflow-wrap: anywhere; }
+.feature-files:empty { display: none; }
 .feature-feedback:empty, #wiki-setup-result:empty { display: none; }
 .chat-thread, .chat-requests { min-width: 0; border: 1px solid var(--border-color); border-radius: 12px; background: var(--panel-bg); }
 .chat-thread-heading { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border-color); }

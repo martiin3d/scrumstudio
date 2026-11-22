@@ -71,6 +71,17 @@ def blob_path(root,key):
     return path
 
 
+def decode(name,encoded):
+    name=filename(name)
+    if not isinstance(encoded,str) or not 1<=len(encoded)<=4*((MAX_BYTES+2)//3):raise ValueError('Attachment content must be base64, at most 5 MiB decoded')
+    try:data=base64.b64decode(encoded,validate=True)
+    except (ValueError,binascii.Error):raise ValueError('Invalid base64 attachment content') from None
+    if not 1<=len(data)<=MAX_BYTES:raise ValueError('Attachment must contain 1 byte to 5 MiB')
+    mime=TYPES[Path(name).suffix.lower()]
+    if mime.startswith('image/'):image_size(data,mime)
+    return name,mime,data
+
+
 def operation(db,a,project,main):
     from store import actor_user,lock_access,now,activity
     import runtime
@@ -88,14 +99,8 @@ def operation(db,a,project,main):
     if mode in ('add','remove'):
         actor=actor_user(db,a);runtime.gate(db,project,actor['id']);lock_access(task,a)
     if mode=='add':
-        name=filename(a.get('name'));encoded=a.get('content_base64')
         if len(items)>=MAX_FILES:raise ValueError('Maximum ten attachments per task')
-        if not isinstance(encoded,str) or not 1<=len(encoded)<=4*((MAX_BYTES+2)//3):raise ValueError('Attachment content must be base64, at most 5 MiB decoded')
-        try:data=base64.b64decode(encoded,validate=True)
-        except (ValueError,binascii.Error):raise ValueError('Invalid base64 attachment content') from None
-        if not 1<=len(data)<=MAX_BYTES:raise ValueError('Attachment must contain 1 byte to 5 MiB')
-        mime=TYPES[Path(name).suffix.lower()]
-        if mime.startswith('image/'):image_size(data,mime)
+        name,mime,data=decode(a.get('name'),a.get('content_base64'))
         item=dict(id=uuid.uuid4().hex,name=name,mime=mime,size=len(data),sha256=hashlib.sha256(data).hexdigest(),created=now(),author=actor['identity'],previewable=mime.startswith('image/'))
         path=blob_path(root,item['id']);root.mkdir(exist_ok=True)
         created=False
