@@ -148,6 +148,10 @@ def advance(db,project,actor,completed,policy,prefix):
     if not db.execute("SELECT 1 FROM tasks WHERE project=? AND id=? AND status='Done'",(project,completed)).fetchone():raise ValueError('Finish the current task before advancing')
     stop=runtime.reason(db,project,actor)
     if stop:return {'batch_done':True,'should_stop':True,'reason':stop}
+    if disabled:=coord.worker_provider_disabled(db,project,actor,row['client']):
+        db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor=?',(project,actor))
+        db.execute('UPDATE context_batches SET done=1 WHERE project=? AND actor=?',(project,actor))
+        return {'batch_done':True,'reason':disabled}
     if row['done']:return {'batch_done':True}
     if members.index(completed)==position:position+=1
     root=task_dict(db.execute('SELECT * FROM tasks WHERE id=?',(members[0],)).fetchone(),prefix)

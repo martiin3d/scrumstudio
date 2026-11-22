@@ -27,6 +27,13 @@ def catalog():
         return {item['slug'] for item in data.get('models',[]) if isinstance(item,dict) and isinstance(item.get('slug'),str)}
     except (OSError,ValueError,TypeError):return set()
 
+def accepts_provider(model,client):
+    if model in ('haiku','sonnet','opus') or model.startswith('claude-'):
+        return client=='claude'
+    if model.startswith('gpt-'):
+        return client=='codex'
+    return True
+
 def select(task,client,profile_model='',available=None):
     if client not in ('codex','claude'):raise ValueError('Invalid model provider')
     validate(task.get('model',''),task.get('model_tier','auto'),task.get('model_reason',''))
@@ -43,7 +50,7 @@ def select(task,client,profile_model='',available=None):
             chosen=next((name for name in routes[tier] if name in known),'')
             if not chosen:reason+='; no known local catalog route, provider default retained'
     model_name(chosen)
-    if chosen.startswith('claude-') and client!='claude' or chosen.startswith('gpt-') and client!='codex':
+    if not accepts_provider(chosen,client):
         raise ValueError('Task model belongs to another provider; choose a matching agent')
     return {'client':client,'model':chosen,'tier':tier,'source':source,
             'reason':reason if source=='automatic' else 'Human '+source+' model override',

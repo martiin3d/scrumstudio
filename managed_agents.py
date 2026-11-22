@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from scripts.cli_runtime import codex_executable,model_name
+from coordination import provider_disabled
 
 ROOT=Path(__file__).resolve().parent
 
@@ -54,7 +55,9 @@ def view(row,sessions,detail=False):
     if detail:result.update(instructions=row['instructions'],usage_file=row['usage_file'])
     return result
 
-def launch(db,row,project,folder,confirmed,sessions,start_now=True):
+def launch(db,row,project,folder,confirmed,sessions,call,start_now=True):
+    if disabled:=provider_disabled(call('project_settings',{'project':project}),row['client']):
+        raise ValueError(disabled)
     if row['client']=='claude' and not confirmed:raise ValueError('Explicit authorization to use the configured Claude account is required')
     session=next((s for s in sessions if s['actor']==row['actor'] and s.get('bridge_connected')),None)
     if session:
@@ -110,7 +113,7 @@ def operation(a,call):
             db.execute('INSERT INTO profiles(id,name,client,instructions,source,usage_file,actor,resume_on_wakeup,model) VALUES(?,?,?,?,?,?,?,?,?)',(key,name.strip(),client,instructions,source.replace('\\','/').split('/')[-1],usage,actor,int(start),model))
             row=profile(db,key);request='created'
             if start:
-                try:request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions)
+                try:request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call)
                 except ValueError as error:
                     db.execute('UPDATE profiles SET error=? WHERE id=?',(str(error)[:500],key));request='launch_failed'
             result=view(profile(db,key),sessions);result['request']=request
@@ -132,7 +135,7 @@ def operation(a,call):
             request='skipped_stopped' # Stop may have arrived after roster discovery.
         else:
             db.execute('UPDATE profiles SET resume_on_wakeup=1 WHERE id=?',(row['id'],))
-            request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,start_now=a.get('start_immediately',True))
+            request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call,start_now=a.get('start_immediately',True))
         result=view(profile(db,row['id']),sessions);result['request']=request
         return result
 
@@ -145,7 +148,8 @@ def wakeup(a,call,signal):
     launches=[]
     try:
         profiles=operation({'project':a['project'],'action':'list'},call)['agents']
-        if not profiles and not result['wakeup']['connected_bridges']:
+        policy=call('project_settings',{'project':a['project']})
+        if not profiles and not result['wakeup']['connected_bridges'] and not provider_disabled(policy,'codex'):
             try:
                 created=operation({'project':a['project'],'actor':a['actor'],'action':'create','name':'Default Codex agent','client':'codex','start_immediately':True},call)
                 launches.append({k:created[k] for k in ('id','name','client','request','error')})
@@ -156,7 +160,9 @@ def wakeup(a,call,signal):
         for profile in profiles:
             if not profile['resume_on_wakeup']:continue
             entry={k:profile[k] for k in ('id','name','client')}
-            if profile['connected']:
+            if disabled:=provider_disabled(policy,profile['client']):
+                entry.update(request='skipped_disabled',error=disabled)
+            elif profile['connected']:
                 entry['request']='signal_sent'
             elif profile['status']=='starting':
                 entry['request']='starting'
@@ -176,7 +182,9 @@ def wakeup(a,call,signal):
             result['wakeup'].update(status='starting',message=f'Starting {len(starting)} agent connection(s). Provider execution waits for fresh quota.',next_step='Open Agents or Chat for connection, quota and execution status.')
         elif errors:
             result['wakeup'].update(status='launch_failed',message='Wakeup could not start the requested agent set.')
-        elif profiles and not any(item['request']!='skipped_stopped' for item in launches) and not result['wakeup']['connected_bridges']:
+        elif (not policy['codex_enabled'] and not policy['claude_enabled']) or (launches and all(item['request']=='skipped_disabled' for item in launches) and not result['wakeup']['connected_bridges']):
+            result['wakeup'].update(status='providers_disabled',message='No enabled provider is available for the saved agent roster.',next_step='Review Codex and Claude in Project Settings.')
+        elif profiles and not any(item['request'] not in ('skipped_stopped','skipped_disabled') for item in launches) and not result['wakeup']['connected_bridges']:
             result['wakeup'].update(status='profiles_stopped',message='All saved agents are individually stopped or not enabled for Wakeup.',next_step='Open Agents and use Start / continue on the agents you want to include. Wakeup will remember that enabled set.')
         if errors:
             result['wakeup']['next_step']=' '.join(item['name']+': '+item['error'] for item in errors)+' Open Agents to resolve the failed or unauthorized profiles; successful starts are preserved.'

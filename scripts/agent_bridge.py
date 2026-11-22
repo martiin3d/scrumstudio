@@ -1041,6 +1041,8 @@ def main():
                             prompt_input.write(prompt.encode('utf-8'));prompt_input.seek(0)
                             launch=interactive_command(command(args.client,run_folder,prompt,selected_model,policy_folder=folder,coordination_channel=channel),args.client,args.project,actor,run_folder,selected_model,policy)
                             cost_path=Path(folder)/'.scrum/local/run-cost'/f'{actor}.json'
+                            if rpc.call('project_settings',{'project':args.project}).get(args.client+'_enabled') is False:
+                                raise ValueError(args.client+' is disabled in Project Settings')
                             child=subprocess.Popen(launch,cwd=run_folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**worker_env,'SCRUM_RUN_COST_STATE':str(cost_path)},**options)
                             overhead.record_startup(args.project,actor,run_id,args.client,selected_model,started.get('measurement_session'),run_tasks,len(prompt.encode('utf-8')),prompt_sections)
                             cost_watch=run_cost.Watch(log_path,log_offset,cost_path,run_id,run_tasks,policy,args.client)

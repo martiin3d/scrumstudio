@@ -8,10 +8,40 @@ from pathlib import Path
 
 from git_sync import GIT_DEFAULTS, validate as validate_git
 from run_cost import DEFAULTS as COST_DEFAULTS
-POLICY_DEFAULTS = {'file_lock_policy':'Always','execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'cli','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **GIT_DEFAULTS, **COST_DEFAULTS}
+
+PROVIDER_SETTINGS = {'codex':'codex_enabled', 'claude':'claude_enabled'}
+POLICY_DEFAULTS = {'file_lock_policy':'Always','execution_instructions':'','autonomy_mode':'Standard','coordination_channel':'cli','agent_followup_tasks':False,'agent_approval_mode':'Auto review', 'workflow_mode':'Auto', 'task_sizing':'Small', 'session_stop_percent':92, 'weekly_stop_percent':94, 'usage_guard':True, 'usage_check_seconds':60, 'auto_resume_session_quota':False,'max_parallel_agents':1, **dict.fromkeys(PROVIDER_SETTINGS.values(), True), **GIT_DEFAULTS, **COST_DEFAULTS}
+
+
+def provider_disabled(policy, client):
+    key=PROVIDER_SETTINGS.get(client)
+    if key in policy.keys() and not policy[key]:
+        return ('Codex' if client=='codex' else 'Claude')+' is disabled in Project Settings'
+    return ''
+
+
+def worker_provider_disabled(db, project, actor, client=None):
+    policy=db.execute('SELECT codex_enabled,claude_enabled FROM projects WHERE id=?',(project,)).fetchone()
+    if all(policy):return ''
+    session=db.execute('SELECT client FROM agent_sessions WHERE project=? AND actor=?',(project,actor)).fetchone()
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='context_batches'").fetchone():
+        batch=db.execute('SELECT client FROM context_batches WHERE project=? AND actor=? AND done=0',(project,actor)).fetchone()
+        if batch and (reason:=provider_disabled(policy,batch['client'])):return reason
+    return provider_disabled(policy,client) or (provider_disabled(policy,session['client']) if session else '')
+
+
+def revoke_disabled_offers(db, project, client):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone():
+        return
+    db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor IN (SELECT actor FROM agent_sessions WHERE project=? AND client=?)',(project,project,client))
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='context_batches'").fetchone():
+        db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor IN (SELECT actor FROM context_batches WHERE project=? AND client=?)',(project,project,client))
 
 def validate_policy(changed):
     validate_git(changed)
+    for key in PROVIDER_SETTINGS.values():
+        if key in changed and (type(changed[key]) not in (bool,int) or changed[key] not in (0,1)):
+            raise ValueError(key+' must be boolean')
     if 'file_lock_policy' in changed and changed['file_lock_policy'] not in ('Auto','Always'):raise ValueError('file_lock_policy must be Auto or Always')
     if 'execution_instructions' in changed and (not isinstance(changed['execution_instructions'],str) or len(changed['execution_instructions'])>4000 or '\x00' in changed['execution_instructions']):raise ValueError('execution_instructions must be text, max4000 characters')
     if 'autonomy_mode' in changed and changed['autonomy_mode'] not in ('Standard','Autonomous'):raise ValueError('autonomy_mode must be Standard or Autonomous')
@@ -75,7 +105,7 @@ def migrate(db, separate=False):
 
 
 def settings(row):
-    return {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup','git_pause_blocked'] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+    return {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup','git_pause_blocked',*PROVIDER_SETTINGS.values()] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
 
 
 def active_count(db, project, actor, exclude=-1):
@@ -310,6 +340,9 @@ def operation(db, action, a, project_row, actor_user, activity, now):
             changed['workspace_root']=root
         for field,value in changed.items():
             db.execute(f'UPDATE projects SET {field}=? WHERE id=?',(value,project))
+        for client,key in PROVIDER_SETTINGS.items():
+            if current[key] and not changed.get(key,True):
+                revoke_disabled_offers(db,project,client)
         if changed.get('auto_resume_session_quota') is False:
             db.execute("UPDATE agent_sessions SET resume_reset=NULL,auto_resume_status='disabled' WHERE project=?",(project,))
         db.execute('UPDATE projects SET settings_version=settings_version+1 WHERE id=?',(project,))

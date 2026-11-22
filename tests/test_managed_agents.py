@@ -1,4 +1,5 @@
 import unittest
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from store import run
 class ManagedAgentTest(unittest.TestCase):
     def test_supervisor_can_reconnect_without_requesting_model_work(self):
         p,_=self.project();profile=self.create(p,start_immediately=False)
-        with patch('managed_agents.subprocess.Popen') as spawn:
+        with patch('managed_agents.shutil.which',return_value='codex'),patch('managed_agents.subprocess.Popen') as spawn:
             result=run('agent_manage',dict(project=p,actor=self.human,id=profile['id'],action='start',start_immediately=False))
         self.assertTrue(result['enabled'])
         self.assertNotIn('--start-now',spawn.call_args.args[0])
@@ -56,6 +57,90 @@ class ManagedAgentTest(unittest.TestCase):
         return run('agent_manage',dict(project=p,action='create',actor=self.human,name='Builder',**extra))
     def wake(self,p,**extra):
         return run('project_control',dict(project=p,actor=self.human,action='wakeup',**extra))
+
+    def test_provider_settings_persist_and_gate_the_wakeup_roster(self):
+        for codex,claude in ((True,True),(True,False),(False,True),(False,False)):
+            with self.subTest(codex=codex,claude=claude):
+                p,folder=self.project()
+                policy={'codex_enabled':codex,'claude_enabled':claude}
+                with patch('managed_agents.shutil.which',side_effect=lambda client:client),patch('managed_agents.subprocess.Popen') as spawn:
+                    for client in ('codex','claude'):
+                        run('agent_manage',dict(project=p,actor=self.human,action='create',name=client,client=client,
+                            usage_file=str(folder/'usage.json'),confirm_client_account=True))
+                    spawn.reset_mock()
+                    run('project_settings',dict(project=p,actor=self.human,**policy))
+                    reopened=run('project_open',dict(path=str(folder)))['id']
+                    settings=run('project_settings',dict(project=reopened))
+                    self.assertEqual({key:settings[key] for key in policy},policy)
+                    for client,enabled in (('codex',codex),('claude',claude)):
+                        if enabled:continue
+                        profile=next(row for row in run('agent_manage',dict(project=p))['agents'] if row['client']==client)
+                        with self.assertRaisesRegex(ValueError,'disabled in Project Settings'):
+                            run('agent_manage',dict(project=p,actor=self.human,action='start',id=profile['id'],confirm_client_account=True))
+                    with patch('managed_agents.time.time',return_value=time.time()+21):
+                        self.wake(p,confirm_client_account=True)
+                    self.assertEqual([call.args[0][call.args[0].index('--client')+1] for call in spawn.call_args_list],
+                                     [client for client,enabled in (('claude',claude),('codex',codex)) if enabled])
+
+    def test_provider_defaults_for_legacy_snapshot_and_no_disabled_default_launch(self):
+        p,folder=self.project()
+        run('project_settings',dict(project=p,actor=self.human,codex_enabled=False,claude_enabled=False))
+        with patch('managed_agents.subprocess.Popen') as spawn:
+            self.assertEqual(self.wake(p)['wakeup']['status'],'providers_disabled')
+            spawn.assert_not_called()
+        self.assertEqual(run('agent_manage',dict(project=p))['agents'],[])
+        run('project_export',dict(project=p))
+        clone=test_storage.StorageTest.clone
+        restored,_=clone(self,folder)
+        persisted=run('project_settings',dict(project=restored['id']))
+        self.assertFalse(persisted['codex_enabled'])
+        self.assertFalse(persisted['claude_enabled'])
+        snapshot=folder/'.scrum/snapshot.json'
+        data=json.loads(snapshot.read_text(encoding='utf-8'))
+        for key in ('codex_enabled','claude_enabled'):
+            data['settings'].pop(key)
+        snapshot.write_text(json.dumps(data),encoding='utf-8')
+        legacy,_=clone(self,folder)
+        settings=run('project_settings',dict(project=legacy['id']))
+        self.assertTrue(settings['codex_enabled'])
+        self.assertTrue(settings['claude_enabled'])
+
+    def test_disabled_offer_cannot_be_claimed_or_block_enabled_worker(self):
+        p,_=self.project()
+        codex=self.create(p,start_immediately=False)['actor']
+        claude=run('agent_manage',dict(project=p,actor=self.human,action='create',name='Claude',client='claude',start_immediately=False))['actor']
+        for client,actor in (('codex',codex),('claude',claude)):
+            run('agent_checkpoint',dict(project=p,actor=actor,client=client,session_used_percent=10,weekly_used_percent=10))
+        fixed=run('task_create',dict(project=p,title='Codex task',description='Bounded outcome',acceptance_criteria=['Verified'],model='gpt-6.2-sol',actor=self.human))['id']
+        shared=run('task_create',dict(project=p,title='Shared task',description='Bounded outcome',acceptance_criteria=['Verified'],files=['shared.py']))['id']
+        successor=run('task_create',dict(project=p,title='Next shared task',description='Bounded outcome',acceptance_criteria=['Verified'],files=['shared.py']))['id']
+        run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=2))
+        self.assertEqual(run('worker_launch',dict(project=p,actor=codex,client='codex',id=fixed))['id'],fixed)
+        self.assertEqual(run('worker_launch',dict(project=p,actor=claude,client='claude'))['id'],shared)
+        for actor in (codex,claude):
+            run('worker_launch',dict(project=p,actor=actor,action='release'))
+        run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=1))
+        offer=run('worker_launch',dict(project=p,actor=codex,client='codex',id=shared))
+        self.assertEqual(offer['id'],shared)
+        self.assertFalse(run('worker_launch',dict(project=p,actor=claude,client='claude'))['eligible'])
+        run('project_settings',dict(project=p,actor=self.human,codex_enabled=False))
+        for operation,extra in [('task_claim',{}),('task_update',{'claim':True})]:
+            with self.assertRaisesRegex(ValueError,'Codex is disabled'):
+                run(operation,dict(project=p,id=shared,actor=codex,**extra))
+        self.assertFalse(run('worker_launch',dict(project=p,actor=codex,client='codex'))['eligible'])
+        offer=run('worker_launch',dict(project=p,actor=claude,client='claude'))
+        self.assertEqual(offer['id'],shared)
+        self.assertEqual([task['id'] for task in offer['batch']],[shared,successor])
+        claim=run('task_claim',dict(project=p,id=shared,actor=claude))
+        self.assertTrue(claim['claimed'])
+        run('project_settings',dict(project=p,actor=self.human,claude_enabled=False))
+        finished=run('work_finish',dict(project=p,actor=claude,id=shared,token=claim['token'],client='claude',
+            evidence='Tested',use_batch=True,claim_next=True))
+        self.assertEqual(finished['completed']['status'],'Done')
+        self.assertTrue(finished['next']['batch_done'])
+        self.assertNotIn('claim',finished['next'])
+        self.assertEqual(run('task_get',dict(project=p,id=fixed))['status'],'TODO')
+        self.assertEqual(run('task_get',dict(project=p,id=successor))['status'],'TODO')
 
     def test_deleted_managed_identity_is_marked_and_can_be_restored(self):
         p,_=self.project()

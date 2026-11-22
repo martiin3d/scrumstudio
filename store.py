@@ -784,6 +784,8 @@ def legacy_run(action, a, path=None, locks=None):
             if not row:
                 raise ValueError('Task not found')
             if action=='task_claim' and actor['kind']=='agent':
+                if row['owner_id']!=actor['id'] or row['lock_until']<=time.time():
+                    if reason:=coord.worker_provider_disabled(db,project,actor['id']):raise ValueError(reason)
                 import scheduling
                 if scheduling.human_only(dict(row)):raise ValueError('Human review requires a human; no agent claim or model run is allowed')
             if action == 'task_release':
@@ -913,7 +915,9 @@ def legacy_run(action, a, path=None, locks=None):
             if type(claiming) is not bool:
                 raise ValueError('claim must be boolean')
             if claiming:
-                actor_user(db, a)
+                actor=actor_user(db, a)
+                if actor['kind']=='agent' and (old['owner_id']!=actor['id'] or old['lock_until']<=time.time()):
+                    if reason:=coord.worker_provider_disabled(db,project,actor['id']):raise ValueError(reason)
                 import context_batches
                 context_batches.check_claim(db,project,old['id'],a['actor'])
                 if a.get('status', 'In Progress') != 'In Progress':
@@ -1223,6 +1227,13 @@ def legacy_run(action, a, path=None, locks=None):
             stop=runtime.reason(db,project,a.get('actor')) if a.get('actor') is not None or runtime.control(db,project)['paused'] else ''
             if stop and not preview:
                 return {'task':None,'should_stop':True,'reason':stop,'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None,'instruction':'Stop editing; call agent_checkpoint at a safe boundary to save handoff and release own work.'}
+            disabled=coord.worker_provider_disabled(db,project,a.get('actor'),a.get('client'))
+            if action=='worker_launch' and not (project_row['codex_enabled'] or project_row['claude_enabled']):
+                disabled=disabled or 'Codex and Claude are disabled in Project Settings'
+            if disabled and not preview:
+                if action=='worker_launch':return {'eligible':False,'reason':disabled}
+                return {'task':None,'reason':disabled,'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None}
+            stop=stop or disabled
             import context_tools
             if a.get('actor') is not None and not coord.parallel_available(db,project,a['actor']):
                 if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
@@ -1341,6 +1352,10 @@ def legacy_run(action, a, path=None, locks=None):
                     branch_skipped=len(candidates)-len(keep)
                     candidates=keep
             if action=='worker_launch' and a.get('id') is not None:candidates=[t for t in candidates if t['id']==a['id']]
+            if a.get('client'):
+                import model_routing
+                profile_model=model_routing.profile_model(project_row['workspace_root'],a['actor']) if a.get('actor') is not None else ''
+                candidates=[t for t in candidates if model_routing.accepts_provider(t.get('model') or profile_model,a['client'])]
             if preview:
                 import project_knowledge
                 selected=candidates[0] if candidates else None
@@ -1364,7 +1379,7 @@ def legacy_run(action, a, path=None, locks=None):
                 selection={}
                 if a.get('client'):
                     import model_routing
-                    selection=model_routing.select(selected,a['client'],model_routing.profile_model(project_row['workspace_root'],a['actor']))
+                    selection=model_routing.select(selected,a['client'],profile_model)
                     db.execute('UPDATE tasks SET model_selection=? WHERE id=?',(json.dumps(selection),selected['id']))
                     if selected.get('model_selection')!=selection:activity(db,selected['id'],a['actor'],'comment','Model selected: '+(selection['model'] or 'Provider default')+' ('+selection['source']+'): '+selection['reason'])
                 db.execute('INSERT INTO worker_launch_offers(project,actor,task,expires) VALUES(?,?,?,?) ON CONFLICT(project,actor) DO UPDATE SET task=excluded.task,expires=excluded.expires',(project,a['actor'],selected['id'],time.time()+600))

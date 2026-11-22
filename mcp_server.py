@@ -92,7 +92,7 @@ for _name,_description,_schema in TOOLS:
     if _name=='task_create':_schema['properties']['status']={'type':'string','enum':['TODO','Backlog']}
     if _name=='worker_launch':_schema['properties']['client']={'type':'string','enum':['codex','claude']}
     if _name=='work_finish':_schema['properties'].update(use_batch=B,claim_next=B)
-    if _name=='project_settings':_schema['properties'].update(execution_instructions={'type':'string','maxLength':4000},autonomy_mode={'type':'string','enum':['Standard','Autonomous']},coordination_channel={'type':'string','enum':['mcp','cli']},agent_followup_tasks=B,max_parallel_agents=I,agent_approval_mode={'type':'string','enum':['Auto review','Ask in chat','Full access']})
+    if _name=='project_settings':_schema['properties'].update(execution_instructions={'type':'string','maxLength':4000},autonomy_mode={'type':'string','enum':['Standard','Autonomous']},coordination_channel={'type':'string','enum':['mcp','cli']},agent_followup_tasks=B,max_parallel_agents=I,codex_enabled=B,claude_enabled=B,agent_approval_mode={'type':'string','enum':['Auto review','Ask in chat','Full access']})
     if _name=='note_add':_schema['properties'].update(task=I,audience={'type':'string','enum':['human','agent']})
     if _name=='task_get':_schema['properties'].update(full=B,files_after=I,files_limit=I,inputs_after=I,inputs_limit=I,include_notes=B,notes_content=B,notes_after=I,notes_limit=I,notes_audience={'type':'string','enum':['agent','human','all']})
     if _name=='project_settings':
