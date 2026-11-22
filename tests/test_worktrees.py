@@ -1,3 +1,4 @@
+import json
 import unittest
 import subprocess
 from pathlib import Path
@@ -252,7 +253,7 @@ class WorktreeTest(unittest.TestCase):
         result=run('project_workspaces',dict(project=project,actor=self.human))
         preview=result['workspaces'][0]['cleanup']
         self.assertEqual(preview['integration'],'equivalent_content')
-        self.assertIn('local_or_ignored_files',preview['retention_reasons'])
+        self.assertTrue(preview['archive_required'])
         self.assertIn('verified_ancestry_required',preview['retention_reasons'])
         self.assertIn('worker_exit_unconfirmed',preview['retention_reasons'])
         self.assertEqual(git('show-ref'),before)
@@ -277,14 +278,41 @@ class WorktreeTest(unittest.TestCase):
         self.assertEqual(resumed['git']['parent'],'main');self.assertEqual((work/'a.py').read_text(),'completed')
 
     @NEEDS_MERGE_TREE
-    def test_cleanup_preserves_untracked_and_ignored_files(self):
+    def test_cleanup_archives_staged_unstaged_untracked_and_ignored_files(self):
         project,folder,git=self.setup_repo(git_merge='Group',git_cleanup=True)
         task=self.task(project,'Keep files','a.py')
         claim=run('task_claim',dict(project=project,id=task,actor=self.agent));work=Path(claim['git']['worktree'])
-        (work/'a.py').write_text('completed');(work/'.scrum').mkdir();(work/'.scrum/private').write_text('keep')
+        (work/'a.py').write_text('completed')
         run('work_finish',dict(project=project,id=task,actor=self.agent,token=claim['token'],evidence='Verified'))
+        staged=b'\x00staged\r\n'
+        (work/'b.py').write_bytes(staged)
+        _git_sync._git(work,'add','b.py').check_returncode()
+        staged_blob=_git_sync._git(work,'rev-parse',':b.py').stdout.strip()
+        (work/'b.py').write_bytes(b'unstaged\n')
+        (work/'notes').write_text('untracked')
+        (work/'.scrum').mkdir(exist_ok=True)
+        (work/'.scrum/private').write_text('keep')
         result=run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='offline',run_exit_code=0))
-        self.assertFalse(result['git_cleanup'][0]['removed']);self.assertEqual((work/'.scrum/private').read_text(),'keep')
+        outcome=result['git_cleanup'][0]
+        self.assertTrue(outcome['removed'])
+        self.assertTrue(outcome['branch_preserved'])
+        self.assertFalse(work.exists())
+        self.assertEqual(git('rev-parse',claim['git']['branch']),outcome['head'])
+        backup=Path(outcome['archive'])
+        self.assertEqual((backup/'b.py').read_bytes(),b'unstaged\n')
+        self.assertEqual((backup/'notes').read_text(),'untracked')
+        self.assertEqual((backup/'.scrum/private').read_text(),'keep')
+        manifest=Path(outcome['manifest'])
+        self.assertEqual(json.loads(manifest.read_text())['state'],'archived')
+        def index_blob(index):
+            return _git_sync._git(folder,'rev-parse',':b.py',index_file=index).stdout.strip()
+        self.assertEqual(index_blob(manifest.with_name('index')),staged_blob)
+        recovered_index=manifest.with_name('recovered-index')
+        _git_sync._git(folder,'read-tree',outcome['head'],index_file=recovered_index).check_returncode()
+        _git_sync._git(folder,'apply','--cached',str(manifest.with_name('staged.patch')),index_file=recovered_index).check_returncode()
+        self.assertEqual(index_blob(recovered_index),staged_blob)
+        preview=run('project_workspaces',dict(project=project,actor=self.human))
+        self.assertIn(outcome,preview['cleanup_results'])
 
     @NEEDS_MERGE_TREE
     def test_cleanup_keeps_parent_needed_by_another_branch(self):
@@ -295,6 +323,8 @@ class WorktreeTest(unittest.TestCase):
         git('branch','dependent',claim['git']['branch']);git('config','branch.dependent.scrum-parent',claim['git']['branch'])
         result=run('agent_checkpoint',dict(project=project,actor=self.agent,client='codex',action='offline',run_exit_code=0))
         self.assertIn('origin',result['git_cleanup'][0]['reason']);self.assertTrue(work.exists())
+        preview=run('project_workspaces',dict(project=project,actor=self.human))
+        self.assertEqual(preview['workspaces'][0]['cleanup_result'],result['git_cleanup'][0])
 
     @NEEDS_MERGE_TREE
     def test_cleanup_defers_for_new_related_work_and_rechecks_after_later_exit(self):

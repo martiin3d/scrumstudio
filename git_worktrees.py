@@ -115,6 +115,8 @@ def prepare(root,settings,task):
     for value in saved.values():
         if value['branch']==target:value.pop('cleanup',None)
     saved[identity(task)]={'path':str(path),'branch':target}
+    if existing and 'cleanup_result' in existing:
+        saved[identity(task)]['cleanup_result']=existing['cleanup_result']
     save(root,saved)
     return {'branch':target,'worktree':str(path),'canonical_root':str(root),'parent':git.parent_branch(root,target),**extra}
 
@@ -146,7 +148,6 @@ def cleanup_preview(root,item,settings,related_work):
     if git_paused.pending(root,source):reasons.append('preserved_unfinished_work')
     status=git._git(path,'status','--porcelain','--untracked-files=all','--ignored')
     if status.returncode:reasons.append('status_unavailable')
-    elif status.stdout.strip():reasons.append('local_or_ignored_files')
     parents=git._git(root,'config','--local','--get-regexp',r'^branch\..*\.scrum-parent$')
     if parents.returncode not in (0,1):reasons.append('parent_refs_unavailable')
     elif any(line.split(' ',1)[-1]==source for line in parents.stdout.splitlines()):reasons.append('dependent_branch')
@@ -165,7 +166,8 @@ def cleanup_preview(root,item,settings,related_work):
         except (ValueError,OSError,subprocess.SubprocessError):
             pass
     if integration!='ancestor':reasons.append('verified_ancestry_required')
-    return {'target':target,'integration':integration,'retention_reasons':reasons}
+    return {'target':target,'integration':integration,'retention_reasons':reasons,
+            'archive_required':not status.returncode and bool(status.stdout.strip())}
 
 
 def archive(root,confirm=False,settings=None,related_work=None):
@@ -187,43 +189,73 @@ def archive(root,confirm=False,settings=None,related_work=None):
             group=groups.get(str(path))
             if group is None:
                 group={'path':str(path),'branch':item['branch'],'tasks':[]}
+                if 'cleanup_result' in item:group['cleanup_result']=item['cleanup_result']
                 if not confirm and settings is not None:
                     group['cleanup']=cleanup_preview(root,dict(item,path=str(path)),settings,related_work)
                 groups[str(path)]=group
             group['tasks'].append(key)
-        if not confirm:return {'workspaces':list(groups.values()),'confirmed':False}
+        if not confirm:
+            completed={item['branch']:item['cleanup_result'] for item in saved.values()
+                       if item.get('cleaned') and 'cleanup_result' in item}
+            return {'workspaces':list(groups.values()),'cleanup_results':list(completed.values()),'confirmed':False}
         reports=[]
         for location,item in groups.items():
             path=Path(location)
             if not path.is_relative_to(root/'.scrum/local/worktrees') or path==root:
                 raise ValueError('Refusing to detach a path outside managed worktrees')
-            archive_root=root/'.scrum/local/worktree-archives'
-            if not archive_root.resolve().is_relative_to(root/'.scrum/local'):
-                raise ValueError('Archive path escapes project-local storage')
-            archive_root.mkdir(parents=True,exist_ok=True)
-            archive_dir=Path(tempfile.mkdtemp(prefix='workspace-',dir=archive_root))
-            contents=archive_dir/'files';contents.mkdir()
-            manifest=dict(item,head=git._git(path,'rev-parse','HEAD').stdout.strip(),state='preserving')
-            record=archive_dir/'manifest.json';record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
-            moved=[]
-            try:
-                for child in list(path.iterdir()):
-                    if child.name=='.git':continue
-                    shutil.move(str(child),str(contents/child.name));moved.append(child.name)
-                removed=git._git(root,'worktree','remove','--force',str(path),timeout=30)
-                if removed.returncode:raise ValueError('Could not detach preserved worktree: '+removed.stderr[-400:])
-            except BaseException:
-                if (path/'.git').is_file():
-                    for name in reversed(moved):
-                        if not (path/name).exists():shutil.move(str(contents/name),str(path/name))
-                manifest['state']='recovery_required';record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
-                raise
-            manifest['state']='archived';record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+            reports.append(archive_workspace(root,path,item))
             for key in item['tasks']:saved.pop(key,None)
             save(root,saved)
-            reports.append(dict(item,archive=str(contents),head=manifest['head']))
         save(root,{key:value for key,value in saved.items() if not value.get('cleaned')})
         return {'workspaces':reports,'confirmed':True,'branches_preserved':True}
+
+
+def git_output(path,*args):
+    import git_sync as git
+    result=git._git(path,*args,timeout=30)
+    if result.returncode:raise ValueError((result.stderr or result.stdout).strip()[-400:])
+    return result.stdout
+
+
+def archive_workspace(root,path,item):
+    import git_sync as git
+    head=git_output(path,'rev-parse','HEAD').strip()
+    git_dir=Path(git_output(path,'rev-parse','--absolute-git-dir').strip())
+    archive_root=root/'.scrum/local/worktree-archives'
+    if not archive_root.resolve().is_relative_to(root/'.scrum/local'):
+        raise ValueError('Archive path escapes project-local storage')
+    archive_root.mkdir(parents=True,exist_ok=True)
+    archive_dir=Path(tempfile.mkdtemp(prefix='workspace-',dir=archive_root))
+    contents=archive_dir/'files'
+    shutil.copy2(git_dir/'index',archive_dir/'index')
+    shared=git_output(path,'rev-parse','--shared-index-path').strip()
+    if shared:
+        shared_path=path/shared
+        shutil.copy2(shared_path,archive_dir/shared_path.name)
+    # The patch retains staged content even if Git later prunes its blobs.
+    git_output(path,'diff','--cached','--binary','--full-index','--no-ext-diff','--no-textconv',
+               '--no-renames','--output='+str(archive_dir/'staged.patch'),head,'--')
+    manifest=dict(item,head=head,state='preserving')
+    record=archive_dir/'manifest.json'
+    record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+    link=archive_dir/'worktree-link'
+    moved=False
+    try:
+        # Move the whole checkout first so Git only removes its registration.
+        path.rename(contents)
+        moved=True
+        (contents/'.git').rename(link)
+        git_output(root,'worktree','remove',str(path))
+    except BaseException:
+        manifest['state']='recovery_required'
+        record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+        if moved and git_dir.is_dir() and not os.path.lexists(path):
+            if link.is_file():link.rename(contents/'.git')
+            contents.rename(path)
+        raise
+    manifest['state']='archived'
+    record.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+    return dict(item,archive=str(contents),manifest=str(record),head=head)
 
 
 def queue_cleanup(root,merge,actor):
@@ -263,6 +295,7 @@ def related_pending(root,source,tasks,settings,prefix):
 def cleanup(root,actor,related_work=None):
     """Only called after the supervisor reports that its CLI process exited."""
     import git_sync as git
+    root=Path(root).resolve()
     results=[]
     if not any(v.get('cleanup',{}).get('actor')==actor or v.get('cleanup',{}).get('worker_exited') for v in entries(root).values()):return results
     with git.checkout_lock(root):
@@ -272,43 +305,64 @@ def cleanup(root,actor,related_work=None):
         for source in sorted({v['branch'] for v in saved.values() if v.get('cleanup',{}).get('worker_exited')}):
             item=next(v for v in saved.values() if v['branch']==source and v.get('cleanup',{}).get('worker_exited'))
             pending=item['cleanup'];result={'branch':source,'removed':False}
-            if related_work is None or related_work(source):
-                results.append(dict(result,reason='related unfinished work or unknown task state'));continue
+            retry=False
             try:
+                if related_work is None or related_work(source):
+                    retry=True
+                    raise ValueError('related unfinished work or unknown task state')
                 import git_paused
                 if git_paused.pending(root,source):raise ValueError('branch contains preserved unfinished work')
+                tasks=[key for key,value in saved.items() if value['branch']==source]
                 path=workspace(root,next(k for k,v in saved.items() if v is item))
                 common=git._git(path,'rev-parse','--path-format=absolute','--git-common-dir')
                 original=git._git(root,'rev-parse','--path-format=absolute','--git-common-dir')
                 if common.returncode or original.returncode or common.stdout.strip()!=original.stdout.strip():raise ValueError('workspace repository changed')
+                if git_output(path,'symbolic-ref','HEAD').strip()!='refs/heads/'+source:
+                    raise ValueError('workspace branch changed')
+                git_dir=Path(git_output(path,'rev-parse','--absolute-git-dir').strip())
+                operations=('MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge',
+                            'rebase-apply','sequencer','BISECT_START','index.lock')
+                if any((git_dir/name).exists() for name in operations):
+                    raise ValueError('workspace has a Git operation in progress')
                 tip=git._git(root,'rev-parse','--verify','refs/heads/'+source)
                 if tip.returncode or tip.stdout.strip()!=pending['source_sha']:raise ValueError('source changed or missing')
                 if git._git(root,'merge-base','--is-ancestor',pending['source_sha'],'refs/heads/'+pending['target']).returncode:raise ValueError('source is no longer integrated')
                 parents=git._git(root,'config','--local','--get-regexp',r'^branch\..*\.scrum-parent$')
                 if parents.returncode not in (0,1):raise ValueError('cannot inspect dependent branches')
-                if any(line.split(' ',1)[-1]==source for line in parents.stdout.splitlines()):raise ValueError('branch is the origin of another branch')
+                if any(line.split(' ',1)[-1]==source for line in parents.stdout.splitlines()):
+                    retry=True
+                    raise ValueError('branch is the origin of another branch')
                 trees=git._git(root,'worktree','list','--porcelain')
                 if trees.returncode:raise ValueError('cannot inspect worktrees')
                 for record in trees.stdout.split('\n\n'):
                     if 'branch refs/heads/'+source in record.splitlines():
                         location=next(line[9:] for line in record.splitlines() if line.startswith('worktree '))
                         if Path(location).resolve()!=Path(path).resolve():raise ValueError('branch is checked out elsewhere')
-                # Include ignored files: caches/build outputs may contain valuable local data.
-                status=git._git(path,'status','--porcelain','--untracked-files=all','--ignored')
-                if status.returncode or status.stdout.strip():raise ValueError('workspace contains local or ignored files')
-                removed=git._git(root,'worktree','remove',path,timeout=20)
-                if removed.returncode:raise ValueError(removed.stderr.strip()[-300:])
-                deleted=git._git(root,'update-ref','-d','refs/heads/'+source,pending['source_sha'])
-                for value in saved.values():
-                    if value['branch']==source:
-                        value.update(cleaned=True,parent=pending['target']);value.pop('cleanup',None)
-                if deleted.returncode:raise ValueError('folder removed; branch changed concurrently and was retained')
-                git._git(root,'config','--local','--remove-section','branch.'+source)
-                result['removed']=True
+                status=git_output(path,'status','--porcelain','--untracked-files=all','--ignored')
+                flags=git_output(path,'ls-files','-v','-z')
+                hidden_changes=any(entry and (entry[0]=='S' or entry[0].islower()) for entry in flags.split('\0'))
+                if status.strip() or hidden_changes:
+                    index=git_output(path,'ls-files','--stage')
+                    if any(line.startswith('160000 ') for line in index.splitlines()):
+                        raise ValueError('workspace contains submodules')
+                    if git_output(path,'ls-files','--unmerged').strip():
+                        raise ValueError('workspace contains unresolved conflicts')
+                    archived=archive_workspace(root,Path(path),dict(path=path,branch=source,tasks=tasks))
+                    result.update(removed=True,archive=archived['archive'],manifest=archived['manifest'],
+                                  head=archived['head'],branch_preserved=True)
+                else:
+                    git_output(root,'worktree','remove',path)
+                    result['removed']=True
+                    deleted=git._git(root,'update-ref','-d','refs/heads/'+source,pending['source_sha'])
+                    if deleted.returncode:raise ValueError('folder removed; branch changed concurrently and was retained')
+                    git._git(root,'config','--local','--remove-section','branch.'+source)
             except (OSError,ValueError,KeyError,subprocess.SubprocessError) as error:
                 result['reason']=str(error)[:300]
-                for value in saved.values():
-                    if value['branch']==source and str(error)!='branch is the origin of another branch':value.pop('cleanup',None)
+            for value in saved.values():
+                if value['branch']!=source:continue
+                value['cleanup_result']=result
+                if result['removed']:value.update(cleaned=True,parent=pending['target'])
+                if not retry:value.pop('cleanup',None)
             results.append(result)
         save(root,saved)
     return results
