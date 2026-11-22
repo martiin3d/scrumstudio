@@ -1,4 +1,9 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+import json
+import time
+from unittest.mock import patch
 import test_storage
 from store import run
 
@@ -83,6 +88,76 @@ class PlanningTest(unittest.TestCase):
         with self.assertRaises(ValueError):self.plan(p,[self.item('one','Changed result',id=row['id'])])
         run('agent_checkpoint',dict(project=p,actor=self.agent,client='codex',session_used_percent=93,weekly_used_percent=20))
         with self.assertRaises(ValueError):self.plan(p,[self.item('other','Extra result')])
+
+    def test_interactive_registration_for_each_provider_without_a_session(self):
+        from scrum_cli import main
+        from worker_identity import standalone_worker
+
+        p,folder=self.project()
+        for client in ('codex','claude'):
+            with self.subTest(client=client):
+                source=folder/'plan.json'
+                title=f'Register {client} work'
+                items=[self.item('first',title,files=['delivery.py'])]
+                if client=='claude':
+                    items.extend([self.item('again',title,files=['delivery.py']),
+                                  self.item('second','Verify delivery',dependencies=['again'])])
+                source.write_text(json.dumps(items),encoding='utf-8')
+                output=StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(main(['register','--context','','--project',str(folder),
+                                           '--client',client,'--input',str(source)]),0)
+                rows=json.loads(output.getvalue())['items']
+                task=run('task_get',dict(project=p,id=rows[0]['id']))
+                self.assertEqual(task['status'],'TODO')
+                self.assertIsNone(task['owner_id'])
+                self.assertFalse(task['locked'])
+                if client=='claude':
+                    self.assertTrue(rows[1]['existing'])
+                    self.assertEqual(rows[1]['id'],task['id'])
+                    dependent=run('task_get',dict(project=p,id=rows[2]['id']))
+                    self.assertEqual(dependent['dependencies'],[task['id']])
+                actor=run('user_register',standalone_worker(client))['id']
+                with self.assertRaisesRegex(ValueError,'Usage unknown or stale'):
+                    run('task_claim',dict(project=p,id=task['id'],actor=actor))
+        self.assertEqual(len(run('task_search',dict(project=p))['items']),3)
+
+    def test_registration_reuses_claimed_work_and_preserves_execution_gates(self):
+        from coordination_api import execute
+
+        p,_=self.project()
+        original=self.item('original','Preserve active work')
+        task=self.plan(p,[original])[0]['id']
+        claim=run('task_claim',dict(project=p,id=task,actor=self.agent))
+        with self.assertRaisesRegex(ValueError,'agent_followup_tasks'):
+            self.handoff(p,task,claim['token'],[self.item('prereq','Autonomous prerequisite')])
+
+        new=self.item('registered','Register under quota hold')
+        args=dict(project=p,actor=self.agent,registration_only=True,items=[original])
+        rows=execute('task_plan',args)['items']
+        self.assertTrue(rows[0]['existing'])
+        self.assertEqual(rows[0]['id'],task)
+        old=run('task_get',dict(project=p,id=task))
+        self.assertEqual((old['status'],old['owner_id']),('In Progress',self.agent))
+        self.assertTrue(old['locked'])
+        run('agent_checkpoint',dict(project=p,actor=self.agent,client='codex',
+                                   session_used_percent=93,weekly_used_percent=20))
+        args['items']=[new]
+        registered=execute('task_plan',args)['items'][0]
+        self.assertEqual(registered['status'],'TODO')
+        with self.assertRaisesRegex(ValueError,'reached stop threshold'):
+            run('task_claim',dict(project=p,id=registered['id'],actor=self.agent))
+        with patch('runtime.time.time',return_value=time.time()+3600):
+            self.assertTrue(execute('task_plan',args)['items'][0]['existing'])
+            with self.assertRaisesRegex(ValueError,'Usage unknown or stale'):
+                run('task_claim',dict(project=p,id=registered['id'],actor=self.agent))
+        for invalid in (dict(items=[dict(original,id=task)]),dict(items=[dict(new,status='Backlog')]),
+                        dict(defer_task=task),dict(allow_duplicate=True)):
+            with self.assertRaisesRegex(ValueError,'Registration only'):
+                execute('task_plan',args|invalid)
+        run('project_control',dict(project=p,actor=self.human,action='stop'))
+        with self.assertRaisesRegex(ValueError,'Stop work'):
+            execute('task_plan',args)
 
     def test_final_dependency_graph_allows_valid_rewiring_in_one_batch(self):
         p,_=self.project()

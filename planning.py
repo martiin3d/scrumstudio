@@ -21,7 +21,19 @@ def _apply(db,a,project,*,begin):
     from store import actor_user,required,priority,acceptance_criteria,dependencies,now,activity,project_prefix,duplicate_task,validate_required_skills
     actor=actor_user(db,a)
     if begin:db.execute('BEGIN IMMEDIATE')
-    runtime.gate(db,project,actor['id'])
+    registration_only=a.get('registration_only',False)
+    if registration_only:
+        if actor['kind']!='agent':
+            raise ValueError('Registration-only planning requires an active agent actor')
+        if any(k in a for k in ('defer_task','prerequisites','continuity','token')) or a.get('allow_duplicate'):
+            raise ValueError('Registration only accepts new TODO outcomes and reuses existing matches')
+        control=runtime.control(db,project)
+        if not control['enabled']:
+            raise ValueError('SCRUM is off for this project')
+        if control['paused']:
+            raise ValueError('Stop work: '+(control['reason'] or 'Project stopped by human'))
+    else:
+        runtime.gate(db,project,actor['id'])
     deferred=None
     if 'defer_task' in a:
         from store import lock_access
@@ -47,6 +59,8 @@ def _apply(db,a,project,*,begin):
     for item in items:
         if not isinstance(item,dict) or set(item)-allowed:
             raise ValueError('Unsupported planning fields; planning never changes state or ownership')
+        if registration_only and ('id' in item or item.get('status','TODO')!='TODO'):
+            raise ValueError('Registration only accepts new TODO outcomes')
         key=required(item.get('key'),'key',80)
         if key in keys:raise ValueError('Plan keys must be unique')
         keys[key]=None
@@ -60,13 +74,6 @@ def _apply(db,a,project,*,begin):
             if old['status'] in ('Done','Cancelled') or old['lock_until']>time.time():
                 raise ValueError('Plan only unlocked unfinished tasks. For a discovered prerequisite of your current claim use defer_task, prerequisites and its token; do not refine the claimed task in items')
         title=required(item.get('title'),'title',240)
-        same,differs=(None,[]) if old else duplicate_task(db,project,title,{**a,**item})
-        if same:
-            # Reused outcomes still reject invalid planning input.
-            from store import validate_verification
-            import model_routing
-            validate_verification(item.get('verification_level','auto'),item.get('verification_reason',''))
-            model_routing.validate('',item.get('model_tier','auto'),item.get('model_reason',''))
         initial=item.get('status',old['status'] if old else 'TODO')
         if old and initial!=old['status']:raise ValueError('Use task_update to move an existing task')
         if not old and initial not in ('TODO','Backlog'):raise ValueError('New tasks start in TODO or Backlog')
@@ -86,17 +93,22 @@ def _apply(db,a,project,*,begin):
         deps=item.get('dependencies',json.loads(old['dependencies']) if old else [])
         if not isinstance(deps,list) or len(deps)>100 or any(type(d) not in (str,int) for d in deps):
             raise ValueError('Dependencies must be task IDs or plan keys')
-        prepared.append(dict(same=same,differs=differs,item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps,skills=skills))
+        prepared.append(dict(item=item,old=old,key=key,title=title,description=description,criteria=criteria,size=size,reason=reason,files=files,deps=deps,skills=skills))
     prefix=project_prefix(db.execute('SELECT name FROM projects WHERE id=?',(project,)).fetchone()['name'])
     result=[]
     resolved_items=[]
     for value in prepared:
         old=value['old'];item=value['item']
-        if value['same']:
+        same,differs=(None,[]) if old else duplicate_task(db,project,value['title'],{**a,**item,'description':value['description'],'acceptance_criteria':value['criteria']})
+        if same:
             # Resumed sessions often re-plan known work: reuse, never repeat it.
-            same=value['same'];keys[value['key']]=same['id']
-            from store import existing_note
-            result.append({'key':value['key'],'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':value['differs'],'note':existing_note(value['differs'])} if value['differs'] else {})})
+            from store import existing_note,validate_verification
+            import model_routing
+            validate_verification(item.get('verification_level','auto'),item.get('verification_reason',''))
+            model_routing.validate('',item.get('model_tier','auto'),item.get('model_reason',''))
+            keys[value['key']]=same['id']
+            value['reused']=True
+            result.append({'key':value['key'],'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':differs,'note':existing_note(differs)} if differs else {})})
             continue
         rank=priority(item.get('priority',old['priority'] if old else 2))
         category=required(item.get('category',old['category'] if old else 'General'),'category',80)
@@ -132,7 +144,7 @@ def _apply(db,a,project,*,begin):
         keys[value['key']]=task
         result.append({'key':value['key'],'id':task,'code':f'{prefix}-{number}','status':status})
     for value in prepared:
-        if value['same']:continue
+        if value.get('reused'):continue
         resolved=[]
         for dep in value['deps']:
             if isinstance(dep,str):

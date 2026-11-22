@@ -12,6 +12,7 @@ from worker_identity import machine_scope, standalone_worker, worker_registratio
 
 READS={'projects','users','task_get','task_search','task_changes','agent_status','project_mode','project_metrics','coordination_metrics','session_resume','next_work','worker_readiness','graph_readiness','workflow_status','project_wiki_proposals'}
 ALIASES={'ask':'agent_interaction','show':'task_get','search':'task_search','plan':'task_plan','update':'task_update','claim':'task_claim','release':'task_release','lock':'file_locks','finish':'work_finish','pause':'agent_checkpoint','status':'agent_status','mode':'project_mode','metrics':'coordination_metrics','start':'work_start','projects':'projects'}
+ALIASES['register']='task_plan'
 
 
 def read_operation(name,args):
@@ -202,7 +203,7 @@ def main(argv=None):
         raw=ns.input.read_text(encoding='utf-8-sig') if ns.input else sys.stdin.read() if ns.stdin else '{}'
         if len(raw)>1024*1024:raise ValueError('Input too large')
         args=json.loads(raw)
-        if ns.command=='plan' and isinstance(args,list):args={'items':args}
+        if ns.command in ('plan','register') and isinstance(args,list):args={'items':args}
         if not isinstance(args,dict):raise ValueError('Arguments must be a JSON object')
         bootstrap=bool(ns.context and not Path(ns.context).exists() and ns.command=='start')
         state=context_file(ns.context) if ns.context and not bootstrap else {}
@@ -221,6 +222,17 @@ def main(argv=None):
         for field in ('actor','client','query','status','limit','after','file','action'):
             value=getattr(ns,field)
             if value is not None:args[field]=value
+        if ns.command=='register':
+            args['registration_only']=True
+            if not ns.context and 'actor' not in args:
+                client=args.pop('client',None)
+                if client not in ('codex','claude'):
+                    raise ValueError('register requires --client codex or claude, --actor, or a managed context')
+                from mcp_server import _validate
+                _validate(dict(args,actor=1),spec)
+                args['actor']=invoke('user_register',standalone_worker(client))['id']
+            elif ns.client:
+                raise ValueError('register uses the existing actor or context without --client')
         for field in ('evidence','continuity'):
             value=getattr(ns,field);file=getattr(ns,field+'_file')
             if file:
