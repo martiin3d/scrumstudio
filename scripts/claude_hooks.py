@@ -14,8 +14,7 @@ import sys
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
-IDENTITY=os.environ.get('SCRUM_CLAUDE_IDENTITY','agent:scrum:claude-primary')
-NAME=os.environ.get('SCRUM_CLAUDE_NAME','Claude primary')
+from worker_identity import standalone_worker
 
 def inside(child,parent):
     child=os.path.normcase(str(Path(child).resolve()));parent=os.path.normcase(str(Path(parent).resolve()))
@@ -29,10 +28,11 @@ def board(cwd):
     mode=run('project_mode',{'project':project['id']})
     if not mode['enabled']:
         if mode['pending_handoff']:
-            actor=next((u['id'] for u in run('users',{}) if u['identity']==IDENTITY and u.get('active',1)),None)
+            identity=standalone_worker('claude')['identity']
+            actor=next((u['id'] for u in run('users',{}) if u['identity']==identity and u.get('active',1)),None)
             if actor:run('agent_checkpoint',{'project':project['id'],'actor':actor,'client':'claude','action':'pause','reason':'SCRUM is off for this project'})
         return None,None,None
-    actor=run('user_register',{'identity':IDENTITY,'name':NAME,'kind':'agent'})['id']
+    actor=run('user_register',standalone_worker('claude'))['id']
     return run,project,actor
 
 def line(task):

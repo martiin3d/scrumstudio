@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import time
 import uuid
+from worker_identity import machine_scope, standalone_worker, worker_registration
 
 READS={'projects','users','task_get','task_search','task_changes','agent_status','project_mode','project_metrics','coordination_metrics','session_resume','next_work','worker_readiness','graph_readiness','workflow_status','project_wiki_proposals'}
 ALIASES={'ask':'agent_interaction','show':'task_get','search':'task_search','plan':'task_plan','update':'task_update','claim':'task_claim','release':'task_release','lock':'file_locks','finish':'work_finish','pause':'agent_checkpoint','status':'agent_status','mode':'project_mode','metrics':'coordination_metrics','start':'work_start','projects':'projects'}
@@ -38,6 +39,8 @@ def context_file(path):
     if path.is_symlink() or path.stat().st_size>2*1024*1024:raise ValueError('Invalid CLI context')
     data=json.loads(path.read_text(encoding='utf-8'))
     if data.get('schema')!=1:raise ValueError('Unsupported CLI context')
+    if 'machine_scope' in data and data['machine_scope']!=machine_scope():
+        raise ValueError('CLI context belongs to a different machine')
     return data
 
 
@@ -53,7 +56,7 @@ def locked(path):
 
 def create_context(path,project,actor,client,started,batch=False):
     task=started['task']
-    state={'schema':1,'project':project,'actor':actor,'client':client,'batch':bool(batch),
+    state={'schema':1,'machine_scope':machine_scope(),'project':project,'actor':actor,'client':client,'batch':bool(batch),
            'measurement_session':started.get('measurement_session'),'current':{'id':task['id'],'code':task['code'],'token':started['token']},'receipts':[]}
     atomic(path,state);return state
 
@@ -249,8 +252,20 @@ def main(argv=None):
         elif name=='task_get' and not any(k in args for k in ('id','code')) and state.get('current'):args['id']=state['current']['id']
         if name in ('work_start','task_claim','work_finish') and not ns.context:raise ValueError('Use --context FILE to keep claim tokens private and durable')
         if bootstrap:
-            if not all(k in args for k in ('project','actor','client')):raise ValueError('start requires project, actor and client')
-            atomic(ns.context,{'schema':1,'project':args['project'],'actor':args['actor'],'client':args['client'],'current':None,'batch':False,'receipts':[]})
+            if 'project' not in args or args.get('client') not in ('codex','claude'):raise ValueError('start requires project and client')
+            if 'actor' not in args:
+                if not invoke('project_mode',{'project':args['project']})['enabled']:
+                    result=coordinated(name,args)
+                    print(json.dumps(result,separators=(',',':'),ensure_ascii=False));return 0
+                if 'identity' in args or 'name' in args:
+                    from mcp_server import _validate
+                    _validate(args,spec)
+                    if not args.get('identity') or not args.get('name'):raise ValueError('Supply both identity and name')
+                    registration=worker_registration(args['client'],args.pop('identity'),args.pop('name'))
+                else:
+                    registration=standalone_worker(args['client'])
+                args['actor']=invoke('user_register',registration)['id']
+            atomic(ns.context,{'schema':1,'machine_scope':machine_scope(),'project':args['project'],'actor':args['actor'],'client':args['client'],'current':None,'batch':False,'receipts':[]})
         result=coordinated(name,args,ns.context)
         print(json.dumps(result,separators=(',',':'),ensure_ascii=False));return 0
     except Exception as error:

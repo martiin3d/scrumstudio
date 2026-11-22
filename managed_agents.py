@@ -11,6 +11,7 @@ import time
 import uuid
 from scripts.cli_runtime import codex_executable,model_name
 from coordination import provider_disabled
+from worker_identity import worker_registration
 
 ROOT=Path(__file__).resolve().parent
 
@@ -45,11 +46,15 @@ def profile(db,value):
     if row is None:raise ValueError('Agent profile not found')
     return dict(row)
 
-def view(row,sessions,detail=False):
+def registration(row,checkout):
+    return worker_registration('managed',[checkout,row['client'],row['id']],row['name'])
+
+def view(row,sessions,checkout,detail=False):
     session=next((a for a in sessions if a['actor']==row['actor']),{})
     connected=bool(session.get('bridge_connected'))
     state=('failed' if session.get('run_exit_code') not in (None,0) and session.get('status') in ('waiting','offline') else session.get('status','waiting')) if connected else 'starting' if row['desired'] and time.time()-row['started']<20 else 'disconnected' if row['desired'] else 'stopped'
     result={k:row[k] for k in ('id','name','client','source','actor','generation','error','model')}
+    result['name']=registration(row,checkout)['name']
     result.update(enabled=bool(row['desired']),resume_on_wakeup=bool(row['resume_on_wakeup']),connected=connected,status=state,instruction_chars=len(row['instructions']))
     if session.get('run_exit_code') not in (None,0):result['error']=session.get('run_error') or f"CLI exited with code {session['run_exit_code']}"
     if detail:result.update(instructions=row['instructions'],usage_file=row['usage_file'])
@@ -92,10 +97,11 @@ def operation(a,call):
     if not status['control'].get('enabled',1) and (mode=='start' or mode=='create' and a.get('start_immediately',True)):
         raise ValueError('SCRUM is off for this project. Turn it on before starting agents.')
     sessions=status['agents']
+    checkout=p['checkout']
     with closing(connect(p['path'])) as db,db:
         if mode=='list':
             active={u['id'] for u in call('users',{}) if u.get('active',1)}
-            return {'agents':[dict(view(dict(r),sessions),deleted=r['actor'] not in active) for r in db.execute('SELECT * FROM profiles ORDER BY name,id')],'local_only':True}
+            return {'agents':[dict(view(dict(r),sessions,checkout),deleted=r['actor'] not in active) for r in db.execute('SELECT * FROM profiles ORDER BY name,id')],'local_only':True}
         if mode=='create':
             name=a.get('name','');instructions=a.get('instructions','');source=a.get('source','');client=a.get('client','codex');usage=a.get('usage_file','');start=a.get('start_immediately',True)
             if not isinstance(name,str) or not name.strip() or len(name)>80:raise ValueError('Name must be 1..80 characters')
@@ -109,24 +115,28 @@ def operation(a,call):
             if db.execute('SELECT COUNT(*) FROM profiles').fetchone()[0]>=20:raise ValueError('Maximum 20 local agent profiles per project')
             if db.execute('SELECT 1 FROM profiles WHERE lower(name)=lower(?)',(name.strip(),)).fetchone():raise ValueError('An agent with this name already exists')
             key=uuid.uuid4().hex
-            actor=call('user_register',{'identity':f"agent:managed:{p['checkout']}:{key}",'name':name.strip(),'kind':'agent'})['id']
+            actor=call('user_register',registration({'id':key,'name':name,'client':client},checkout))['id']
             db.execute('INSERT INTO profiles(id,name,client,instructions,source,usage_file,actor,resume_on_wakeup,model) VALUES(?,?,?,?,?,?,?,?,?)',(key,name.strip(),client,instructions,source.replace('\\','/').split('/')[-1],usage,actor,int(start),model))
             row=profile(db,key);request='created'
             if start:
                 try:request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call)
                 except ValueError as error:
                     db.execute('UPDATE profiles SET error=? WHERE id=?',(str(error)[:500],key));request='launch_failed'
-            result=view(profile(db,key),sessions);result['request']=request
+            result=view(profile(db,key),sessions,checkout);result['request']=request
             return result
         row=profile(db,a.get('id'))
-        if mode=='get':return view(row,sessions,detail=a.get('include_instructions',False))
+        if mode=='get':
+            detail=a.get('include_instructions',False)
+            result=view(row,sessions,checkout,detail=detail)
+            if detail:
+                expected=registration(row,checkout)['identity']
+                result['local_actor']=any(u['id']==row['actor'] and u['identity']==expected and u['kind']=='agent' and u.get('active',1) for u in call('users',{}))
+            return result
         if mode=='update':
             if set(a)-{'project','actor','id','action','model','measurement_session'}:raise ValueError('Profile update accepts only model; active runs and other settings are preserved')
             if 'model' not in a:raise ValueError('Supply model to update, or an empty string for provider default')
             db.execute('UPDATE profiles SET model=? WHERE id=?',(model_name(a['model']),row['id']))
-            return dict(view(profile(db,row['id']),sessions),request='updated_next_run')
-        if mode=='start' and not any(u['id']==row['actor'] and u.get('active',1) for u in call('users',{})):
-            raise ValueError('Agent profile was deleted; a human must restore it before starting')
+            return dict(view(profile(db,row['id']),sessions,checkout),request='updated_next_run')
         db.execute('BEGIN IMMEDIATE')
         row=profile(db,a.get('id'))
         if mode=='stop':
@@ -134,9 +144,21 @@ def operation(a,call):
         elif a.get('_restore_only') and not row['resume_on_wakeup']:
             request='skipped_stopped' # Stop may have arrived after roster discovery.
         else:
+            user=next((u for u in call('users',{}) if u['id']==row['actor']),None)
+            if user and not user.get('active',1):
+                raise ValueError('Agent profile was deleted; a human must restore it before starting')
+            scoped=registration(row,checkout)
+            if not user or user['identity']!=scoped['identity']:
+                legacy=f"agent:managed:{checkout}:{row['id']}"
+                if user and user['identity']==legacy and any(s['actor']==row['actor'] and s.get('bridge_connected') for s in sessions):
+                    return dict(view(row,sessions,checkout),request='already_connected')
+                # Change the launch binding only. Legacy leases and history retain their actor.
+                actor=call('user_register',scoped)['id']
+                db.execute('UPDATE profiles SET actor=?,desired=0,started=0 WHERE id=?',(actor,row['id']))
+                row=profile(db,row['id'])
             db.execute('UPDATE profiles SET resume_on_wakeup=1 WHERE id=?',(row['id'],))
             request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call,start_now=a.get('start_immediately',True))
-        result=view(profile(db,row['id']),sessions);result['request']=request
+        result=view(profile(db,row['id']),sessions,checkout);result['request']=request
         return result
 
 def wakeup(a,call,signal):

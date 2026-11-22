@@ -837,6 +837,22 @@ class BridgeChatTest(unittest.TestCase):
 
 
 class ManagedBridgeTest(BridgeTestCase):
+    def test_existing_bridge_or_foreign_profile_does_not_checkpoint_owner(self):
+        for local in (False,True):
+            with self.subTest(local=local), tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as folder:
+                responses={
+                    'projects':[{'id':1,'uuid':'fixture','checkout':'fixture','path':folder,'available':True}],
+                    'agent_manage':{'actor':9,'client':'codex','instructions':'','local_actor':local},
+                    'agent_status':{'agents':[{'actor':9,'bridge_connected':True}]},
+                }
+                argv=['agent_bridge.py','--project','1','--client','codex','--profile','profile','--allow-run']
+                with patch.object(sys,'argv',argv), patch.object(agent_bridge,'ScrumClient') as factory:
+                    rpc=factory.return_value
+                    rpc.call.side_effect=lambda name,args:responses[name]
+                    with self.assertRaisesRegex(RuntimeError,'connected bridge' if local else 'bind it to this machine'):
+                        agent_bridge.main()
+                    self.assertFalse(any(call.args[0]=='agent_checkpoint' for call in rpc.call.call_args_list))
+
     def test_deferred_git_failure_starts_recovery_without_another_wakeup(self):
         import git_sync
         with tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
@@ -925,7 +941,7 @@ class ManagedBridgeTest(BridgeTestCase):
             rpc=Mock();offers=[]
             def call(name,args):
                 if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
-                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'','generation':1,'model':''}
+                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'','generation':1,'model':'','local_actor':True}
                 if name=='agent_status':return {'agents':[],'control':{'generation':0}}
                 if name=='project_settings':return {'usage_check_seconds':60}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','profile_enabled':True,'control':{'generation':0,'paused':False}}
@@ -964,7 +980,7 @@ class ManagedBridgeTest(BridgeTestCase):
             rpc=Mock();offers=[]
             def call(name,args):
                 if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
-                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'','generation':1,'model':'profile-model'}
+                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'','generation':1,'model':'profile-model','local_actor':True}
                 if name=='agent_status':return {'agents':[],'control':{'generation':0}}
                 if name=='project_settings':return {'usage_check_seconds':60,'coordination_channel':'mcp'}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'reason':'','profile_enabled':True,'control':{'generation':0,'paused':False}}
@@ -993,7 +1009,7 @@ class ManagedBridgeTest(BridgeTestCase):
                 if name=='work_start':return {'claim':{'claimed':True,'token':'fixture','git':{'worktree':str(workspace)}},'task':{'id':1,'code':'FIX-1'}}
                 if name=='worker_launch':return {'eligible':True,'id':1,'code':'FIX-1'} if args.get('action')=='reserve' else {'released':True}
                 if name=='projects':return [{'id':1,'uuid':'project','checkout':'checkout','path':str(folder),'available':True}]
-                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'You review performance.','generation':1,'model':'fixture-model'}
+                if name=='agent_manage':return {'actor':9,'client':'codex','instructions':'You review performance.','generation':1,'model':'fixture-model','local_actor':True}
                 if name=='agent_status':return {'agents':[],'control':{'generation':0}}
                 if name=='project_settings':return {'usage_check_seconds':60,'coordination_channel':'mcp'}
                 if name=='agent_checkpoint' and args['action']=='observe':return {'should_stop':False,'profile_enabled':True,'profile_generation':1,'control':{'generation':0,'paused':False}}

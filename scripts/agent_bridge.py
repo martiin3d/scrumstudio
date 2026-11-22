@@ -29,6 +29,7 @@ import overhead
 import run_cost
 import usage_measurement
 from worker_catalog import EXECUTION_TOOLS
+from worker_identity import bridge_worker
 
 
 def usage_checkpoint(rpc,payload):
@@ -767,11 +768,13 @@ def main():
         folder=Path(project['path'])
         managed=rpc.call('agent_manage',{'project':args.project,'action':'get','id':args.profile,'include_instructions':True}) if args.profile else None
         if managed and managed['client']!=args.client:raise RuntimeError('Profile client mismatch')
+        if managed and not managed.get('local_actor'):raise RuntimeError('Start this profile through Scrum Studio to bind it to this machine')
         role=managed['instructions'] if managed else ''
-        actor=managed['actor'] if managed else rpc.call('user_register',{'identity':f"agent:bridge:{project['checkout']}:{args.client}:{args.worker}",'name':f'{args.client} · {args.worker}','kind':'agent'})['id']
+        candidate=managed['actor'] if managed else rpc.call('user_register',bridge_worker(project['checkout'],args.client,args.worker))['id']
         status=rpc.call('agent_status',{'project':args.project})
-        if any(a['actor']==actor and a.get('bridge_connected') for a in status['agents']):
+        if any(a['actor']==candidate and a.get('bridge_connected') for a in status['agents']):
             raise RuntimeError('This worker already has a connected bridge; choose a distinct --worker')
+        actor=candidate
         generation=status['control']['generation']
         attempted=generation # Ordinary bridge startup never consumes old Wakeup.
         pending_start=args.start_now
@@ -1068,7 +1071,7 @@ def main():
                 usage_checkpoint(rpc,{'project':args.project,'actor':actor,'client':args.client,'action':'offline','summary':'Bridge disconnected. Resume from task history; validate partial edits.',**({'cli_usage_report':measured_report(folder,log_path,log_offset,args.client,run_id,selected_model,run_tasks)} if run_id and log_path else {})})
             except RuntimeError:
                 pass
-        if 'folder' in locals():finish_measurement(folder,'Supervisor disconnected',rpc,args.project,args.client)
+        if actor:finish_measurement(folder,'Supervisor disconnected',rpc,args.project,args.client)
         rpc.close()
         usage_pool.shutdown(wait=False,cancel_futures=True)
 
