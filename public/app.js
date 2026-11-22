@@ -115,6 +115,7 @@ async function loadProjects(){
   $('#project').value=project; await refresh();
 }
 let refreshVersions={},refreshing=false,refreshSerial=0;
+let interactionProject, interactionRequest=0;
 async function refresh(conditional=false){
   if(refreshing){if(conditional)return;refreshVersions={};}
   refreshing=true;
@@ -122,6 +123,7 @@ async function refresh(conditional=false){
   const selected=project,selectedPage=page;
   try{
   $('#error').textContent='';
+  if(selectedPage!=='Chat'||!selected)refreshInteractions(null).catch(error);
   if(page==='Wiki'){
     const data=project?await api('project_knowledge',{project,...(wikiPages.get(project)?{page:wikiPages.get(project)}:{})}):null;
     if(selected!==project||selectedPage!==page||serial!==refreshSerial)return;
@@ -130,7 +132,7 @@ async function refresh(conditional=false){
   }
   if(selected && selectedPage==='Chat'){
     const [snapshot,chat,interactions]=await Promise.all([
-      api('snapshot',{project:selected}),api('project_chat',{project:selected}),api('agent_interaction',{project:selected})
+      api('snapshot',{project:selected}),api('project_chat',{project:selected}),refreshInteractions(null)
     ]);
     if(selected!==project||selectedPage!==page||serial!==refreshSerial)return;
     state={...snapshot,chat,interactions};users=state.users||users;
@@ -1060,7 +1062,8 @@ const editorBlocksRefresh=()=>editor.open && !editor.classList.contains('desktop
 function refreshVisiblePage(){
   if(document.hidden||editorBlocksRefresh())return;
   if(page==='Chat'){chatView?.refresh();return;}
-  if(!['Settings','Projects','Wiki'].includes(page))refresh(true).catch(error);
+  if(['Settings','Projects','Wiki'].includes(page))refreshInteractions(null).catch(error);
+  else refresh(true).catch(error);
 }
 window.addEventListener('focus',refreshVisiblePage);
 setInterval(refreshVisiblePage,15000);
@@ -1153,8 +1156,7 @@ function renderChat(){
   }
   async function refreshChat(){
     if(!live())return;
-    if(!plannerRoot.hidden)await planner.refresh();
-    else await Promise.all([read(),refreshInteractions()]).catch(showError);
+    await Promise.all([plannerRoot.hidden?read():planner.refresh(),refreshInteractions()]).catch(showError);
   }
 
   function showMode(mode){
@@ -1513,14 +1515,21 @@ function renderUsers(){
 }
 
 
-async function refreshInteractions(){
-  const container=$('#chat-interactions');
-  if(page!=='Chat'||!project||!container)return;
-  const selected=project, version=container.dataset.version||'';
+async function refreshInteractions(container=page==='Chat'?$('#chat-interactions'):null){
+  const selected=project, request=++interactionRequest;
+  const badge=$('#chat-pending-count');
+  if(interactionProject!==selected){
+    interactionProject=selected;
+    badge.textContent='0';
+  }
+  if(!selected)return;
+  const version=container?.dataset.version||'';
   const result=await api('agent_interaction',{project:selected,version_seen:version});
-  if(project!==selected||page!=='Chat'||!container.isConnected||container.dataset.version!==version)return;
-  if(result.changed===false)return;
-  renderInteractions(result);
+  if(project===selected&&request===interactionRequest&&result.changed!==false){
+    badge.textContent=result.pending_count;
+    if(page==='Chat'&&container?.isConnected&&container.dataset.version===version)renderInteractions(result);
+  }
+  return result;
 }
 function renderInteractions(data){
   const container=$('#chat-interactions');if(!container)return;
@@ -1532,7 +1541,7 @@ function renderInteractions(data){
   const drafts=new Map(Array.from(container.querySelectorAll('[data-interaction]')).map(card=>[card.dataset.interaction,card.querySelector('input[name=answer]')?.value||'']));
   container.innerHTML=items.map(q=>`<article class="interaction-card" data-interaction="${esc(q.id)}"><small>${q.kind==='permission'?'Permission request':'Agent question'} · ${esc(users.find(u=>u.id===q.actor)?.name||q.actor)} · ${esc(state.tasks.find(t=>t.id===q.task)?.code||q.task)} · ${esc(q.state)}</small><p class="interaction-question">${esc(q.question)}</p>${q.human_requirement?`<p><strong>Why human input</strong> ${esc(q.human_requirement)}</p>`:""}${q.deferred?"<p>Other ready work may continue. Answering resumes this task when Stop and quota allow.</p>":""}${q.state==='pending'?`<div class="interaction-options">${q.options.map(option=>`<button type="button" data-answer="${esc(option)}">${esc(option)}</button>`).join('')}</div>${q.kind==='question'?'<form class="interaction-answer"><label class="field">Your answer<input name="answer" maxlength="2000" required></label><button type="submit">Send answer</button></form>':''}`:`<p>${esc(q.answer||'This request has closed.')}</p>`}<p class="interaction-result" role="status"></p></article>`).join('')||'<p class="chat-quiet">Agent questions and approvals will appear here.</p>';
   container.querySelectorAll('[data-interaction]').forEach(card=>{
-    const answer=async text=>{const controls=card.querySelectorAll('button,input');controls.forEach(b=>b.disabled=true);try{await api('agent_interaction',{project:selected,actor,action:'answer',id:card.dataset.interaction,answer:text});if(card.isConnected&&selected===project)await refreshInteractions();}catch(e){card.querySelector('.interaction-result').textContent=e.message;}finally{controls.forEach(b=>b.disabled=false);}};
+    const answer=async text=>{const controls=card.querySelectorAll('button,input');controls.forEach(b=>b.disabled=true);try{await api('agent_interaction',{project:selected,actor,action:'answer',id:card.dataset.interaction,answer:text});if(selected===project)await refreshInteractions();}catch(e){card.querySelector('.interaction-result').textContent=e.message;}finally{controls.forEach(b=>b.disabled=false);}};
     card.querySelectorAll('[data-answer]').forEach(button=>button.onclick=()=>answer(button.dataset.answer));
     const form=card.querySelector('form');if(form){form.elements.answer.value=drafts.get(card.dataset.interaction)||'';form.onsubmit=e=>{e.preventDefault();answer(new FormData(form).get('answer'));};}
   });

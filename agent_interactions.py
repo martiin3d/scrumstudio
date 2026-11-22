@@ -49,10 +49,13 @@ def operation(db,a,actor_user,now,activity=None):
     ensure(db);project=a['project'];mode=a.get('action','list')
     if mode=='list':
         rows=db.execute('SELECT * FROM agent_interactions WHERE project=? ORDER BY created DESC LIMIT 50',(project,)).fetchall()
-        items=[dict(view(r),state=r['state'] if r['state']!='pending' or live(db,r) else 'expired') for r in rows]
-        version=hashlib.sha256(json.dumps(items,sort_keys=True).encode()).hexdigest()[:24]
+        candidates=db.execute("SELECT * FROM agent_interactions WHERE project=? AND state='pending' AND expires>?",(project,time.time()))
+        pending={row['id'] for row in candidates if live(db,row)}
+        items=[dict(view(r),state='expired' if r['state']=='pending' and r['id'] not in pending else r['state']) for r in rows]
+        payload={'items':items,'pending_count':len(pending)}
+        version=hashlib.sha256(json.dumps(payload,sort_keys=True).encode()).hexdigest()[:24]
         if a.get('version_seen')==version:return {'changed':False,'version':version}
-        return {'changed':True,'version':version,'items':items}
+        return {'changed':True,'version':version,**payload}
     author=actor_user(db,a)
     db.execute('BEGIN IMMEDIATE')
     if mode=='request':
