@@ -52,7 +52,10 @@ class ManagedAgentTest(unittest.TestCase):
         resolver=patch('managed_agents.codex_executable',side_effect=lambda:__import__('managed_agents').shutil.which('codex'))
         resolver.start();self.addCleanup(resolver.stop)
     tearDown=test_storage.StorageTest.tearDown
-    project=test_storage.StorageTest.project
+    def project(self,name='Project'):
+        project,folder=test_storage.StorageTest.project(self,name)
+        run('project_settings',dict(project=project,actor=self.human,max_parallel_agents=1))
+        return project,folder
     def create(self,p,**extra):
         return run('agent_manage',dict(project=p,action='create',actor=self.human,name='Builder',**extra))
     def wake(self,p,**extra):
@@ -203,6 +206,7 @@ class ManagedAgentTest(unittest.TestCase):
             spawn.assert_not_called()
         self.assertEqual(failed['wakeup']['status'],'launch_failed')
         self.assertIn('PATH',failed['wakeup']['next_step'])
+        self.assertIn('PATH',run('agent_manage',dict(project=p))['agents'][0]['error'])
         with patch('managed_agents.shutil.which',return_value='codex'),patch('managed_agents.subprocess.Popen') as spawn:
             retried=self.wake(p)
             spawn.assert_called_once()
@@ -226,6 +230,7 @@ class ManagedAgentTest(unittest.TestCase):
 
     def test_wakeup_claude_requires_account_authorization_without_provider_fallback(self):
         p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,codex_enabled=False))
         with patch('managed_agents.shutil.which',return_value='claude'),patch('managed_agents.subprocess.Popen'):
             profile=self.create(p,client='claude',usage_file=str(self.root/'usage.json'),confirm_client_account=True)
         with patch('managed_agents.time.time',return_value=time.time()+21),patch('managed_agents.subprocess.Popen') as spawn:
@@ -245,6 +250,36 @@ class ManagedAgentTest(unittest.TestCase):
         self.assertEqual(spawn.call_count,1)
         self.assertEqual(len(run('agent_manage',dict(project=p))['agents']),1)
         self.assertTrue(all(result['wakeup']['status']=='starting' for result in results),results)
+
+    def test_play_fills_capacity_once_and_both_agents_can_claim_distinct_work(self):
+        p,_=self.project()
+        run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=2,file_lock_policy='Auto'))
+        stopped=run('agent_manage',dict(project=p,actor=self.human,action='create',name='Stopped',start_immediately=False))
+        with patch('managed_agents.shutil.which',return_value='codex'),patch('managed_agents.subprocess.Popen') as spawn:
+            saved=self.create(p)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda _:self.wake(p),range(2)))
+            self.wake(p)
+        agents=run('agent_manage',dict(project=p))['agents']
+        enabled=[agent for agent in agents if agent['enabled']]
+        self.assertEqual(len(agents),3)
+        self.assertEqual(len({agent['actor'] for agent in enabled}),2)
+        self.assertIn(saved['id'],{agent['id'] for agent in enabled})
+        self.assertNotIn(stopped['id'],{agent['id'] for agent in enabled})
+        self.assertEqual(spawn.call_count,2)
+        for filename in ('a.py','b.py'):
+            run('task_create',dict(project=p,title=filename,description='Independent work',acceptance_criteria=['Verified'],files=[filename]))
+        claims=[]
+        for agent in enabled:
+            actor=agent['actor']
+            run('agent_checkpoint',dict(project=p,actor=actor,profile_id=agent['id'],client='codex',
+                action='observe',running=False,session_used_percent=1,weekly_used_percent=1))
+            offer=run('worker_launch',dict(project=p,actor=actor,client='codex'))
+            claim=run('task_claim',dict(project=p,actor=actor,id=offer['id']))
+            self.assertTrue(claim['claimed'])
+            self.assertEqual(claim['file_lock_mode'],'files')
+            claims.append(offer['id'])
+        self.assertEqual(len(set(claims)),2)
 
     def test_signal_only_wakeup_never_creates_or_launches_profiles(self):
         p,_=self.project()

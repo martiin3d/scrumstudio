@@ -14,6 +14,7 @@ from coordination import provider_disabled
 from worker_identity import worker_registration
 
 ROOT=Path(__file__).resolve().parent
+MAX_PROFILES=20
 
 def project_info(project,call):
     item=next((p for p in call('projects',{}) if p['id']==project),None)
@@ -49,6 +50,13 @@ def profile(db,value):
 def registration(row,checkout):
     return worker_registration('managed',[checkout,row['client'],row['id']],row['name'])
 
+def insert_profile(db,call,checkout,name,client='codex',instructions='',source='',usage='',start=True,model=''):
+    key=uuid.uuid4().hex
+    actor=call('user_register',registration({'id':key,'name':name,'client':client},checkout))['id']
+    db.execute('INSERT INTO profiles(id,name,client,instructions,source,usage_file,actor,resume_on_wakeup,model) VALUES(?,?,?,?,?,?,?,?,?)',
+               (key,name,client,instructions,source,usage,actor,int(start),model))
+    return profile(db,key)
+
 def view(row,sessions,checkout,detail=False):
     session=next((a for a in sessions if a['actor']==row['actor']),{})
     connected=bool(session.get('bridge_connected'))
@@ -57,6 +65,8 @@ def view(row,sessions,checkout,detail=False):
     result['name']=registration(row,checkout)['name']
     result.update(enabled=bool(row['desired']),resume_on_wakeup=bool(row['resume_on_wakeup']),connected=connected,status=state,instruction_chars=len(row['instructions']))
     if session.get('run_exit_code') not in (None,0):result['error']=session.get('run_error') or f"CLI exited with code {session['run_exit_code']}"
+    if state=='disconnected' and not result['error']:
+        result['error']='Bridge did not connect or lost its connection. Check the bridge log before retrying.'
     if detail:result.update(instructions=row['instructions'],usage_file=row['usage_file'])
     return result
 
@@ -101,7 +111,17 @@ def operation(a,call):
     with closing(connect(p['path'])) as db,db:
         if mode=='list':
             active={u['id'] for u in call('users',{}) if u.get('active',1)}
-            return {'agents':[dict(view(dict(r),sessions,checkout),deleted=r['actor'] not in active) for r in db.execute('SELECT * FROM profiles ORDER BY name,id')],'local_only':True}
+            policy=call('project_settings',{'project':a['project']})
+            agents=[]
+            for row in db.execute('SELECT * FROM profiles ORDER BY name,id'):
+                item=dict(view(dict(row),sessions,checkout),deleted=row['actor'] not in active)
+                if item['resume_on_wakeup']:
+                    item['reason']=provider_disabled(policy,item['client'])
+                    if not item['reason'] and item['client']=='claude' and not item['connected'] and item['status']!='starting':
+                        item['reason']='Use Start / continue to authorize the configured Claude account.'
+                agents.append(item)
+            return {'agents':agents,'local_only':True,
+                    'capacity_pending':policy['effective_max_parallel_agents']<policy['max_parallel_agents']}
         if mode=='create':
             name=a.get('name','');instructions=a.get('instructions','');source=a.get('source','');client=a.get('client','codex');usage=a.get('usage_file','');start=a.get('start_immediately',True)
             if not isinstance(name,str) or not name.strip() or len(name)>80:raise ValueError('Name must be 1..80 characters')
@@ -112,12 +132,10 @@ def operation(a,call):
             if not isinstance(usage,str) or (usage and not Path(usage).is_absolute()):raise ValueError('Usage file must be an absolute path')
             if client=='claude' and start and not a.get('confirm_client_account',False):raise ValueError('Authorize the configured Claude account explicitly before starting')
             db.execute('BEGIN IMMEDIATE')
-            if db.execute('SELECT COUNT(*) FROM profiles').fetchone()[0]>=20:raise ValueError('Maximum 20 local agent profiles per project')
+            if db.execute('SELECT COUNT(*) FROM profiles').fetchone()[0]>=MAX_PROFILES:raise ValueError('Maximum 20 local agent profiles per project')
             if db.execute('SELECT 1 FROM profiles WHERE lower(name)=lower(?)',(name.strip(),)).fetchone():raise ValueError('An agent with this name already exists')
-            key=uuid.uuid4().hex
-            actor=call('user_register',registration({'id':key,'name':name,'client':client},checkout))['id']
-            db.execute('INSERT INTO profiles(id,name,client,instructions,source,usage_file,actor,resume_on_wakeup,model) VALUES(?,?,?,?,?,?,?,?,?)',(key,name.strip(),client,instructions,source.replace('\\','/').split('/')[-1],usage,actor,int(start),model))
-            row=profile(db,key);request='created'
+            row=insert_profile(db,call,checkout,name.strip(),client,instructions,source.replace('\\','/').split('/')[-1],usage,start,model)
+            key=row['id'];request='created'
             if start:
                 try:request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call)
                 except ValueError as error:
@@ -144,6 +162,10 @@ def operation(a,call):
         elif a.get('_restore_only') and not row['resume_on_wakeup']:
             request='skipped_stopped' # Stop may have arrived after roster discovery.
         else:
+            latest=call('agent_status',{'project':a['project']})
+            sessions=latest['agents']
+            if a.get('_restore_only') and latest['control']['paused']:
+                return dict(view(row,sessions,checkout),request='skipped_stopped')
             user=next((u for u in call('users',{}) if u['id']==row['actor']),None)
             if user and not user.get('active',1):
                 raise ValueError('Agent profile was deleted; a human must restore it before starting')
@@ -157,9 +179,47 @@ def operation(a,call):
                 db.execute('UPDATE profiles SET actor=?,desired=0,started=0 WHERE id=?',(actor,row['id']))
                 row=profile(db,row['id'])
             db.execute('UPDATE profiles SET resume_on_wakeup=1 WHERE id=?',(row['id'],))
-            request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call,start_now=a.get('start_immediately',True))
+            try:
+                request=launch(db,row,a['project'],p['path'],a.get('confirm_client_account',False),sessions,call,start_now=a.get('start_immediately',True))
+            except ValueError as error:
+                if not a.get('_restore_only'):raise
+                db.execute('UPDATE profiles SET error=? WHERE id=?',(str(error)[:500],row['id']))
+                request='launch_failed'
         result=view(profile(db,row['id']),sessions,checkout);result['request']=request
         return result
+
+def wakeup_roster(a,p,call):
+    """Reserve missing roster slots together so concurrent Play requests reuse them."""
+    project=a['project']
+    with closing(connect(p['path'])) as db,db:
+        db.execute('BEGIN IMMEDIATE')
+        status=call('agent_status',{'project':project})
+        policy=call('project_settings',{'project':project})
+        users={u['id'] for u in call('users',{}) if u.get('active',1)}
+        rows=[dict(r) for r in db.execute('SELECT * FROM profiles ORDER BY name,id')]
+        profiles=[view(row,status['agents'],p['checkout']) for row in rows if row['actor'] in users]
+        enabled=[profile for profile in profiles if profile['resume_on_wakeup']]
+        all_stopped=bool(profiles and not enabled)
+        if status['control']['paused'] or provider_disabled(policy,'codex') or all_stopped:
+            return enabled,policy,0,all_stopped,False
+        eligible={profile['actor'] for profile in enabled if not provider_disabled(policy,profile['client'])
+                  and (profile['client']=='codex' or profile['connected'] or a.get('confirm_client_account',False))}
+        managed={row['actor'] for row in rows}
+        external={s['actor'] for s in status['agents'] if s['bridge_connected'] and s['actor'] not in managed
+                  and not provider_disabled(policy,s['client'])}
+        missing=max(0,policy['max_parallel_agents']-len(eligible | external))
+        names={row['name'].lower() for row in rows}
+        created=min(missing,MAX_PROFILES-len(rows))
+        index=1
+        for _ in range(created):
+            while True:
+                name='Default Codex agent' if index==1 else f'Default Codex agent {index}'
+                index+=1
+                if name.lower() not in names:break
+            names.add(name.lower())
+            row=insert_profile(db,call,p['checkout'],name)
+            enabled.append(view(row,status['agents'],p['checkout']))
+        return enabled,policy,created,all_stopped,created<missing
 
 def wakeup(a,call,signal):
     """Restore the enabled roster after a human signal, without weakening quotas."""
@@ -169,18 +229,9 @@ def wakeup(a,call,signal):
     if not p or not p.get('uuid') or not p.get('available'):return result
     launches=[]
     try:
-        profiles=operation({'project':a['project'],'action':'list'},call)['agents']
-        policy=call('project_settings',{'project':a['project']})
-        if not profiles and not result['wakeup']['connected_bridges'] and not provider_disabled(policy,'codex'):
-            try:
-                created=operation({'project':a['project'],'actor':a['actor'],'action':'create','name':'Default Codex agent','client':'codex','start_immediately':True},call)
-                launches.append({k:created[k] for k in ('id','name','client','request','error')})
-                result['default_profile_created']=True
-            except ValueError:
-                profiles=operation({'project':a['project'],'action':'list'},call)['agents']
-                if not profiles:raise
+        profiles,policy,created,all_stopped,roster_full=wakeup_roster(a,p,call)
+        if created:result['default_profile_created']=True
         for profile in profiles:
-            if not profile['resume_on_wakeup']:continue
             entry={k:profile[k] for k in ('id','name','client')}
             if disabled:=provider_disabled(policy,profile['client']):
                 entry.update(request='skipped_disabled',error=disabled)
@@ -200,16 +251,20 @@ def wakeup(a,call,signal):
         result['wakeup']=call('agent_status',{'project':a['project']})['wakeup']
         starting=[item for item in launches if item['request']=='starting']
         errors=[item for item in launches if item['request'] in ('launch_failed','authorization_required')]
-        if starting:
+        if result['wakeup']['status'] in ('stopped','disabled'):
+            pass
+        elif starting:
             result['wakeup'].update(status='starting',message=f'Starting {len(starting)} agent connection(s). Provider execution waits for fresh quota.',next_step='Open Agents or Chat for connection, quota and execution status.')
         elif errors:
             result['wakeup'].update(status='launch_failed',message='Wakeup could not start the requested agent set.')
         elif (not policy['codex_enabled'] and not policy['claude_enabled']) or (launches and all(item['request']=='skipped_disabled' for item in launches) and not result['wakeup']['connected_bridges']):
             result['wakeup'].update(status='providers_disabled',message='No enabled provider is available for the saved agent roster.',next_step='Review Codex and Claude in Project Settings.')
-        elif profiles and not any(item['request'] not in ('skipped_stopped','skipped_disabled') for item in launches) and not result['wakeup']['connected_bridges']:
+        elif all_stopped and not result['wakeup']['connected_bridges']:
             result['wakeup'].update(status='profiles_stopped',message='All saved agents are individually stopped or not enabled for Wakeup.',next_step='Open Agents and use Start / continue on the agents you want to include. Wakeup will remember that enabled set.')
-        if errors:
+        if errors and result['wakeup']['status'] not in ('stopped','disabled'):
             result['wakeup']['next_step']=' '.join(item['name']+': '+item['error'] for item in errors)+' Open Agents to resolve the failed or unauthorized profiles; successful starts are preserved.'
+        if roster_full and result['wakeup']['status'] not in ('stopped','disabled'):
+            result['wakeup']['next_step']+=' The local profile limit has been reached. Open Agents to start an existing profile.'
     except (OSError,ValueError,sqlite3.Error) as error:
         result['wakeup'].update(status='launch_failed',message='Wakeup was recorded, but agent restoration failed.',next_step=str(error)[:500]+' Inspect existing profiles before retrying; some operations may already have completed.')
     result['launches']=launches

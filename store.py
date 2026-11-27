@@ -1246,6 +1246,12 @@ def legacy_run(action, a, path=None, locks=None):
                 return {'task':None,'reason':disabled,'settings':coord.settings(project_row) if a.get('settings_seen')!=project_row['settings_version'] else None}
             stop=stop or disabled
             import context_tools
+            if action=='worker_launch' and coord.effective_parallel_limit(db,project_row)<project_row['max_parallel_agents']:
+                exclusive=db.execute('SELECT 1 FROM tasks WHERE project=? AND owner_id<>? AND lock_until>? LIMIT 1',
+                                     (project,a['actor'],time.time())).fetchone()
+                if exclusive:
+                    return {'eligible':False,'waiting_for_parallel_capacity':True,
+                            'reason':'Waiting for the current exclusive checkout claim to end before using the saved parallel capacity.'}
             if a.get('actor') is not None and not coord.parallel_available(db,project,a['actor']):
                 if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
                 if not preview:

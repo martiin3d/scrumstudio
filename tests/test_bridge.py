@@ -508,6 +508,35 @@ class BridgeTest(BridgeTestCase):
             for earlier,later,delay in zip(offers,offers[1:],(30,90,180)):
                 self.assertGreaterEqual(later[0]-earlier[0],delay)
 
+    def test_play_waits_for_saved_capacity_on_regular_checkpoints(self):
+        for stopped in (False,True):
+            with self.subTest(stopped=stopped),tempfile.TemporaryDirectory(dir=SCRIPTS.parent/'data') as temporary:
+                folder=Path(temporary);clock=[0];offers=[];rpc=Mock()
+                def call(name,args):
+                    if name=='projects':return [{'id':1,'uuid':'fixture','checkout':'fixture','path':str(folder),'available':True}]
+                    if name=='user_register':return {'id':9}
+                    if name=='agent_status':return {'agents':[],'control':{'generation':0}}
+                    if name=='project_settings':return {'usage_check_seconds':300}
+                    if name=='agent_checkpoint':
+                        paused=stopped and clock[0]>=60
+                        return {'should_stop':paused,'reason':'Project Stop' if paused else '',
+                                'control':{'generation':int(paused),'paused':paused}}
+                    if name=='worker_launch' and args.get('action')=='reserve':
+                        offers.append(clock[0])
+                        if len(offers)==1:return {'eligible':False,'waiting_for_parallel_capacity':True,'reason':'Waiting for exclusive claim'}
+                        return {'eligible':False,'reason':'No eligible work'}
+                    return {}
+                def sleep(seconds):
+                    clock[0]+=seconds
+                    if clock[0]>=150:raise KeyboardInterrupt
+                rpc.call.side_effect=call
+                pool=Mock();future=Mock();future.done.return_value=True;future.result.return_value={'session_used_percent':1,'weekly_used_percent':1};pool.submit.return_value=future
+                with patch.object(sys,'argv',['agent_bridge.py','--project','1','--client','codex','--allow-run','--start-now']),patch.object(agent_bridge,'ScrumClient',return_value=rpc),patch.object(agent_bridge,'ThreadPoolExecutor',return_value=pool),patch.object(agent_bridge.time,'monotonic',side_effect=lambda:clock[0]),patch.object(agent_bridge.time,'sleep',side_effect=sleep),patch.object(agent_bridge.subprocess,'Popen') as spawn:
+                    agent_bridge.main()
+                spawn.assert_not_called()
+                self.assertEqual(len(offers),1 if stopped else 2)
+                if not stopped:self.assertGreaterEqual(offers[1]-offers[0],60)
+
     def test_idle_bridge_uses_few_checkpoints_and_notices_control_marker(self):
         import idle_signals
         for signal_at in (None,6):
