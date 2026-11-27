@@ -785,6 +785,7 @@ def main():
         checkout_attempts=set()
         incomplete_attempts={};pending_recovery=None
         capacity_attempts={};capacity_pending=None
+        waiting_for_parallel_capacity=False
         preflight_attempts={}
         checkout_watch=None;checkout_seen=None
         profile_generation=managed['generation'] if managed else 0
@@ -828,7 +829,7 @@ def main():
             requested=pending_start or request_key[0]>attempted or request_key[1]>profile_generation
             refresh_request=(requested and request_key!=usage_request and not running
                              and not report['control']['paused'] and report.get('profile_enabled',True))
-            wants_usage=running or pending_start or pending_usage_resume or pending_auto or capacity_due or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
+            wants_usage=running or pending_start or pending_usage_resume or pending_auto or capacity_due or waiting_for_parallel_capacity or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
             if usage_future is None and (refresh_request or wants_usage and at-last_usage>=policy.get('usage_check_seconds',60)):
                 # A slow provider request must never block the local Stop loop.
                 # Generation is authoritative: a missed/coalesced notification
@@ -908,11 +909,12 @@ def main():
                 # still pending. Failure/high quota/Stop do not preserve it.
                 if not waiting_for_fresh_usage(report,usage_future is not None):pending_start=False
                 checkout_watch=None;checkout_seen=None;capacity_pending=None
+                waiting_for_parallel_capacity=False
             current=report['control']['generation']
             profile_request=report.get('profile_generation',profile_generation)>profile_generation
             recovery_id=report.get('git_recovery_id')
             recovery_pending=recovery_id is not None and recovery_id not in recovery_attempts and not report['should_stop']
-            immediate=(pending_start or profile_request or pending_auto or recovery_pending or capacity_due) and usage_future is None
+            immediate=(pending_start or profile_request or pending_auto or recovery_pending or capacity_due or waiting_for_parallel_capacity) and usage_future is None
             if not child and usage_future is None and (current>attempted or immediate) and not report['control']['paused']:
                 attempted=current
                 pending_start=False
@@ -930,6 +932,7 @@ def main():
                         preflight_attempts.pop(current,None)
                         if recovery_id:recovery_attempts.add(recovery_id)
                     except RuntimeError as error:
+                        waiting_for_parallel_capacity=False
                         capacity_pending=None
                         attempt=preflight_attempts.get(current,0)
                         delay=preflight_transport_delay(error,attempt)
@@ -945,6 +948,10 @@ def main():
                         print('Wakeup preflight unavailable; no model started.',flush=True)
                         chat_event(rpc,args.project,actor,'Wakeup preflight failed; no model started: '+str(error)[:500])
                         time.sleep(2)
+                        continue
+                    was_waiting=waiting_for_parallel_capacity
+                    waiting_for_parallel_capacity=bool(offer.get('waiting_for_parallel_capacity'))
+                    if waiting_for_parallel_capacity and was_waiting:
                         continue
                     if not offer.get('eligible'):
                         if str(offer.get('reason','')).startswith('No eligible'):

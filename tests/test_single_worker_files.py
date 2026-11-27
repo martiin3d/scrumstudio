@@ -74,7 +74,9 @@ class SingleWorkerFilesTest(unittest.TestCase):
         for actor in (self.agent,peer,self.human):
             with self.assertRaisesRegex(ValueError,'Single-worker checkout'):
                 self.claim(p,other,actor)
-        self.assertFalse(run('worker_launch',dict(project=p,actor=peer,client='codex'))['eligible'])
+        offer=run('worker_launch',dict(project=p,actor=peer,client='codex'))
+        self.assertFalse(offer['eligible'])
+        self.assertTrue(offer['waiting_for_parallel_capacity'])
         renewed=run('task_claim',dict(project=p,id=t,actor=self.agent,token=claim['token']))
         self.assertEqual(renewed['file_lock_mode'],'checkout')
         self.finish(p,t,claim)

@@ -141,7 +141,7 @@ def wakeup_readiness(policy,sessions,project_control,at):
     elif not connected:
         status='no_connected_bridge'
         message='No agent connection is running. Wakeup can start the saved agent set.'
-        next_step='Wakeup restores enabled profiles, or creates a default Codex agent when no profiles exist. Individually stopped profiles stay stopped. Open Agents to choose or authorize a provider. Desktop chats are not reopened.'
+        next_step='Play resumes eligible profiles and can add default Codex agents to fill saved capacity. Individually stopped profiles stay stopped. Open Agents to choose or authorize a provider.'
     elif ready:
         status='ready'
         message=f'{ready} connected agent(s) ready for a Wakeup request; {len(running)} already running and {len(held)} held by usage checks.'
