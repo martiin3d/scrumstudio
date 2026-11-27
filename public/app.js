@@ -116,6 +116,54 @@ async function loadProjects(){
 }
 let refreshVersions={},refreshing=false,refreshSerial=0;
 let interactionProject, interactionRequest=0;
+const notificationPreferences=[
+  ['task-status','Task status changes'],
+  ['pending-question','New pending agent questions'],
+];
+const notificationKey=type=>`scrum-notify:${type}`;
+const notificationEnabled=type=>localStorage.getItem(notificationKey(type))==='true';
+let notificationScope;
+function desktopNotificationScope(){
+  if(notificationScope?.project!==project)notificationScope={project};
+  return notificationScope;
+}
+function notifyDesktop(type,title,message){
+  if(!notificationEnabled(type))return;
+  window.pywebview?.api?.notify?.(title,message).catch(console.error);
+}
+async function refreshTaskNotifications(){
+  if(!desktopMode)return;
+  const scope=desktopNotificationScope();
+  if(!project||!notificationEnabled('task-status'))return;
+  const watch=scope.taskWatch??={};
+  if(watch.loading)return;
+  watch.loading=true;
+  try{
+    const result=await api('web_refresh',{
+      project:scope.project,page:'AI workflow',version_seen:watch.version,
+    });
+    if(desktopNotificationScope()!==scope||scope.taskWatch!==watch||!result.changed)return;
+    const previous=watch.statuses;
+    watch.statuses=new Map(result.data.tasks.map(task=>[task.id,task.status]));
+    watch.version=result.version;
+    for(const task of result.data.tasks){
+      if(previous?.has(task.id)&&previous.get(task.id)!==task.status){
+        notifyDesktop('task-status',`${task.code||task.id} · ${task.status}`,task.title);
+      }
+    }
+  }finally{watch.loading=false;}
+}
+function recordPendingQuestions(scope,items){
+  const previous=scope.seenQuestions;
+  const pending=items.filter(item=>item.kind==='question'&&item.state==='pending');
+  scope.seenQuestions??=new Set();
+  for(const item of pending){
+    if(previous&&!previous.has(item.id)){
+      notifyDesktop('pending-question','New agent question',item.question);
+    }
+    scope.seenQuestions.add(item.id);
+  }
+}
 async function refresh(conditional=false){
   if(refreshing){if(conditional)return;refreshVersions={};}
   refreshing=true;
@@ -123,6 +171,7 @@ async function refresh(conditional=false){
   const selected=project,selectedPage=page;
   try{
   $('#error').textContent='';
+  refreshTaskNotifications().catch(console.error);
   if(selectedPage!=='Chat'||!selected)refreshInteractions(null).catch(error);
   if(page==='Wiki'){
     const data=project?await api('project_knowledge',{project,...(wikiPages.get(project)?{page:wikiPages.get(project)}:{})}):null;
@@ -407,6 +456,19 @@ function renderSettings(){
   const runCostFields=[['run_advisory_minutes','Elapsed minutes',20],['run_advisory_tools','Reported completed tool events',60],['run_advisory_output_tokens','Reported output tokens',30000]];
   $('#content').innerHTML=`<form id="settings-form" class="workflow settings-form"><h2>Project settings</h2><fieldset><legend>Agent permissions</legend><label><input type="checkbox" name="agent_followup_tasks" ${s.agent_followup_tasks?'checked':''}> Allow agents to create necessary recovery and prerequisite tasks</label><p>Limited to the authorized project outcome. Reuses existing tasks, respects dependencies and quotas, and does not run planning or models while idle.</p><label class="field">Codex permission approvals<select name="agent_approval_mode"><option value="Auto review">Auto accept - reviewed automatically</option><option value="Ask in chat">Ask me in project Chat</option><option value="Full access">Full access - no permission prompts</option></select></label><p>Auto review checks requests outside the sandbox automatically. Full access removes the local sandbox and permission prompts for Codex workers, including file and network access outside this project. Organization and operating-system restrictions still apply. Stop, quota limits and task reservations remain enforced. Human decisions appear in Chat with buttons. Changes apply to the next worker launch. Claude keeps its own provider permission policy.</p></fieldset><label class="field">Workflow mode<select name="workflow_mode"><option>Auto</option><option>Light</option><option>Standard</option></select></label><p>Auto prefers Light for bounded Small tasks with one agent. Dependencies, blockers, parallel work or larger scope use Standard. Light never bypasses ownership, usage limits or verification.</p><label class="field">Task sizing policy<select name="task_sizing"><option>Small</option><option>Balanced</option><option>Unrestricted</option></select></label><p>Small: one concrete, independently verifiable outcome per task. Split independent outcomes; avoid trivial fragments and oversized speculative backlogs.</p><fieldset><legend>Usage stop policy</legend><label><input type="checkbox" name="auto_resume_session_quota" ${s.auto_resume_session_quota?'checked':''}> Automatically resume supervised agents after a verified 5-hour quota reset</label><p>Off by default. Requires a connected authorized CLI supervisor and fresh provider readings below both quota limits. Manual Stop/pause cancels pending resume. Desktop chats are not reopened.</p><label><input type="checkbox" name="usage_guard" ${s.usage_guard?'checked':''}> Require recent provider usage before agent work</label><label class="field">5-hour usage stop (%)<input type="number" min="1" max="100" required name="session_stop_percent" value="${s.session_stop_percent}"></label><label class="field">Weekly usage stop (%)<input type="number" min="1" max="100" required name="weekly_stop_percent" value="${s.weekly_stop_percent}"></label><label class="field">Usage check interval (seconds)<input type="number" min="1" max="300" required name="usage_check_seconds" value="${s.usage_check_seconds}"></label><p>These are consumed account quota percentages, not context-window usage. Unknown/stale data pauses guarded agents. Provider refresh delay and safe stopping can allow overshoot; this is not a provider-enforced hard cap.</p></fieldset><label class="field">Maximum parallel agents<input type="number" name="max_parallel_agents" min="1" max="20" required value="${s.max_parallel_agents}"></label><p>Default one. Limits simultaneous agent claims and supervised model starts across this project. Extra workers defer without inference; lowering the limit does not interrupt existing work.</p><label class="field">Maximum active tasks per agent<input type="number" name="max_active_per_agent" min="1" max="20" required value="${s.max_active_per_agent}"></label><p>Counts active In Progress claims with an unexpired lease, per agent in this project. Humans are exempt. Release excess work before lowering the limit.</p>${field('Workspace root (absolute directory path)','workspace_root',s.workspace_root)}<p>Required for file locks. Relative file paths resolve here. Each checkout has its own file reservations. Move the folder and reopen it to change its location.</p><label><input type="checkbox" name="require_evidence" ${s.require_evidence?'checked':''}> Require verification evidence and completed checklist before Done</label><p>Evidence records what was checked and its result. It is not an automatic test runner.</p><fieldset><legend>Git automation</legend><label><input type="checkbox" name="git_pause_blocked" ${s.git_pause_blocked?'checked':''}> Preserve blocked task edits locally to free the checkout</label><p>Branches mode only. With no live claims or file reservations, saves only files planned by your blocked tasks, then restores them on resume. No push, merge or model call. Staged or unrelated edits still require reconciliation; conflicts retain the backup.</p><label><input type="checkbox" name="git_cleanup" ${s.git_cleanup?'checked':''}> Delete merged local branches and clean managed worktrees after the worker exits</label><p>Optional native cleanup, without AI calls. Related unfinished tasks, dirty folders and branches needed by other branches prevent cleanup. Remote branches are preserved. In Branches mode, checked-out branches are retained.</p><label class="field">Automatic merge<select name="git_merge"><option value="Off">Off</option><option value="Task">Per task: Done requires successful integration (recommended)</option><option value="Group">Merge completed group into its origin branch</option><option value="PR">Protected pull request: publish source and reconcile verified landing</option></select></label><p>Local code merges without an AI call. Failed integration creates a scoped recovery task for an available authorized worker. The origin branch is recorded at creation and used as the merge destination. Existing branches without recorded origin require review. No force push.</p><label class="field">Mode<select name="git_mode"><option>Off</option><option>Branches</option><option>Worktrees</option></select></label><p>For a single worker, Branches usually avoids an extra checkout. Worktrees provides isolation for parallel workers or human edits, at the cost of a full extra checkout per task or context group under <code>.scrum/local/worktrees</code>: projects with heavy generated state (Unity <code>Library/</code>, <code>node_modules</code>, build caches) pay a complete import/install per workspace, so prefer Branches there. Automatic commits only include a task's planned <code>files</code>; tasks without a file plan are never committed automatically. Automatic merge needs git 2.38+. Modes never change automatically with worker count.</p><p>Worktrees: separate Git checkout and staging per task/context branch; the central board and file reservations remain shared. Existing edits in the main checkout are preserved. Workspaces are retained for resuming work.</p><p>Branches: when a task is claimed the server moves this checkout to <code>prefix + context group</code> (or <code>prefix + CODE-title</code> for tasks without a group), creating it from the base branch when missing. A claim is refused while another active task needs a different branch, or the checkout holds uncommitted work of another branch; the refusal is recorded on the task. Needs git on this machine and a repository at the workspace root.</p><label class="field">Commit<select name="git_commit"><option value="Task">One commit per task (at Done)</option><option value="Group">One commit per context group (when its last task is Done)</option></select></label><label class="field">Push<select name="git_push"><option value="Group">When the context group completes (tasks without a group: at Done)</option><option value="Task">After every task</option><option value="Never">Never (manual)</option></select></label>${field('Base branch for new branches (empty = current HEAD)','git_base_branch',s.git_base_branch)}${field('Branch prefix','git_branch_prefix',s.git_branch_prefix)}${field('Remote','git_remote',s.git_remote)}<p>Commits use the task code and title (<code>WEB-12: Fix login</code>) and only the task's planned files (no automatic commit without an explicit file plan). Push is <code>git push -u remote branch</code>, never forced; a failure is recorded in task activity. In per-task merge mode, verification is retained in In Review until integration and configured publication succeed. Each task has its own branch; context groups only organize related work. Human Done on this board triggers the same automation.</p></fieldset>${mcpSettingsMarkup()}<button class="primary" type="submit">Save settings</button><p id="settings-result" role="status"></p></form>`;
   bindMcpSettings();
+  if(desktopMode){
+    $('#settings-form h2').insertAdjacentHTML('afterend',`<fieldset><legend>Notifications</legend>
+      ${notificationPreferences.map(([type,label])=>`<label><input type="checkbox" data-notification="${type}" ${notificationEnabled(type)?'checked':''}> ${label}</label>`).join('')}
+      <p>Changes are saved on this device.</p></fieldset>`);
+    document.querySelectorAll('[data-notification]').forEach(box=>box.onchange=()=>{
+      const type=box.dataset.notification;
+      localStorage.setItem(notificationKey(type),String(box.checked));
+      if(type==='task-status'){
+        delete desktopNotificationScope().taskWatch;
+        if(box.checked)refreshTaskNotifications().catch(console.error);
+      }
+    });
+  }
   $('#settings-form [name=task_sizing]').value=s.task_sizing;
   $('#settings-form button[type=submit]').insertAdjacentHTML('beforebegin',`<fieldset><legend>Run cost advisories - no AI</legend><p>One advisory at the next existing MCP boundary. No automatic interruption or relaunch. Zero disables a threshold. Tokens unavailable during a provider run stay unknown. Applies to the next supervisor launch.</p>${runCostFields.map(([key,label,fallback])=>`<label class="field">${label}<input type="number" min="0" max="1000000" required name="${key}" value="${s[key]??fallback}"></label>`).join('')}</fieldset>`);
   $('#settings-form [name=workflow_mode]').closest('label').insertAdjacentHTML('beforebegin','<label class="field">Agent autonomy<select name="autonomy_mode"><option value="Standard">Standard</option><option value="Autonomous">Autonomous - only concrete human decisions</option></select></label><p>Agents resolve routine implementation, recovery and design details. A necessary question must explain why human input is required and offer choices. In Autonomous mode it parks only that task; other ready work can continue. Answers reopen the task without approving or completing its work. Screenshots are internal verification, not routine approval requests. Stop, quotas and actual permission review still apply.</p>');
@@ -1061,13 +1123,20 @@ $('#editor-form').onsubmit=async e=>{
 };
 const editorBlocksRefresh=()=>editor.open && !editor.classList.contains('desktop-inspector');
 function refreshVisiblePage(){
-  if(document.hidden||editorBlocksRefresh())return;
+  if(document.hidden||editorBlocksRefresh()){
+    if(desktopMode){
+      refreshInteractions(null).catch(console.error);
+      refreshTaskNotifications().catch(console.error);
+    }
+    return;
+  }
+  refreshTaskNotifications().catch(console.error);
   if(page==='Chat'){chatView?.refresh();return;}
   if(['Settings','Projects','Wiki'].includes(page))refreshInteractions(null).catch(error);
   else refresh(true).catch(error);
 }
 window.addEventListener('focus',refreshVisiblePage);
-setInterval(refreshVisiblePage,15000);
+if(!desktopMode)setInterval(refreshVisiblePage,15000);
 loadProjects().catch(error);
 
 function renderChat(){
@@ -1518,6 +1587,7 @@ function renderUsers(){
 
 async function refreshInteractions(container=page==='Chat'?$('#chat-interactions'):null){
   const selected=project, request=++interactionRequest;
+  const scope=desktopMode?desktopNotificationScope():null;
   const badge=$('#chat-pending-count');
   if(interactionProject!==selected){
     interactionProject=selected;
@@ -1528,6 +1598,7 @@ async function refreshInteractions(container=page==='Chat'?$('#chat-interactions
   const result=await api('agent_interaction',{project:selected,version_seen:version});
   if(project===selected&&request===interactionRequest&&result.changed!==false){
     badge.textContent=result.pending_count;
+    if(scope&&scope===desktopNotificationScope())recordPendingQuestions(scope,result.items);
     if(page==='Chat'&&container?.isConnected&&container.dataset.version===version)renderInteractions(result);
   }
   return result;

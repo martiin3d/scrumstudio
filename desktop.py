@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from collections import deque
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from threading import Thread
@@ -23,6 +24,71 @@ def desktop_backend(port):
         finally:
             server.shutdown()
             thread.join()
+
+
+class DesktopNotifications:
+    def __init__(self, icon_path):
+        self.icon_path = icon_path
+        self.pending = deque()
+        self.window = None
+
+    def attach(self, window):
+        self.window = window
+        window.events.before_show += self._start
+
+    def _start(self):
+        from System.Drawing import Icon, SystemIcons
+        from System.Windows.Forms import NotifyIcon, Timer
+
+        self.icon = Icon(str(self.icon_path)) if self.icon_path.is_file() else None
+        self.tray = NotifyIcon()
+        self.tray.Icon = self.icon or SystemIcons.Application
+        self.tray.Text = 'Scrum Studio'
+        self.poll = Timer()
+        self.poll.Interval = 15000
+        self.poll.Tick += self._refresh
+        self.delivery = Timer()
+        self.delivery.Interval = 10000
+        self.delivery.Tick += self._deliver
+        self.window.native.FormClosed += self._close
+        self.poll.Start()
+
+    def _refresh(self, sender, args):
+        # Run on the UI thread without waiting for WebView2 to return a result.
+        view = self.window.native.browser.webview
+        if view.CoreWebView2 is not None:
+            view.ExecuteScriptAsync('globalThis.refreshVisiblePage?.()')
+
+    def notify(self, title, message):
+        from System import Action
+
+        if not isinstance(title, str) or not isinstance(message, str):
+            return
+
+        def enqueue():
+            self.pending.append((title[:63], message[:255]))
+            if not self.delivery.Enabled:
+                self._deliver(None, None)
+                self.delivery.Start()
+
+        self.window.native.BeginInvoke(Action(enqueue))
+
+    def _deliver(self, sender, args):
+        if not self.pending:
+            self.delivery.Stop()
+            return
+        from System.Windows.Forms import ToolTipIcon
+
+        title, message = self.pending.popleft()
+        self.tray.Visible = True
+        self.tray.ShowBalloonTip(10000, title, message, ToolTipIcon.Info)
+
+    def _close(self, sender, args):
+        self.poll.Dispose()
+        self.delivery.Dispose()
+        self.tray.Dispose()
+        if self.icon is not None:
+            self.icon.Dispose()
 
 
 def main():
@@ -46,10 +112,13 @@ def main():
     try:
         with desktop_backend(args.port) as url:
             webview.settings['ALLOW_DOWNLOADS'] = True
-            webview.create_window(
+            notifications = DesktopNotifications(icon)
+            window = webview.create_window(
                 'Scrum Studio Desktop', f'{url}/?desktop=1',
                 width=1440, height=900, min_size=(1080, 680), text_select=True,
             )
+            window.expose(notifications.notify)
+            notifications.attach(window)
             webview.start(gui='edgechromium', private_mode=False, storage_path=str(profile), **options)
     except OSError as error:
         parser.exit(1, f'Could not start Scrum Studio Desktop ({error}). Try a free --port if the port is in use.\n')
