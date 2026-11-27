@@ -114,6 +114,31 @@ def project_exists(db, project):
         raise ValueError('Project not found')
     return row
 
+def parallel_candidates(db, project_row, candidates, live):
+    if not live:return candidates
+    settings=coord.settings(project_row)
+    mode=settings.get('git_mode')
+    if coord.checkout_policy(db,project_row['id']) or mode=='Branches' or any(t['category']=='Git recovery' for t in live):
+        return []
+    candidates=[task for task in candidates if task['category']!='Git recovery']
+    if mode!='Worktrees':
+        return [task for task in candidates if task['files']] if all(task['files'] for task in live) else []
+    import git_sync
+    root=project_row['workspace_root']
+    workspaces=git_worktrees.entries(root)
+    def branch(task):
+        return workspaces.get(git_worktrees.identity(task),{}).get('branch') or git_sync.branch_for(settings,task)
+    occupied={branch(task) for task in live}
+    current=git_sync.state(root)
+    if current:occupied.add(current[0])
+    return [task for task in candidates if branch(task) not in occupied]
+
+def live_tasks(db,project,prefix,running=()):
+    ids=','.join('?' for _ in running) or 'NULL'
+    return [task_dict(row,prefix) for row in db.execute(
+        f"SELECT * FROM tasks WHERE project=? AND ((status='In Progress' AND lock_until>?) OR id IN ({ids}))",
+        (project,time.time(),*running))]
+
 def git_claim(db, project, row, prefix, actor):
     """Branch policy at claim time; returns a report or a {'busy':...} refusal."""
     import git_sync
@@ -814,6 +839,12 @@ def legacy_run(action, a, path=None, locks=None):
                 if db.execute('SELECT status FROM tasks WHERE id=?', (dep,)).fetchone()['status'] != 'Done':
                     raise ValueError('Finish dependencies before claiming')
             coord.check_capacity(db,project,actor['id'],row['id'])
+            if a.get('parallel'):
+                offer=db.execute('SELECT 1 FROM worker_launch_offers WHERE project=? AND actor=? AND task=? AND expires>?',
+                                 (project,actor['id'],row['id'],time.time())).fetchone()
+                if not offer:raise ValueError('Parallel launch requires a current task offer')
+                if not parallel_candidates(db,project_row,[task_dict(row,prefix)],live_tasks(db,project,prefix,a.get('running_ids',[]))):
+                    raise ValueError('Task is waiting for checkout isolation or explicit file plans')
             plan=coord.file_plan(a.get('files',json.loads(row['files'])))
             root=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()[0]
             paths=coord.canonical_paths(root,plan)
@@ -1232,6 +1263,9 @@ def legacy_run(action, a, path=None, locks=None):
                 db.execute('BEGIN IMMEDIATE')
                 db.execute('DELETE FROM worker_launch_offers WHERE expires<=?',(time.time(),))
                 if mode=='release':
+                    if a.get('parallel'):
+                        db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor=? AND task=?',(project,a['actor'],a['id']))
+                        return {'released':True}
                     db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor=?',(project,a['actor']))
                     import context_batches
                     return {'released':True,**context_batches.release(db,project,a['actor'])}
@@ -1253,7 +1287,8 @@ def legacy_run(action, a, path=None, locks=None):
                     return {'eligible':False,'waiting_for_parallel_capacity':True,
                             'reason':'Waiting for the current exclusive checkout claim to end before using the saved parallel capacity.'}
             if a.get('actor') is not None and not coord.parallel_available(db,project,a['actor']):
-                if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
+                if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.',
+                                                   **({'waiting':True} if a.get('parallel') else {})}
                 if not preview:
                     return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':coord.effective_parallel_limit(db,project_row)}}
                 stop=stop or 'Project parallel-agent limit reached.'
@@ -1290,6 +1325,11 @@ def legacy_run(action, a, path=None, locks=None):
             candidates=[t for t in candidates if not (held:=context_batches.reservation(db,project,t['id'])) or (held['actor']==a.get('actor') and held['current']==t['id'])]
             active=coord.active_count(db,project,a.get('actor')) if a.get('actor') is not None else 0
             limit=project_row['max_active_per_agent']
+            parallel=action=='worker_launch' and a.get('parallel',False)
+            if parallel and active>=limit:
+                return {'eligible':False,'waiting':True,'reason':f'Agent active task limit reached ({limit}).'}
+            if parallel:
+                candidates=[t for t in candidates if not t['locked']]
             if a.get('actor') is not None and actor_user(db,a)['kind']=='agent' and active>=limit:
                 candidates=[t for t in candidates if t['owner_id']==a['actor'] and t['locked']]
             available=[]
@@ -1327,6 +1367,12 @@ def legacy_run(action, a, path=None, locks=None):
             branch_skipped=0
             checkout_recovery=None
             settings=coord.settings(project_row)
+            isolation_skipped=0
+            if parallel:
+                live=live_tasks(db,project,prefix,a.get('running_ids',[]))
+                compatible=parallel_candidates(db,project_row,candidates,live)
+                isolation_skipped=len(candidates)-len(compatible)
+                candidates=compatible
             if settings.get('git_mode')=='Branches' and project_row['workspace_root'] and candidates:
                 import git_sync
                 task_branch=lambda t:git_sync.branch_for(settings,{'code':t['code'],'title':t['title'],'context_group':t.get('context_group','')})
@@ -1388,8 +1434,13 @@ def legacy_run(action, a, path=None, locks=None):
                 return project_knowledge.worker_readiness(root,workspace,selected,a,settings['coordination_channel'],stop,unavailable,changes)
             if action=='worker_launch':
                 if not candidates:
-                    reason=(str(branch_skipped)+' ready task(s) need another branch, but this checkout is owned by active work or contains uncommitted edits. Preserve those edits; finish/recover this branch or use Worktrees for isolation.' if branch_skipped else 'No eligible unreserved work; no model was started.')
-                    return {'eligible':False,'reason':reason,**({'checkout_recovery':checkout_recovery} if checkout_recovery and branch_skipped and settings.get('agent_followup_tasks') else {})}
+                    reason=(str(branch_skipped)+' ready task(s) need another branch, but this checkout is owned by active work or contains uncommitted edits. Preserve those edits; finish/recover this branch or use Worktrees for isolation.' if branch_skipped else
+                            'Ready work is waiting for checkout isolation or explicit file plans.' if isolation_skipped else
+                            'Ready work is waiting for file reservations.' if parallel and conflicts_skipped else
+                            'No eligible unreserved work; no model was started.')
+                    return {'eligible':False,'reason':reason,
+                            **({'waiting':True} if parallel and (branch_skipped or isolation_skipped or conflicts_skipped) else {}),
+                            **({'checkout_recovery':checkout_recovery} if checkout_recovery and branch_skipped and settings.get('agent_followup_tasks') else {})}
                 selected=candidates[0]
                 if selected['locked'] and selected['owner_id']==a['actor']:
                     db.execute('DELETE FROM worker_launch_offers WHERE project=? AND task=? AND actor!=?',(project,selected['id'],a['actor']))
@@ -1401,7 +1452,7 @@ def legacy_run(action, a, path=None, locks=None):
                     if selected.get('model_selection')!=selection:activity(db,selected['id'],a['actor'],'comment','Model selected: '+(selection['model'] or 'Provider default')+' ('+selection['source']+'): '+selection['reason'])
                 db.execute('INSERT INTO worker_launch_offers(project,actor,task,expires) VALUES(?,?,?,?) ON CONFLICT(project,actor) DO UPDATE SET task=excluded.task,expires=excluded.expires',(project,a['actor'],selected['id'],time.time()+600))
                 batch=[]
-                if selection:
+                if selection and not parallel:
                     import context_batches
                     selected['model_selection']=selection
                     batch=context_batches.plan(db,project,a['actor'],selected,tasks,selection,project_row['workspace_root'])

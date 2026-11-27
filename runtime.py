@@ -1,5 +1,6 @@
 """Local cooperative agent control. Never exported, never fabricates usage."""
 import math
+import secrets
 import git_worktrees
 import time
 import json
@@ -181,10 +182,11 @@ def summary(db, project):
     return {'workflow':coordination.workflow_mode(db,project),'control':c,'active_agents':len(active),'active_tasks':len(tasks),'active_task_ids':tasks,'agents':sessions,'wakeup':readiness,
             'execution_active':bool(readiness['running_bridges']) or has_agent_work(db,project),'basis':'Recent cooperative heartbeat plus valid claim; not OS process detection'}
 
-def handoff(db, project, actor, why, text, now, activity):
-    if db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone():
+def handoff(db, project, actor, why, text, now, activity, task_id=None):
+    if task_id is None and db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone():
         db.execute('DELETE FROM worker_launch_offers WHERE project=? AND actor=?',(project,actor))
     tasks=db.execute("SELECT * FROM tasks WHERE project=? AND owner_id=? AND lock_until>?",(project,actor,time.time())).fetchall()
+    if task_id is not None:tasks=[task for task in tasks if task['id']==task_id]
     stamp=now()
     root=db.execute('SELECT workspace_root FROM projects WHERE id=?',(project,)).fetchone()['workspace_root'] if tasks else ''
     for task in tasks:
@@ -218,6 +220,30 @@ def handoff(db, project, actor, why, text, now, activity):
     if tasks:
         db.execute('INSERT INTO project_messages(project,actor,text,created) VALUES(?,?,?,?)',(project,actor,('Paused: '+why+'. Resume task continuity: '+', '.join(str(t['number']) for t in tasks))[:2000],stamp))
     return len(tasks)
+
+
+def checkpoint_usage(db,project,actor,a):
+    if 'cli_usage_report' in a:
+        import execution_usage
+        try:execution_usage.record(db,project,actor,a['client'],a['cli_usage_report'])
+        except ValueError as error:return {'cli_usage_error':str(error)}
+    return {}
+
+
+def task_checkpoint(db,project,actor,a,mode,required,now,activity):
+    if mode=='observe' or 'id' not in a or not a.get('token'):
+        raise ValueError('Task checkpoint requires a task ID and claim token')
+    row=db.execute('SELECT lock_token FROM tasks WHERE project=? AND id=? AND owner_id=? AND lock_until>?',
+                   (project,a['id'],actor,time.time())).fetchone()
+    owned=row and secrets.compare_digest(row['lock_token'] or '',a['token'])
+    why=reason(db,project,actor)
+    if mode in ('pause','offline'):
+        why=required(a.get('reason','Task execution ended'),'reason',500)
+    summary=a.get('summary','')
+    if not isinstance(summary,str) or len(summary)>2000:raise ValueError('summary must be text, max2000')
+    released=handoff(db,project,actor,why,summary,now,activity,a['id']) if owned and why else 0
+    return {'should_stop':bool(why) or not owned,'reason':why or ('' if owned else 'Task claim is no longer active'),
+            'tasks_released':released,'control':control(db,project),**checkpoint_usage(db,project,actor,a)}
 
 def operation(db, action, a, project, actor_user, required, now, activity):
     if action=='agent_status':
@@ -258,6 +284,8 @@ def operation(db, action, a, project, actor_user, required, now, activity):
     client=a.get('client')
     if client not in ['codex','claude']:
         raise ValueError('client must be codex or claude')
+    if 'id' in a or 'token' in a:
+        return task_checkpoint(db,project,actor['id'],a,mode,required,now,activity)
     old=db.execute('SELECT * FROM agent_sessions WHERE project=? AND actor=?',(project,actor['id'])).fetchone()
     db.execute('INSERT INTO agent_sessions(project,actor,client,heartbeat) VALUES(?,?,?,?) ON CONFLICT(project,actor) DO UPDATE SET client=excluded.client,heartbeat=excluded.heartbeat',(project,actor['id'],client,time.time()))
     fields=['session_used_percent','weekly_used_percent','session_resets_at','weekly_resets_at']
@@ -300,9 +328,4 @@ def operation(db, action, a, project, actor_user, required, now, activity):
     released=handoff(db,project,actor['id'],why,text,now,activity) if why and mode!='observe' else 0
     resume=quota_resume(db,project,actor['id'],mode,why,old,a.get('running',False),a.get('automatic',False))
     db.execute('UPDATE agent_sessions SET status=?,reason=? WHERE project=? AND actor=?',(status,why,project,actor['id']))
-    usage_error=''
-    if 'cli_usage_report' in a:
-        import execution_usage
-        try:execution_usage.record(db,project,actor['id'],a['client'],a['cli_usage_report'])
-        except ValueError as error:usage_error=str(error)
-    return {'should_stop':bool(why),'reason':why,'status':status,'tasks_released':released,**({'cli_usage_error':usage_error} if usage_error else {}),'control':control(db,project),'auto_resume':resume,'check_after_seconds':db.execute('SELECT usage_check_seconds FROM projects WHERE id=?',(project,)).fetchone()[0]}
+    return {'should_stop':bool(why),'reason':why,'status':status,'tasks_released':released,**checkpoint_usage(db,project,actor['id'],a),'control':control(db,project),'auto_resume':resume,'check_after_seconds':db.execute('SELECT usage_check_seconds FROM projects WHERE id=?',(project,)).fetchone()[0]}
