@@ -1,7 +1,10 @@
 """Launch Scrum Studio in a Windows WebView2 window."""
 
 import argparse
+import json
+import logging
 import os
+import subprocess
 import sys
 from collections import deque
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -11,6 +14,37 @@ from threading import Thread
 from server import Handler, LocalHTTPServer
 
 DATA = Path(__file__).resolve().parent / 'data'
+APP_ID = 'ScrumStudio.Desktop'
+TOAST_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+$payload = $input | ConvertFrom-Json
+$manager = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]
+$null = [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType=WindowsRuntime]
+$xml = $manager::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$lines = $xml.GetElementsByTagName('text')
+$lines.Item(0).InnerText = $payload.title
+$lines.Item(1).InnerText = $payload.message
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$manager::CreateToastNotifier($payload.app_id).Show($toast)
+'''
+
+
+def show_desktop_toast(icon_path, title, message):
+    import winreg
+
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf'Software\Classes\AppUserModelId\{APP_ID}') as key:
+        winreg.SetValueEx(key, 'DisplayName', 0, winreg.REG_SZ, 'Scrum Studio')
+        if icon_path.is_file():
+            winreg.SetValueEx(key, 'IconUri', 0, winreg.REG_SZ, str(icon_path))
+
+    powershell = Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    result = subprocess.run(
+        [str(powershell), '-NoProfile', '-NonInteractive', '-Command', TOAST_SCRIPT],
+        input=json.dumps({'app_id': APP_ID, 'title': title, 'message': message}).encode('ascii'),
+        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=10,
+    )
+    if result.returncode:
+        raise OSError(result.stderr.decode(errors='replace').strip())
 
 
 @contextmanager
@@ -37,13 +71,8 @@ class DesktopNotifications:
         window.events.before_show += self._start
 
     def _start(self):
-        from System.Drawing import Icon, SystemIcons
-        from System.Windows.Forms import NotifyIcon, Timer
+        from System.Windows.Forms import Timer
 
-        self.icon = Icon(str(self.icon_path)) if self.icon_path.is_file() else None
-        self.tray = NotifyIcon()
-        self.tray.Icon = self.icon or SystemIcons.Application
-        self.tray.Text = 'Scrum Studio'
         self.poll = Timer()
         self.poll.Interval = 15000
         self.poll.Tick += self._refresh
@@ -77,18 +106,18 @@ class DesktopNotifications:
         if not self.pending:
             self.delivery.Stop()
             return
-        from System.Windows.Forms import ToolTipIcon
-
         title, message = self.pending.popleft()
-        self.tray.Visible = True
-        self.tray.ShowBalloonTip(10000, title, message, ToolTipIcon.Info)
+        Thread(target=self._show, args=(title, message), daemon=True).start()
+
+    def _show(self, title, message):
+        try:
+            show_desktop_toast(self.icon_path, title, message)
+        except (OSError, subprocess.TimeoutExpired):
+            logging.exception('Could not show a Scrum Studio desktop notification')
 
     def _close(self, sender, args):
         self.poll.Dispose()
         self.delivery.Dispose()
-        self.tray.Dispose()
-        if self.icon is not None:
-            self.icon.Dispose()
 
 
 def main():
@@ -135,7 +164,7 @@ def run():
     log_path = app_dir / 'desktop.log'
     try:
         app_dir.mkdir(parents=True, exist_ok=True)
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('ScrumStudio.Desktop')
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         # Background worker commands still need the console interpreter for stdio.
         sys.executable = str(Path(sys.executable).with_name('python.exe'))
         with log_path.open('a', encoding='utf-8', buffering=1) as log, redirect_stderr(log), redirect_stdout(log):
