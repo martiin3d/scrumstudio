@@ -131,14 +131,19 @@ function browserNotificationPermission(){
   return window.isSecureContext&&typeof window.Notification?.requestPermission==='function'
     ?window.Notification.permission:'unavailable';
 }
-function notify(type,title,message){
-  if(!notificationEnabled(type))return;
+async function deliverNotification(title,message){
   if(desktopMode){
-    window.pywebview?.api?.notify?.(title,message).catch(console.error);
-  }else if(browserNotificationPermission()==='granted'){
-    try{new window.Notification(title,{body:message});}
-    catch(error){console.error(error);}
+    const bridge=window.pywebview?.api;
+    if(typeof bridge?.notify!=='function')return false;
+    await bridge.notify(title,message);
+  }else{
+    if(browserNotificationPermission()!=='granted')return false;
+    new window.Notification(title,{body:message});
   }
+  return true;
+}
+function notify(type,title,message){
+  if(notificationEnabled(type))deliverNotification(title,message).catch(console.error);
 }
 async function refreshTaskNotifications(){
   const scope=currentNotificationScope();
@@ -175,7 +180,9 @@ function renderNotificationSettings(){
   $('#settings-form h2').insertAdjacentHTML('afterend',`<fieldset><legend>Notifications</legend>
     ${notificationPreferences.map(([type,label])=>`<label><input type="checkbox" data-notification="${type}" ${notificationEnabled(type)?'checked':''}> ${label}</label>`).join('')}
     <p>Changes are saved on this device.</p>
-    ${desktopMode?'':'<button type="button" id="notification-permission">Allow browser notifications</button><p id="notification-status" role="status"></p>'}</fieldset>`);
+    ${desktopMode?'':'<button type="button" id="notification-permission">Allow browser notifications</button><p id="notification-status" role="status"></p>'}
+    <button type="button" id="test-notification">Test notification</button>
+    <p id="test-notification-status" role="status"></p></fieldset>`);
   document.querySelectorAll('[data-notification]').forEach(box=>box.onchange=()=>{
     const type=box.dataset.notification;
     localStorage.setItem(notificationKey(type),String(box.checked));
@@ -184,6 +191,27 @@ function renderNotificationSettings(){
       if(box.checked)refreshTaskNotifications().catch(console.error);
     }
   });
+  const testButton=$('#test-notification'),testStatus=$('#test-notification-status');
+  testButton.onclick=async()=>{
+    testButton.disabled=true;
+    testStatus.textContent='';
+    try{
+      if(await deliverNotification('Scrum Studio test notification','This is a sample notification from Settings.')){
+        testStatus.textContent='Test notification sent.';
+      }else{
+        testStatus.textContent=desktopMode
+          ?'Desktop notification delivery is unavailable. Try again once Scrum Studio Desktop has loaded.'
+          :({
+            unavailable:'Browser notifications are unavailable here. Use a supported desktop browser over HTTPS or localhost.',
+            denied:'Browser notifications are blocked. Allow notifications for this site in your browser settings.',
+            default:'Allow browser notifications before sending a test.',
+          }[browserNotificationPermission()]??'Browser notification delivery is unavailable.');
+      }
+    }catch(error){
+      console.error(error);
+      testStatus.textContent=`${desktopMode?'Desktop':'Browser'} notification delivery failed. Try again.`;
+    }finally{testButton.disabled=false;}
+  };
   if(desktopMode)return;
   const button=$('#notification-permission'), status=$('#notification-status');
   const updatePermissionStatus=(failed=false)=>{
