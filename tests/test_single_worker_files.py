@@ -58,12 +58,38 @@ class SingleWorkerFilesTest(unittest.TestCase):
         p,_=self.setup_project(parallel=2);t=self.task(p);claim=self.claim(p,t)
         with self.assertRaisesRegex(ValueError,'exclusive single-worker'):self.finish(p,t,claim,additional_files=['b.py'])
         self.assertEqual(run('task_get',dict(project=p,id=t))['status'],'In Progress')
-    def test_live_exclusive_claim_prevents_unsafe_policy_transition(self):
+    def test_capacity_increase_waits_for_exclusive_claim(self):
         p,_=self.setup_project();t=self.task(p);claim=self.claim(p,t)
-        for changes in ({'max_parallel_agents':2},{'file_lock_policy':'Always'}):
-            with self.assertRaisesRegex(ValueError,'Finish live single-worker'):run('project_settings',dict(project=p,actor=self.human,**changes))
+        other=self.task(p,'Next',files=['b.py'])
+        peer=run('user_register',dict(identity='agent:capacity-peer',name='Peer',kind='agent'))['id']
+        run('agent_checkpoint',dict(project=p,actor=peer,client='codex',session_used_percent=10,weekly_used_percent=20))
+        saved=run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=2))
+        reloaded=run('snapshot',dict(project=p))['settings']
+        for settings in (saved,reloaded):
+            self.assertEqual(settings['max_parallel_agents'],2)
+            self.assertEqual(settings['effective_max_parallel_agents'],1)
+            self.assertEqual(settings['file_lock_policy'],'Auto')
+        with self.assertRaisesRegex(ValueError,'Finish live single-worker'):
+            run('project_settings',dict(project=p,actor=self.human,file_lock_policy='Always'))
+        for actor in (self.agent,peer,self.human):
+            with self.assertRaisesRegex(ValueError,'Single-worker checkout'):
+                self.claim(p,other,actor)
+        self.assertFalse(run('worker_launch',dict(project=p,actor=peer,client='codex'))['eligible'])
+        renewed=run('task_claim',dict(project=p,id=t,actor=self.agent,token=claim['token']))
+        self.assertEqual(renewed['file_lock_mode'],'checkout')
         self.finish(p,t,claim)
-        self.assertEqual(run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=2))['max_parallel_agents'],2)
+        self.assertEqual(run('snapshot',dict(project=p))['settings']['effective_max_parallel_agents'],2)
+        new=self.claim(p,other,peer)
+        self.assertEqual(new['file_lock_mode'],'files')
+        self.assertEqual(new['files_reserved'],1)
+        self.assertEqual(self.claim(p,self.task(p,'Independent',files=['c.py']))['file_lock_mode'],'files')
+    def test_reclaim_does_not_restore_released_capacity_wait(self):
+        p,_=self.setup_project();t=self.task(p);claim=self.claim(p,t)
+        run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=2))
+        run('task_release',dict(project=p,id=t,actor=self.agent,token=claim['token']))
+        reclaimed=self.claim(p,t)
+        self.assertEqual(reclaimed['file_lock_mode'],'files')
+        self.assertEqual(run('project_settings',dict(project=p))['effective_max_parallel_agents'],2)
     def test_policy_is_human_only_and_rejects_unknown_modes(self):
         p,_=self.setup_project()
         with self.assertRaisesRegex(ValueError,'Only a human'):run('project_settings',dict(project=p,actor=self.agent,file_lock_policy='Always'))
@@ -86,10 +112,11 @@ class SingleWorkerFilesTest(unittest.TestCase):
         p,_=self.setup_project(policy='Always');a=self.task(p,'First');b=self.task(p,'Second',files=['b.py'])
         ca=self.claim(p,a);cb=self.claim(p,b)
         run('project_settings',dict(project=p,actor=self.human,file_lock_policy='Auto'))
+        run('project_settings',dict(project=p,actor=self.human,max_parallel_agents=2))
         renewed=run('task_claim',dict(project=p,id=a,actor=self.agent,token=ca['token']))
         self.assertEqual(renewed['file_lock_mode'],'files');self.assertEqual(len(run('file_locks',dict(project=p))['items']),2)
         self.finish(p,b,cb);self.finish(p,a,ca)
-        c=self.task(p,'Next');self.assertEqual(self.claim(p,c)['file_lock_mode'],'checkout')
+        c=self.task(p,'Next');self.assertEqual(self.claim(p,c)['file_lock_mode'],'files')
     def test_git_commit_includes_declared_extra_and_preserves_unrelated_edit(self):
         p,root=self.setup_project()
         def g(*args):

@@ -89,6 +89,11 @@ def migrate(db, separate=False):
     for name, spec in [('review_data', "TEXT NOT NULL DEFAULT '{}'"), ('decisions', "TEXT NOT NULL DEFAULT '[]'"), ('files', "TEXT NOT NULL DEFAULT '[]'"), ('evidence', "TEXT NOT NULL DEFAULT ''")]:
         if name not in columns:
             db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {spec}')
+    db.execute('''CREATE TABLE IF NOT EXISTS parallel_capacity_waits(
+        project INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        lease_token TEXT NOT NULL,
+        PRIMARY KEY(project,task))''')
     namespace = 'reservations.' if separate else ''
     references = '' if separate else ' REFERENCES projects(id)'
     task_ref = '' if separate else ' REFERENCES tasks(id)'
@@ -104,8 +109,24 @@ def migrate(db, separate=False):
     runtime.migrate(db,separate)
 
 
-def settings(row):
-    return {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup','git_pause_blocked',*PROVIDER_SETTINGS.values()] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+def settings(row, db=None):
+    result = {k: bool(row[k]) if k in ['agent_followup_tasks','require_evidence','usage_guard','auto_resume_session_quota','git_cleanup','git_pause_blocked',*PROVIDER_SETTINGS.values()] else row[k] for k in ['max_active_per_agent','require_evidence','workspace_root','settings_version',*POLICY_DEFAULTS]}
+    if db is not None:
+        result['effective_max_parallel_agents'] = effective_parallel_limit(db, row)
+    return result
+
+
+def effective_parallel_limit(db, policy):
+    requested = policy['max_parallel_agents']
+    if requested > 1 and policy['file_lock_policy'] == 'Auto':
+        # A renewal retains its token. A released or expired claim cannot
+        # block the transition again if the same task is claimed anew.
+        pending = db.execute('''SELECT 1 FROM parallel_capacity_waits w
+            JOIN tasks t ON t.id=w.task AND t.lock_token=w.lease_token
+            WHERE w.project=? AND t.lock_until>? LIMIT 1''', (policy['id'], time.time())).fetchone()
+        if pending:
+            return 1
+    return requested
 
 
 def active_count(db, project, actor, exclude=-1):
@@ -113,8 +134,8 @@ def active_count(db, project, actor, exclude=-1):
 
 
 def checkout_policy(db,project):
-    policy=db.execute('SELECT file_lock_policy,max_parallel_agents FROM projects WHERE id=?',(project,)).fetchone()
-    return policy['file_lock_policy']=='Auto' and policy['max_parallel_agents']==1
+    policy=db.execute('SELECT id,file_lock_policy,max_parallel_agents FROM projects WHERE id=?',(project,)).fetchone()
+    return policy['file_lock_policy']=='Auto' and effective_parallel_limit(db,policy)==1
 
 
 def file_lock_mode(db,project,task=None):
@@ -152,7 +173,8 @@ def parallel_available(db,project,actor):
     actors.update(feature_planning.active_actors(db,project))
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='worker_launch_offers'").fetchone():
         actors.update(r[0] for r in db.execute('SELECT o.actor FROM worker_launch_offers o JOIN users u ON u.id=o.actor WHERE o.project=? AND o.expires>? AND u.active=1',(project,time.time())))
-    limit=db.execute('SELECT max_parallel_agents FROM projects WHERE id=?',(project,)).fetchone()[0]
+    policy=db.execute('SELECT id,file_lock_policy,max_parallel_agents FROM projects WHERE id=?',(project,)).fetchone()
+    limit=effective_parallel_limit(db,policy)
     return actor in actors or len(actors)<limit
 
 
@@ -264,14 +286,16 @@ def operation(db, action, a, project_row, actor_user, activity, now):
     if action == 'project_settings':
         changed={k:a[k] for k in ['max_active_per_agent','require_evidence','workspace_root',*POLICY_DEFAULTS] if k in a}
         if not changed:
-            return settings(project_row)
+            return settings(project_row, db)
         if actor_user(db,a)['kind'] != 'human':
             raise ValueError('Only a human profile can change project settings')
         db.execute('BEGIN IMMEDIATE')
         current=db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone()
         validate_policy(changed)
-        leaving_exclusive=(current['file_lock_policy']=='Auto' and current['max_parallel_agents']==1 and (changed.get('file_lock_policy',current['file_lock_policy'])!='Auto' or changed.get('max_parallel_agents',1)>1))
-        if leaving_exclusive and db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>? LIMIT 1',(project,time.time())).fetchone():
+        requested = changed.get('max_parallel_agents', current['max_parallel_agents'])
+        policy = changed.get('file_lock_policy', current['file_lock_policy'])
+        exclusive = current['file_lock_policy']=='Auto' and effective_parallel_limit(db,current)==1
+        if exclusive and policy != 'Auto' and db.execute('SELECT 1 FROM tasks WHERE project=? AND lock_until>? LIMIT 1',(project,time.time())).fetchone():
             raise ValueError('Finish live single-worker claims before enabling concurrent work or changing reservation policy')
         if any(key in changed and changed[key]!=current[key] for key in ('git_mode','workspace_root')):
             import git_paused
@@ -338,6 +362,12 @@ def operation(db, action, a, project_row, actor_user, activity, now):
             if root != current['workspace_root'] and db.execute('SELECT 1 FROM file_locks WHERE project=? AND lock_until>?',(project,time.time())).fetchone():
                 raise ValueError('Release live file locks before changing workspace_root')
             changed['workspace_root']=root
+        if requested == 1 or policy != 'Auto':
+            db.execute('DELETE FROM parallel_capacity_waits WHERE project=?', (project,))
+        elif exclusive and current['max_parallel_agents'] == 1:
+            db.execute('''INSERT INTO parallel_capacity_waits(project,task,lease_token)
+                SELECT project,id,lock_token FROM tasks
+                WHERE project=? AND lock_until>? AND lock_token IS NOT NULL''', (project, time.time()))
         for field,value in changed.items():
             db.execute(f'UPDATE projects SET {field}=? WHERE id=?',(value,project))
         for client,key in PROVIDER_SETTINGS.items():
@@ -346,7 +376,7 @@ def operation(db, action, a, project_row, actor_user, activity, now):
         if changed.get('auto_resume_session_quota') is False:
             db.execute("UPDATE agent_sessions SET resume_reset=NULL,auto_resume_status='disabled' WHERE project=?",(project,))
         db.execute('UPDATE projects SET settings_version=settings_version+1 WHERE id=?',(project,))
-        return settings(db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone())
+        return settings(db.execute('SELECT * FROM projects WHERE id=?',(project,)).fetchone(), db)
     if action == 'session_resume':
         actor=actor_user(db,a);closing={}
         if 'closing_task' in a:

@@ -856,7 +856,7 @@ def legacy_run(action, a, path=None, locks=None):
                      WHERE task=tasks.id AND status=tasks.status AND tasks.status IN ('Done','Cancelled')
                      ORDER BY id DESC LIMIT 1) AS board_finished
                     FROM tasks WHERE project=? ORDER BY priority,id"""
-            return {'runtime':runtime.summary(db,project),'settings':coord.settings(project_row),'users': [dict(r) for r in db.execute('SELECT * FROM users ORDER BY name,id')], 'tasks': [task_dict(r, prefix) for r in db.execute(task_sql, (project,))], 'notes': [dict(r, items=json.loads(r['items'])) for r in db.execute('SELECT * FROM notes WHERE project=? ORDER BY id DESC', (project,))]}
+            return {'runtime':runtime.summary(db,project),'settings':coord.settings(project_row, db),'users': [dict(r) for r in db.execute('SELECT * FROM users ORDER BY name,id')], 'tasks': [task_dict(r, prefix) for r in db.execute(task_sql, (project,))], 'notes': [dict(r, items=json.loads(r['items'])) for r in db.execute('SELECT * FROM notes WHERE project=? ORDER BY id DESC', (project,))]}
         if action == 'task_plan':
             import planning
             return planning.apply(db,a,project)
@@ -1249,7 +1249,7 @@ def legacy_run(action, a, path=None, locks=None):
             if a.get('actor') is not None and not coord.parallel_available(db,project,a['actor']):
                 if action=='worker_launch':return {'eligible':False,'reason':'Project parallel-agent limit reached; no model was started.'}
                 if not preview:
-                    return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':project_row['max_parallel_agents']}}
+                    return {'task':None,'reason':'Project parallel-agent limit reached','capacity':{'parallel_available':False,'parallel_limit':coord.effective_parallel_limit(db,project_row)}}
                 stop=stop or 'Project parallel-agent limit reached.'
             if action=='worker_launch':
                 import git_completion
