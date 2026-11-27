@@ -461,7 +461,11 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
 
 def autonomy_prompt(policy):
     standing=('\nHuman project execution instructions: '+policy['execution_instructions']) if policy.get('execution_instructions') else ''
-    if policy.get('autonomy_mode')!='Autonomous':return standing
+    if policy.get('autonomy_mode')!='Autonomous':
+        return standing+(' When work needs a human decision to proceed, submit a project Chat question before yielding. '
+                         'Use native CLI ask or agent_interaction with question_category, human_requirement, continuity '
+                         'and at least two concrete options. Chat also accepts a written answer. '
+                         'On deferred=true exit: the task is parked until answered. Do not pause it back to TODO.')
     return standing+('\nAutonomous decisions: resolve routine implementation, Git recovery, missing UI states and scoped technical errors yourself; reuse valid checks and existing authorization. Create/reuse a concrete prerequisite only when needed. Do not ask whether to continue, fix a failure or choose an ordinary implementation detail. Screenshots are internal verification, not routine human approval. Do not assume existing UI is wrong or redo verified work. Only for indispensable missing input, conflicting requirements, access, specific visual judgment or a human playtest, use ask --input FILE (or the supplied ask_human helper) with question_category, human_requirement explaining why only the human can resolve it, two or more concrete options and concise continuity. The native question parks only this task, releases its claims/batch and returns deferred=true: exit; the supervisor continues other ready work. Never poll the human or mark waiting work Done. Human answers reopen the task natively, subject to Stop/quota. Never auto-answer permission callbacks or fabricate physical reviews.')
 
 

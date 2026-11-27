@@ -70,12 +70,12 @@ def operation(db,a,actor_user,now,activity=None):
         if kind=='permission' and options!=['Approve once','Deny','Cancel run']:raise ValueError('Permission requests offer only one-shot approval, denial or cancellation')
         if db.execute("SELECT COUNT(*) FROM agent_interactions WHERE project=? AND actor=? AND state='pending' AND expires>?",(project,author['id'],time.time())).fetchone()[0]>=3:raise ValueError('At most three pending decisions per agent')
         policy=db.execute('SELECT autonomy_mode FROM projects WHERE id=?',(project,)).fetchone()
-        deferred=kind=='question' and policy['autonomy_mode']=='Autonomous'
+        deferred=kind=='question' and (policy['autonomy_mode']=='Autonomous' or bool(a.get('question_category')))
         meta={}
         if deferred:
             category=a.get('question_category');why=a.get('human_requirement','')
             if category not in ('missing_input','conflicting_requirements','visual_review','playtest','access'):
-                raise ValueError('Autonomous mode needs a typed concrete question. Use CLI ask --input FILE with question_category, human_requirement, options and continuity instead of an unqualified input request')
+                raise ValueError('Parking a task requires a typed concrete question. Use CLI ask --input FILE with question_category, human_requirement, options and continuity instead of an unqualified input request')
             if not isinstance(why,str) or not 20<=len(why.strip())<=600:
                 raise ValueError('Explain specifically why human input is indispensable (20..600 characters); resolve routine choices yourself')
             if len(options)<2:raise ValueError('Provide at least two concrete choices for the human')
