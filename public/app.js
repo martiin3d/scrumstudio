@@ -283,6 +283,17 @@ async function refresh(conditional=false){
   }finally{if(serial===refreshSerial)refreshing=false;}
 }
 function humanReviewTag(t){return t.status==='In Review'&&t.review?.awaiting_human?'<span class="human-review-tag">Waiting for human review</span>':'';}
+function boardColumnTasks(tasks,status,sort){
+  const column=tasks.filter(task=>task.status===status);
+  if(sort==='default'||!['Done','Cancelled'].includes(status))return column;
+  const [field,direction]=sort.split(':');
+  return column.sort((a,b)=>{
+    const av=a[field],bv=b[field];
+    if(av==null)return bv==null?0:1;
+    if(bv==null)return -1;
+    return (av-bv)*(direction==='asc'?1:-1);
+  });
+}
 function render(){
   renderAgentControls();
   if(desktopMode){$('main').dataset.page=page;renderDesktopProjects();}
@@ -293,6 +304,7 @@ function render(){
   const view=taskView();
   $('#view-label').textContent=page==='Board'?(view.mode==='list'?'Task list':'Kanban board'):page==='AI workflow'?'Agent workspace':page==='Projects'?'Project directory':page==='Agents'?'Agent activity':page==='Notes'?'Project notes':`${page} notes`;
   $('#board-views').hidden=page!=='Board';$('#list-options').hidden=page!=='Board'||view.mode!=='list';
+  $('#board-sort-label').hidden=page!=='Board'||view.mode!=='board'||!project;
   $('#feature-request-shortcut').hidden=!project||page!=='Board';
   $('main > .toolbar').hidden=['Chat','Wiki'].includes(page);
   document.querySelectorAll('[data-board-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.boardView===view.mode)));
@@ -324,7 +336,8 @@ function render(){
     if(view.mode==='list'){renderTaskList(tasks,view);return;}
     const boardScroll=desktopMode?$('.board')?.scrollLeft:0;
     const columnScroll=desktopMode?[...document.querySelectorAll('.board .column')].map(c=>c.scrollTop):[];
-    $('#content').innerHTML='<div class="board">'+statuses.map((s,i)=>`<section class="column" data-status="${s}" title="${s==='Backlog'?'Parked until you move the task to To do; agents never activate it automatically.':''}" style="--tone:${tones[i]}"><div class="column-head"><span class="status-dot"></span>${s==='TODO'?'To do':s}<i>${tasks.filter(t=>t.status===s).length}</i><button data-create="${s}" aria-label="Add task">＋</button></div>${tasks.filter(t=>t.status===s).map(t=>`<button draggable="true" class="card" data-task="${t.id}"><span class="card-id">${state.runtime?.active_task_ids.includes(t.id)?'<span class="active-task-dot" role="img" aria-label="Active on this task" title="Recent agent heartbeat and live task claim"></span>':''}${esc(t.code)}</span><span class="category-tag">${esc(t.category)}</span><h3>${esc(t.title)}</h3>${humanReviewTag(t)}${t.description?`<p>${esc(t.description.slice(0,130))}</p>`:''}${t.dependencies.length?`<p>Prerequisites: ${t.dependencies.map(id=>{const d=state.tasks.find(d=>d.id===id);return esc(d?`${d.code} (${d.status})`:id);}).join(', ')}</p>`:''}${t.status==='Cancelled'?`<p>Cancelled: ${esc(t.cancel_reason.slice(0,130))}</p>`:''}${t.blocked_reason?`<p>⚑ ${esc(t.blocked_reason)}</p>`:''}${t.continuity&&!t.locked&&['TODO','Blocked','In Progress'].includes(t.status)?`<p class="resume-hint" title="${esc(t.continuity)}">⏸ Resumable · ${esc(t.continuity.split('\n')[0].slice(0,110))}</p>`:''}${t.checklist.length?`<p class="checklist-progress">☑ ${t.checklist.filter(i=>i.done).length}/${t.checklist.length} completed</p>`:''}<div class="card-footer"><span class="priority p${t.priority}">${t.priority===1?'↑ High':t.priority===3?'↓ Low':'＝ Normal'}</span><span class="task-owner">${t.locked?'🔒 ':''}${esc(users.find(u=>u.id===t.owner_id)?.name||'Unassigned')}</span></div></button>`).join('')||'<div class="empty-column">No tasks here yet</div>'}</section>`).join('')+'</div>';
+    const sort=$('#board-sort').value;
+    $('#content').innerHTML='<div class="board">'+statuses.map((s,i)=>{const column=boardColumnTasks(tasks,s,sort);return `<section class="column" data-status="${s}" title="${s==='Backlog'?'Parked until you move the task to To do; agents never activate it automatically.':''}" style="--tone:${tones[i]}"><div class="column-head"><span class="status-dot"></span>${s==='TODO'?'To do':s}<i>${column.length}</i><button data-create="${s}" aria-label="Add task">＋</button></div>${column.map(t=>`<button draggable="true" class="card" data-task="${t.id}"><span class="card-id">${state.runtime?.active_task_ids.includes(t.id)?'<span class="active-task-dot" role="img" aria-label="Active on this task" title="Recent agent heartbeat and live task claim"></span>':''}${esc(t.code)}</span><span class="category-tag">${esc(t.category)}</span><h3>${esc(t.title)}</h3>${humanReviewTag(t)}${t.description?`<p>${esc(t.description.slice(0,130))}</p>`:''}${t.dependencies.length?`<p>Prerequisites: ${t.dependencies.map(id=>{const d=state.tasks.find(d=>d.id===id);return esc(d?`${d.code} (${d.status})`:id);}).join(', ')}</p>`:''}${t.status==='Cancelled'?`<p>Cancelled: ${esc(t.cancel_reason.slice(0,130))}</p>`:''}${t.blocked_reason?`<p>⚑ ${esc(t.blocked_reason)}</p>`:''}${t.continuity&&!t.locked&&['TODO','Blocked','In Progress'].includes(t.status)?`<p class="resume-hint" title="${esc(t.continuity)}">⏸ Resumable · ${esc(t.continuity.split('\n')[0].slice(0,110))}</p>`:''}${t.checklist.length?`<p class="checklist-progress">☑ ${t.checklist.filter(i=>i.done).length}/${t.checklist.length} completed</p>`:''}<div class="card-footer"><span class="priority p${t.priority}">${t.priority===1?'↑ High':t.priority===3?'↓ Low':'＝ Normal'}</span><span class="task-owner">${t.locked?'🔒 ':''}${esc(users.find(u=>u.id===t.owner_id)?.name||'Unassigned')}</span></div></button>`).join('')||'<div class="empty-column">No tasks here yet</div>'}</section>`;}).join('')+'</div>';
     document.querySelectorAll('[data-task]').forEach(b=>{b.onclick=()=>openTask(state.tasks.find(t=>t.id===+b.dataset.task));b.ondragstart=e=>e.dataTransfer.setData('text/plain',b.dataset.task);});
     document.querySelectorAll('[data-create]').forEach(b=>b.onclick=()=>openTask(undefined,b.dataset.create==='Backlog'?'Backlog':'TODO'));
     if(boardScroll)$('.board').scrollLeft=boardScroll;
@@ -1176,6 +1189,7 @@ $('#task-sort').onchange=e=>setTaskView({sort:e.target.value,direction:e.target.
 $('#task-sort-direction').onclick=()=>setTaskView({direction:taskView().direction==='asc'?'desc':'asc'});
 $('#search').oninput=render;
 $('#category-filter').onchange=render;
+$('#board-sort').onchange=render;
 function applyTheme(theme){document.documentElement.dataset.theme=theme;$('#theme-toggle').textContent=theme==='dark'?'☀ Light':'☾ Dark';$('#theme-toggle').setAttribute('aria-pressed',theme==='dark');}
 applyTheme(localStorage.getItem('scrum-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));
 $('#theme-toggle').onclick=()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';localStorage.setItem('scrum-theme',theme);applyTheme(theme);};
