@@ -131,19 +131,20 @@ function browserNotificationPermission(){
   return window.isSecureContext&&typeof window.Notification?.requestPermission==='function'
     ?window.Notification.permission:'unavailable';
 }
-async function deliverNotification(title,message){
+async function deliverNotification(title,message,origin=project,view='Board',question=null){
   if(desktopMode){
     const bridge=window.pywebview?.api;
     if(typeof bridge?.notify!=='function')return false;
-    await bridge.notify(title,message);
+    await bridge.notify(title,message,origin,view,question);
   }else{
     if(browserNotificationPermission()!=='granted')return false;
     new window.Notification(title,{body:message});
   }
   return true;
 }
-function notify(type,title,message){
-  if(notificationEnabled(type))deliverNotification(title,message).catch(console.error);
+function notify(type,title,message,origin,question=null){
+  if(notificationEnabled(type))deliverNotification(title,message,origin,
+    type==='pending-question'?'Chat':'Board',question).catch(console.error);
 }
 async function refreshTaskNotifications(){
   const scope=currentNotificationScope();
@@ -161,7 +162,7 @@ async function refreshTaskNotifications(){
     watch.version=result.version;
     for(const task of result.data.tasks){
       if(previous?.has(task.id)&&previous.get(task.id)!==task.status){
-        notify('task-status',`${task.code||task.id} · ${task.status}`,task.title);
+        notify('task-status',`${task.code||task.id} · ${task.status}`,task.title,scope.project);
       }
     }
   }finally{watch.loading=false;}
@@ -173,7 +174,7 @@ function recordPendingQuestions(scope,items){
   for(const item of pending){
     const isNew=previous&&!previous.has(item.id);
     scope.seenQuestions.add(item.id);
-    if(isNew)notify('pending-question','New agent question',item.question);
+    if(isNew)notify('pending-question','New agent question',item.question,scope.project,String(item.id));
   }
 }
 function renderNotificationSettings(){
@@ -1137,7 +1138,35 @@ $('#new-project').onclick=openProject;
 function selectProject(id){
   if(id===project)return;
   if(!leaveInspector()){$('#project').value=project;return;}
-  project=id;$('#project').value=id;metricSession='';metricBySession=false;refresh().catch(error);
+  setProject(id);refresh().catch(error);
+}
+function setProject(id){
+  if(id===project)return;
+  project=id;$('#project').value=id;metricSession='';metricBySession=false;
+}
+async function openDesktopNotification(origin,view,question){
+  if(!desktopMode||editorBlocksRefresh()||!leaveInspector())return;
+  try{
+    if(origin!==null){
+      if(!projects.some(p=>p.id===origin&&p.available!==false))return;
+      setProject(origin);
+    }
+    const selected=project;
+    page=view;
+    if(view==='Chat')chatModes.set(selected,'messages');
+    const loading=refresh(), serial=refreshSerial;
+    await loading;
+    if(view==='Chat'&&project===selected&&page===view&&serial===refreshSerial){
+      const card=[...document.querySelectorAll('#chat-interactions [data-interaction]')]
+        .find(card=>card.dataset.interaction===question);
+      const target=card||$('#chat-requests-title');
+      if(target){
+        target.tabIndex=-1;
+        target.focus({preventScroll:true});
+        target.scrollIntoView({block:'nearest'});
+      }
+    }
+  }catch(e){error(e);}
 }
 $('#project').onchange=()=>selectProject(Number($('#project').value));
 document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{if(leaveInspector()){page=b.dataset.page;refresh().catch(error);}});
