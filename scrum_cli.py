@@ -55,10 +55,11 @@ def locked(path):
     finally:lock.unlink(missing_ok=True)
 
 
-def create_context(path,project,actor,client,started,batch=False):
+def create_context(path,project,actor,client,started,batch=False,task_only=False):
     task=started['task']
     state={'schema':1,'machine_scope':machine_scope(),'project':project,'actor':actor,'client':client,'batch':bool(batch),
            'measurement_session':started.get('measurement_session'),'current':{'id':task['id'],'code':task['code'],'token':started['token']},'receipts':[]}
+    if task_only:state['task_only']=True
     atomic(path,state);return state
 
 
@@ -129,6 +130,12 @@ def coordinated(name,args,path=None):
         for field in ('project','actor','client','measurement_session'):
             if field in spec and state.get(field) is not None:args.setdefault(field,state[field])
         current=state.get('current') or {}
+        if state.get('task_only') and name in ('work_start','task_claim'):
+            raise ValueError('The supervisor owns task selection for this execution')
+        if state.get('task_only') and name=='agent_checkpoint':
+            if not current or args.get('action')=='observe':
+                raise ValueError('A task checkpoint requires the current claim')
+            args.update(id=current['id'],token=current['token'])
         if name=='agent_interaction' and args.get('action')=='request' and not current:
             raise ValueError('ask requires the current claimed task')
         if name=='work_finish':
@@ -146,7 +153,9 @@ def coordinated(name,args,path=None):
             args['token']=current['token']
         if name=='work_finish':
             if not current or args.get('id')!=current['id']:raise ValueError('finish requires the explicitly named current claimed task')
-            if state['batch']:args.update(use_batch=True,claim_next=True,client=state['client'])
+            if state.get('task_only'):
+                args.update(task_only=True,close_session=False,use_batch=False,claim_next=False)
+            elif state['batch']:args.update(use_batch=True,claim_next=True,client=state['client'])
             else:args.update(close_session=True,client=state['client'])
         if name=='task_update' and args.get('status')=='Done':raise ValueError('Use finish with the current claim; direct Done updates are not supported by the worker CLI')
         from coordination_api import specification

@@ -372,6 +372,8 @@ def cli_prompt(project,folder,actor,client,offer,policy,started,role='',sections
             rules+=' For a discovered prerequisite use plan with defer_task=current ID. PLAN_REJECTED rolled back. Exit on deferred=true.'
         if offer.get('batch'):
             rules+=' Finish each task separately. Continue only with the fresh next.claim and next.task. Resolve that task’s required_skills before editing. Exit when the batch ends or the next claim fails.'
+        elif started.get('task_only'):
+            rules+=' Finish closes this task execution. Exit so the supervisor can refill the slot.'
         else:
             rules+=' Finish closes the session. Exit so the supervisor can select the next task.'
         if task.get('category')=='Git recovery':
@@ -722,14 +724,19 @@ def final_message(path,offset):
     return final[:1500]
 
 
-def stop_child(child, grace=10):
+def interrupt_child(child):
+    if os.name=='nt':
+        child.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        os.killpg(child.pid,signal.SIGINT)
+
+
+def stop_child(child, grace=10, interrupted=False):
     if child.poll() is not None:
         return
     try:
-        if os.name=='nt':
-            child.send_signal(signal.CTRL_BREAK_EVENT)
-        else:
-            os.killpg(child.pid,signal.SIGINT)
+        if not interrupted:
+            interrupt_child(child)
         child.wait(timeout=grace)
         return
     except (OSError,subprocess.TimeoutExpired):
@@ -739,6 +746,174 @@ def stop_child(child, grace=10):
     else:
         os.killpg(child.pid,signal.SIGKILL)
     child.wait(timeout=10)
+
+class ParallelRuns:
+    def __init__(self, rpc, args, actor, folder, role):
+        self.rpc = rpc
+        self.args = args
+        self.base = {'project': args.project, 'actor': actor, 'client': args.client}
+        self.folder = folder
+        self.role = role
+        self.runs = {}
+        self.failed = set()
+        self.wait_reason = ''
+        self.waiting = False
+        self.enabled = False
+
+    def chat(self, message):
+        chat_event(self.rpc, self.args.project, self.base['actor'], message)
+
+    def launch(self, policy):
+        try:
+            offer = self.rpc.call('worker_launch', self.base | {
+                'action': 'reserve', 'parallel': True,
+                'running_ids': list(self.runs),
+                'exclude_ids': [*self.runs, *sorted(self.failed)][:100]})
+        except RuntimeError:
+            self.chat('Task slot waiting: launch offer unavailable.')
+            return False
+        if not offer.get('eligible'):
+            self.waiting = bool(offer.get('waiting') or offer.get('waiting_for_parallel_capacity'))
+            reason = offer.get('reason', 'No eligible unreserved work.')
+            if reason != self.wait_reason:
+                self.chat('Task slot waiting: '+reason)
+                self.wait_reason = reason
+            return False
+        task_id = offer['id']
+        scope = self.base | {'id': task_id}
+        run = None
+        try:
+            if error := windows_sandbox_failure(self.folder, self.args.client, policy):
+                raise ValueError(error)
+            claim = self.rpc.call('task_claim', {'project': self.args.project, 'actor': self.base['actor'],
+                                                 'id': task_id, 'parallel': True, 'running_ids': list(self.runs)})
+            if not claim.get('claimed'):
+                raise ValueError(claim.get('branch_busy', {}).get('reason') or 'File reservations prevented the claim.')
+            occupied = {active.slot for active in self.runs.values()}
+            slot = next(index for index in range(1, 21) if index not in occupied)
+            run = ParallelRun(scope | {'token': claim['token']}, offer['code'], slot)
+            self.runs[task_id] = run
+            task = self.rpc.call('task_get', {'project': self.args.project, 'id': task_id})
+            workflow = self.rpc.call('workflow_status', {'project': self.args.project, 'id': task_id})['effective']
+            try:session=overhead.start_session(self.args.project,self.base['actor'],workflow)
+            except (OSError,ValueError,overhead.sqlite3.Error):session=None
+            started = {**claim, 'task': task, 'workflow': workflow, 'measurement_session': session, 'task_only': True}
+            guard = self.rpc.call('agent_checkpoint', run.scope | (
+                {'profile_id': self.args.profile} if self.args.profile else {}))
+            if guard['should_stop']:
+                raise ValueError(guard['reason'])
+            if self.rpc.call('project_settings', {'project': self.args.project}).get(self.args.client+'_enabled') is False:
+                raise ValueError(self.args.client+' is disabled in Project Settings')
+            run.start(self.folder, self.args, offer, policy, started, self.role)
+        except (OSError, RuntimeError, ValueError) as error:
+            if run:
+                self.close(task_id, 'CLI launch failed', error=str(error))
+            else:
+                self.failed.add(task_id)
+                self.chat(f'{offer["code"]} waiting: {error}')
+            return False
+        finally:
+            try:self.rpc.call('worker_launch', scope | {'action': 'release', 'parallel': True})
+            except RuntimeError:self.chat(f'{offer["code"]}: advisory launch offer will expire automatically.')
+        self.wait_reason = ''
+        self.waiting = False
+        self.chat(f'Launched {run.code} in its own CLI execution.')
+        return True
+
+    def close(self, task_id, reason, error='', interrupted=False):
+        run = self.runs[task_id]
+        if run.child and run.child.poll() is None:
+            stop_child(run.child, interrupted=interrupted)
+        if run.cost:
+            run.cost.tick(active=False)
+        if run.output:
+            run.output.close()
+        payload = run.scope | {'action': 'offline', 'reason': reason, 'summary': error[:800]}
+        if run.child:
+            exit_code = run.child.poll()
+            # Existing Git cleanup confirms exit by identity, so wait until its last process exits.
+            if len(self.runs)==1 and exit_code is not None:
+                payload['run_exit_code'] = exit_code
+            payload['cli_usage_report'] = measured_report(
+                self.folder, run.log, 0, self.args.client, run.id, run.model, [task_id])
+        del self.runs[task_id]
+        try:result = usage_checkpoint(self.rpc, payload)
+        except RuntimeError:
+            result = {}
+            error = error or 'Handoff could not be confirmed. Inspect the recorded claim before retrying.'
+        if error or (result.get('tasks_released') and not interrupted):
+            self.failed.add(task_id)
+        self.chat(f'{run.code}: {reason}'+(' — '+error[:500] if error else ''))
+
+    def stop(self, reason):
+        self.waiting = False
+        # Interrupt every process before releasing any of their claims.
+        for run in self.runs.values():
+            if run.child and run.child.poll() is None:
+                try:interrupt_child(run.child)
+                except OSError:pass
+        for task_id in list(self.runs):
+            try:self.close(task_id, reason, interrupted=True)
+            except (OSError, subprocess.TimeoutExpired):
+                self.chat(f'{self.runs[task_id].code}: process shutdown could not be confirmed. Its claim remains held.')
+
+    def reap(self):
+        for task_id, run in list(self.runs.items()):
+            code = run.child.poll()
+            if code is not None:
+                error = (run_failure(run.log, 0) or f'CLI exit {code}') if code else ''
+                self.close(task_id, 'CLI failed' if code else 'CLI execution ended', error)
+                if not code:
+                    try:task=self.rpc.call('task_get', {'project': self.args.project, 'id': task_id})
+                    except RuntimeError:task={}
+                    if task.get('status') in (None,'TODO','In Progress'):
+                        self.failed.add(task_id)
+            elif model_mismatch(run.model, reported_model(run.log, 0)):
+                self.close(task_id, 'Provider model mismatch', f'Requested {run.model}.')
+            else:
+                run.cost.tick(active=True)
+
+
+class ParallelRun:
+    def __init__(self, scope, code, slot):
+        self.scope = scope
+        self.code = code
+        self.slot = slot
+        self.id = uuid.uuid4().hex
+        self.child = self.output = self.cost = None
+
+    def start(self, folder, args, offer, policy, started, role):
+        from scrum_cli import create_context
+        task_id = self.scope['id']
+        actor = self.scope['actor']
+        directory = Path(started.get('git', {}).get('worktree') or folder)
+        context = folder/'.scrum/local/cli-context'/f'{self.id}.json'
+        create_context(context, args.project, actor, args.client, started, task_only=True)
+        self.log = folder/'.scrum/local'/f'worker-{args.client}-{args.worker}-{task_id}-{self.id}.log'
+        cost_path = folder/'.scrum/local/run-cost'/f'{actor}-{self.slot}.json'
+        self.model = offer.get('selection', {}).get('model', '')
+        sections = {}
+        prompt = cli_prompt(args.project, folder, actor, args.client, offer, policy, started, role, sections)
+        if directory != folder:
+            prompt += f'\nEdit only the current worktree at {directory}. Keep using the original board and its relative file reservations.'
+        if args.client=='codex' and policy.get('agent_approval_mode')=='Full access':
+            prompt += '\nThis launch uses human-authorized Full access. Actual organization and OS restrictions still apply.'
+        self.output = self.log.open('x', encoding='utf-8')
+        options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {'start_new_session': True}
+        launch = interactive_command(
+            command(args.client, directory, prompt, self.model, policy_folder=folder, coordination_channel='cli'),
+            args.client, args.project, actor, directory, self.model, policy)
+        env = os.environ | {'SCRUM_BRIDGE_WORKER': '1', 'SCRUM_CLI_CONTEXT': str(context),
+                            'SCRUM_RUN_COST_STATE': str(cost_path)}
+        with tempfile.TemporaryFile(mode='w+b') as source:
+            source.write(prompt.encode('utf-8'))
+            source.seek(0)
+            self.child = subprocess.Popen(launch, cwd=directory, stdin=source, stdout=self.output,
+                                          stderr=subprocess.STDOUT, env=env, **options)
+        self.cost = run_cost.Watch(self.log, 0, cost_path, self.id, [task_id], policy, args.client)
+        overhead.record_startup(args.project, actor, self.id, args.client, self.model, started.get('measurement_session'),
+                                [task_id], len(prompt.encode('utf-8')), sections)
+
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -760,7 +935,7 @@ def main():
     rpc=ScrumClient(channel='supervisor')
     child=None;output=None;actor=None;log_path=None;log_offset=0;selected_model='';seen_model='';offered_task=None;launch_selection={};reroutes=0;batch_run=False;run_id='';run_tasks=[]
     usage_pool=ThreadPoolExecutor(max_workers=1)
-    usage_future=None
+    usage_future=None;parallel=None
     try:
         project=next((p for p in rpc.call('projects',{}) if p['id']==args.project),None)
         if not project or not project.get('uuid') or not project.get('available'):
@@ -775,6 +950,7 @@ def main():
         if any(a['actor']==candidate and a.get('bridge_connected') for a in status['agents']):
             raise RuntimeError('This worker already has a connected bridge; choose a distinct --worker')
         actor=candidate
+        parallel=ParallelRuns(rpc,args,actor,folder,role)
         generation=status['control']['generation']
         attempted=generation # Ordinary bridge startup never consumes old Wakeup.
         pending_start=args.start_now
@@ -798,7 +974,8 @@ def main():
             signal_stamp=idle_signals.stamp(folder)
             signal_changed=signal_stamp!=control_stamp
             control_stamp=signal_stamp
-            running=child is not None and child.poll() is None
+            running=(child is not None and child.poll() is None) or any(
+                run.child.poll() is None for run in parallel.runs.values())
             if checkout_watch is not None and child is None:
                 checkout_now=idle_signals.checkout_stamp(folder,checkout_watch)
                 if checkout_now!=checkout_seen:
@@ -807,7 +984,8 @@ def main():
             usage_ready=usage_future is not None and usage_future.done()
             capacity_due=capacity_pending is not None and at>=capacity_pending[0]
             pending_ready=(pending_start or pending_auto or capacity_due) and usage_future is None
-            if not idle_signals.checkpoint_due(at,last_checkpoint,running,previous_running,signal_changed) and not (child is not None and not running) and not pending_ready and not usage_ready:
+            parallel_exit=any(run.child.poll() is not None for run in parallel.runs.values())
+            if not idle_signals.checkpoint_due(at,last_checkpoint,running,previous_running,signal_changed) and not (child is not None and not running) and not parallel_exit and not pending_ready and not usage_ready:
                 time.sleep(2)
                 continue
             last_checkpoint=at;previous_running=running
@@ -829,7 +1007,7 @@ def main():
             requested=pending_start or request_key[0]>attempted or request_key[1]>profile_generation
             refresh_request=(requested and request_key!=usage_request and not running
                              and not report['control']['paused'] and report.get('profile_enabled',True))
-            wants_usage=running or pending_start or pending_usage_resume or pending_auto or capacity_due or waiting_for_parallel_capacity or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
+            wants_usage=running or pending_start or pending_usage_resume or pending_auto or capacity_due or waiting_for_parallel_capacity or parallel.waiting or signal_changed or policy.get('auto_resume_session_quota',False) or not observed
             if usage_future is None and (refresh_request or wants_usage and at-last_usage>=policy.get('usage_check_seconds',60)):
                 # A slow provider request must never block the local Stop loop.
                 # Generation is authoritative: a missed/coalesced notification
@@ -839,6 +1017,42 @@ def main():
                     observed={}
                 last_usage=at
                 if refresh_request:usage_request=request_key
+            parallel_policy=policy.get('coordination_channel','cli')=='cli' and policy.get('max_active_per_agent',1)>1
+            if not child and (parallel_policy or parallel.runs or parallel.enabled):
+                parallel.enabled=True
+                current, profile_current=request_key
+                new_request=current>attempted or profile_current>profile_generation
+                if new_request:
+                    parallel.failed.clear()
+                    parallel.wait_reason=''
+                pending_usage_resume,usage_restart=usage_retry_intent(report,requested,pending_usage_resume,policy,usage_ready)
+                if report['should_stop']:
+                    parallel.stop(report['reason'])
+                    if requested and report['reason']!=parallel.wait_reason:
+                        parallel.chat('Wakeup held: '+report['reason'])
+                        parallel.wait_reason=report['reason']
+                    if not waiting_for_fresh_usage(report,usage_future is not None):
+                        pending_start=False
+                        attempted,profile_generation=request_key
+                    if report['control']['paused'] or report['reason'].startswith(('5h usage ','weekly usage ')):
+                        finish_measurement(folder,report['reason'],rpc,args.project,args.client)
+                    if not report.get('profile_enabled',True):break
+                else:
+                    had_runs=bool(parallel.runs)
+                    parallel.reap()
+                    pending_start=pending_start or new_request or usage_restart or report.get('auto_resume',{}).get('requested',False)
+                    if parallel_policy and usage_future is None and (pending_start or had_runs or parallel.waiting):
+                        attempted,profile_generation=request_key
+                        pending_start=False
+                        while len(parallel.runs)<policy['max_active_per_agent']:
+                            if not parallel.launch(policy):break
+                        if not parallel.runs and parallel.wait_reason.startswith('No eligible'):
+                            finish_measurement(folder,'No eligible work remains',rpc,args.project,args.client)
+                    elif not parallel_policy and not parallel.runs:
+                        parallel.enabled=False
+                        continue
+                time.sleep(2)
+                continue
             actual=reported_model(log_path,log_offset) if log_path and selected_model else ''
             if actual and actual!=seen_model:
                 seen_model=actual
@@ -1068,11 +1282,15 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        scoped=parallel and parallel.enabled
+        if scoped:
+            try:parallel.stop('Supervisor disconnected')
+            except RuntimeError:pass
         if child and child.poll() is None:
             stop_child(child)
         if 'cost_watch' in locals() and cost_watch:cost_watch.tick(active=False)
         if output:output.close()
-        if actor:
+        if actor and not scoped:
             release_launch(rpc,args.project,actor)
             try:
                 usage_checkpoint(rpc,{'project':args.project,'actor':actor,'client':args.client,'action':'offline','summary':'Bridge disconnected. Resume from task history; validate partial edits.',**({'cli_usage_report':measured_report(folder,log_path,log_offset,args.client,run_id,selected_model,run_tasks)} if run_id and log_path else {})})

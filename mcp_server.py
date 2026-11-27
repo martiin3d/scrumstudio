@@ -86,12 +86,15 @@ TOOLS = [
 for _name,_description,_schema in TOOLS:
     if _name=='project_settings':_schema['properties'].update(git_merge={'type':'string','enum':['Off','Group','Task','PR']},git_cleanup=B,git_pause_blocked=B)
     if _name=='worker_launch':_schema['properties']['id']=I
+    if _name in ('task_claim','worker_launch'):
+        _schema['properties']['running_ids']={'type':'array','items':I,'maxItems':20}
+        _schema['properties']['parallel']=B
     if _name in ('task_create','task_update'):_schema['properties'].update(VERIFICATION,context_group={'type':'string','maxLength':80},required_skills=REQUIRED_SKILLS)
     if _name in ('task_create','task_update'):_schema['properties'].update(model=S,model_tier={'type':'string','enum':['auto','economy','standard','advanced'],'description':'Auto defaults to standard independently of size; economy for mechanical low-risk work, advanced for difficult reasoning. Choose with a reason during existing planning.'},model_reason=S)
     if _name in ('task_create','task_plan'):_schema['properties']['allow_duplicate']=B
     if _name=='task_create':_schema['properties']['status']={'type':'string','enum':['TODO','Backlog']}
-    if _name=='worker_launch':_schema['properties']['client']={'type':'string','enum':['codex','claude']}
-    if _name=='work_finish':_schema['properties'].update(use_batch=B,claim_next=B)
+    if _name=='worker_launch':_schema['properties'].update(client={'type':'string','enum':['codex','claude']},exclude_ids={'type':'array','items':I,'maxItems':100})
+    if _name=='work_finish':_schema['properties'].update(use_batch=B,claim_next=B,task_only=B)
     if _name=='project_settings':_schema['properties'].update(execution_instructions={'type':'string','maxLength':4000},autonomy_mode={'type':'string','enum':['Standard','Autonomous']},coordination_channel={'type':'string','enum':['mcp','cli']},agent_followup_tasks=B,max_parallel_agents=I,codex_enabled=B,claude_enabled=B,agent_approval_mode={'type':'string','enum':['Auto review','Ask in chat','Full access']})
     if _name=='note_add':_schema['properties'].update(task=I,audience={'type':'string','enum':['human','agent']})
     if _name=='task_get':_schema['properties'].update(full=B,files_after=I,files_limit=I,inputs_after=I,inputs_limit=I,include_notes=B,notes_content=B,notes_after=I,notes_limit=I,notes_audience={'type':'string','enum':['agent','human','all']})
@@ -101,7 +104,7 @@ for _name,_description,_schema in TOOLS:
     if _name=='coordination_metrics':_schema['properties'].update(include_cli_usage=B,include_periods=B,include_audit=B,include_logs=B)
     if _name in ('project_metrics','coordination_metrics'):_schema['properties'].update(filter_period=S,start_at=N,end_at=N)
     if _name=='agent_checkpoint':
-        _schema['properties'].update(run_exit_code=I,run_error=S)
+        _schema['properties'].update(run_exit_code=I,run_error=S,id=I,token=S)
         _counts={key:{'type':['integer','null'],'minimum':0,'maximum':10**15} for key in ('input_tokens','output_tokens','cached_input_tokens','cache_write_input_tokens','reasoning_output_tokens')}
         _usage=dict(run_id=S,model=S,tasks={'type':'array','items':I,'maxItems':MAX_CONTEXT_BATCH_TASKS},source=S,**_counts)
         _schema['properties']['cli_usage_report']=schema(_usage,list(_usage))

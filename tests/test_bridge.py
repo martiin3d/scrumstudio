@@ -20,6 +20,199 @@ class BridgeTestCase(unittest.TestCase):
         self.enterContext(patch.object(agent_bridge, 'windows_sandbox_failure', return_value=None))
 
 
+class ParallelBridgeTest(BridgeTestCase):
+    def setUp(self):
+        from test_storage import StorageTest
+        self.storage = StorageTest()
+        self.storage.setUp()
+        self.addCleanup(self.storage.tearDown)
+        super().setUp()
+        from coordination_api import execute
+        from types import SimpleNamespace
+        self.execute = execute
+        self.project, self.folder = self.storage.project()
+        self.actor = self.storage.agent
+        self.base = {'project': self.project, 'actor': self.actor, 'client': 'codex'}
+        self.rpc = SimpleNamespace(call=execute)
+        args = SimpleNamespace(project=self.project, client='codex', worker='test', profile=None)
+        self.runs = agent_bridge.ParallelRuns(self.rpc, args, self.actor, self.folder, '')
+        self.messages = []
+        self.runs.chat = self.messages.append
+        self.policy = execute('project_settings', {
+            'project': self.project, 'actor': self.storage.human, 'max_active_per_agent': 2})
+        self.processes = []
+        self.contexts = []
+        self.workdirs = []
+        popen = agent_bridge.subprocess.Popen
+        def process(*args, **kwargs):
+            if args[0] != ['worker']:
+                return popen(*args, **kwargs)
+            child = Mock()
+            child.poll.return_value = None
+            self.processes.append(child)
+            self.contexts.append(Path(kwargs['env']['SCRUM_CLI_CONTEXT']))
+            self.workdirs.append(Path(kwargs['cwd']))
+            return child
+        self.enterContext(patch.object(agent_bridge.subprocess, 'Popen', side_effect=process))
+        self.enterContext(patch.object(agent_bridge, 'command', return_value=['worker']))
+        self.enterContext(patch.object(agent_bridge, 'stop_child'))
+        self.enterContext(patch.object(agent_bridge, 'interrupt_child'))
+        self.enterContext(patch.object(agent_bridge, 'measured_report', return_value={
+            'run_id':'test', 'model':'', 'tasks':[], 'source':'test', 'input_tokens':None,
+            'output_tokens':None, 'cached_input_tokens':None, 'cache_write_input_tokens':None,
+            'reasoning_output_tokens':None}))
+        self.addCleanup(self.runs.stop, 'Test cleanup')
+
+    def task(self, name, file, **fields):
+        return self.execute('task_create', {
+            'project': self.project, 'title': name, 'description': 'Verify parallel execution',
+            'files': [file], 'acceptance_criteria': ['Acceptance passes'], **fields})['id']
+
+    def observe(self, **fields):
+        return self.execute('agent_checkpoint', self.base | {
+            'action':'observe', 'running':bool(self.runs.runs), **fields})
+
+    def status(self, task):
+        return self.execute('task_get', {'project': self.project, 'id': task})['status']
+
+    def test_finish_failure_pause_and_quota_are_scoped(self):
+        from scrum_cli import coordinated
+        self.policy = self.execute('project_settings', {
+            'project': self.project, 'actor': self.storage.human, 'max_parallel_agents':1})
+        first = self.task('First', 'a.py')
+        second = self.task('Second', 'b.py')
+        third = self.task('Third', 'c.py')
+        fourth = self.task('Fourth', 'd.py')
+        self.assertTrue(self.runs.launch(self.policy), self.messages)
+        self.assertTrue(self.runs.launch(self.policy), self.messages)
+        self.assertFalse(self.runs.launch(self.policy))
+        self.observe()
+        board = self.execute('snapshot', {'project': self.project})
+        self.assertEqual(board['runtime']['active_tasks'], 2)
+        self.assertEqual({t['id'] for t in board['tasks'] if t['status']=='In Progress'}, {first, second})
+        self.assertNotEqual(*self.contexts)
+        result = coordinated('work_finish', {'id': first, 'evidence': 'Checks passed'}, self.contexts[0])
+        self.assertEqual(result['completed']['status'], 'Done')
+        self.processes[0].poll.return_value = 0
+        self.runs.reap()
+        self.assertEqual(self.status(second), 'In Progress')
+        self.assertTrue(self.runs.launch(self.policy))
+        self.processes[1].poll.return_value = 1
+        self.runs.reap()
+        self.assertEqual(self.status(second), 'TODO')
+        self.assertEqual(self.status(third), 'In Progress')
+        self.assertTrue(self.runs.launch(self.policy))
+        result = coordinated('agent_checkpoint', {'action':'pause','reason':'Pause this task'}, self.contexts[2])
+        self.assertEqual(result['tasks_released'], 1)
+        self.processes[2].poll.return_value = 0
+        self.runs.reap()
+        self.assertEqual(self.status(fourth), 'In Progress')
+        self.assertFalse(self.runs.launch(self.policy))
+        fifth = self.task('Fifth', 'e.py')
+        self.assertTrue(self.runs.launch(self.policy))
+        report = self.observe(session_used_percent=93, weekly_used_percent=20)
+        self.assertTrue(report['should_stop'])
+        self.runs.stop(report['reason'])
+        self.assertEqual(self.status(fourth), 'TODO')
+        self.assertEqual(self.status(fifth), 'TODO')
+        self.assertFalse(self.runs.launch(self.policy))
+
+    def test_reservations_and_exclusive_checkout_hold_incompatible_tasks(self):
+        first = self.task('First', 'shared.py')
+        overlap = self.task('Overlap', 'shared.py')
+        self.assertTrue(self.runs.launch(self.policy))
+        self.assertFalse(self.runs.launch(self.policy))
+        self.assertIn('waiting for file reservations', self.runs.wait_reason)
+        independent = self.task('Independent', 'other.py')
+        self.assertTrue(self.runs.launch(self.policy))
+        self.assertEqual(set(self.runs.runs), {first, independent})
+        self.assertEqual(self.status(overlap), 'TODO')
+        self.execute('project_control', {'project': self.project, 'actor': self.storage.human, 'action':'stop'})
+        report = self.observe()
+        self.assertTrue(report['should_stop'])
+        self.runs.stop(report['reason'])
+        self.assertFalse(self.runs.launch(self.policy))
+        self.assertEqual(self.status(first), 'TODO')
+        self.assertEqual(self.status(independent), 'TODO')
+        self.execute('project_control', {
+            'project': self.project, 'actor': self.storage.human, 'action':'wakeup', 'start_agents':False})
+        self.policy = self.execute('project_settings', {
+            'project': self.project, 'actor': self.storage.human, 'max_parallel_agents':1, 'file_lock_policy':'Auto'})
+        self.runs.failed.clear()
+        self.assertTrue(self.runs.launch(self.policy))
+        self.assertFalse(self.runs.launch(self.policy))
+        self.assertIn('checkout isolation', self.runs.wait_reason)
+
+    def test_worktrees_keep_context_groups_and_dependencies_serial(self):
+        from test_worktrees import WorktreeTest
+        from scrum_cli import coordinated
+        WorktreeTest().repo(self.folder)
+        self.policy = self.execute('project_settings', {
+            'project': self.project, 'actor': self.storage.human,
+            'git_mode':'Worktrees', 'git_base_branch':'main', 'git_push':'Never'})
+        first = self.task('First', 'a.py', context_group='shared')
+        same = self.task('Same group', 'second.py', context_group='shared')
+        dependent = self.task('Dependent', 'third.py', dependencies=[first])
+        independent = self.task('Independent', 'b.py')
+        self.assertTrue(self.runs.launch(self.policy), self.messages)
+        self.assertTrue(self.runs.launch(self.policy), self.messages)
+        self.assertEqual(set(self.runs.runs), {first, independent})
+        self.assertEqual(self.status(same), 'TODO')
+        self.assertEqual(self.status(dependent), 'TODO')
+        self.assertEqual(len(set(self.workdirs)), 2)
+        self.assertNotIn(self.folder, self.workdirs)
+        self.assertTrue(all((path/'.git').is_file() for path in self.workdirs))
+        result = coordinated('work_finish', {'id': first, 'evidence': 'Checks passed'}, self.contexts[0])
+        self.assertEqual(result['completed']['status'], 'Done')
+        self.processes[0].poll.return_value = 0
+        self.runs.reap()
+        self.assertTrue(self.runs.launch(self.policy), self.messages)
+        self.assertEqual(len(self.runs.runs), 2)
+
+    def test_main_fills_two_slots_from_one_wakeup_and_stops_both(self):
+        from types import SimpleNamespace
+        first = self.task('First', 'a.py')
+        second = self.task('Second', 'b.py')
+        stop_sent = False
+        sleeps = 0
+        def sleep(_seconds):
+            nonlocal stop_sent, sleeps
+            sleeps += 1
+            if sleeps > 100:
+                raise AssertionError('Supervisor did not fill and stop both task slots')
+            if stop_sent:
+                raise KeyboardInterrupt
+            if len(self.processes)==2:
+                self.assertEqual(self.status(first), 'In Progress')
+                self.assertEqual(self.status(second), 'In Progress')
+                self.execute('project_control', {
+                    'project': self.project, 'actor': self.storage.human, 'action':'stop'})
+                stop_sent = True
+            else:
+                telemetry_yield(.001)
+        telemetry_yield = time.sleep
+        profile = {'client':'codex', 'local_actor':True, 'actor':self.actor, 'instructions':'', 'generation':0}
+        def call(name,args):
+            if name=='agent_manage':
+                return profile
+            if name=='agent_checkpoint' and 'profile_id' in args:
+                args={k:v for k,v in args.items() if k!='profile_id'}
+            return self.execute(name,args)
+        rpc = SimpleNamespace(call=call,close=Mock())
+        argv = ['agent_bridge.py','--project',str(self.project),'--client','codex',
+                '--allow-run','--start-now','--profile','fixture']
+        with (
+            patch.object(agent_bridge,'ScrumClient',return_value=rpc),
+            patch.object(agent_bridge,'codex_usage',return_value={'session_used_percent':1,'weekly_used_percent':2}),
+            patch.object(agent_bridge.time,'sleep',side_effect=sleep),
+            patch.object(sys,'argv',argv),
+        ):
+            agent_bridge.main()
+        self.assertTrue(stop_sent)
+        self.assertEqual(self.status(first), 'TODO')
+        self.assertEqual(self.status(second), 'TODO')
+
+
 class BridgeTest(BridgeTestCase):
     sandbox_probe = staticmethod(agent_bridge.windows_sandbox_failure)
 

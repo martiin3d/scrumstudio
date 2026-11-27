@@ -108,6 +108,8 @@ def operation(action, a, call):
         if completed.get('integration_pending'):
             result['next']={'integration_pending':True,'ownership_granted':False,'instruction':'Verified source is not fully closed. Do not claim a successor or repeat implementation; native closure/recovery owns the remaining Git step.'}
             return result if a.get('verbose',False) else decision_payload(result)
+        if a.get('task_only'):
+            return result if a.get('verbose', False) else decision_payload(result)
         try:
             if a.get('close_session'):
                 if items:
