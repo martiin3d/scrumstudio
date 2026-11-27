@@ -29,7 +29,7 @@ def refresh(args,call):
         # Agent views need no task descriptions, evidence or note bodies.
         data={'runtime':call('agent_status',{'project':project}),'managedAgents':call('agent_manage',{'project':project,'action':'list'}),'users':call('users',{})}
     else:
-        data=call('snapshot',{'project':project})
+        data=call('snapshot',{'project':project,**({'include_board_dates':True} if page=='Board' else {})})
         if page=='Board':
             import context_batches
             data['taskGroups']=context_batches.browser_groups(project,[t['id'] for t in data['tasks']])
