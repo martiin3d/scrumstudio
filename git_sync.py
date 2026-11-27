@@ -781,13 +781,33 @@ def flush(call,jobs,result,external_project=None):
                 if result.get('id')==item['task']['id']:result.update(finalized)
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
         closure_error=outcome.get('checkout',{}).get('reason') if strict and outcome.get('checkout',{}).get('closed') is False else ''
-        if not outcome.get('publication') and ((outcome.get('merge',{}).get('error') and not outcome['merge'].get('reverification_required')) or closure_error):
+        merge=outcome.get('merge',{})
+        pr_delivery=item['settings'].get('git_merge')=='PR'
+        pr_error=(outcome.get('error') or outcome.get('commit',{}).get('error')
+                  or outcome.get('push',{}).get('error')) if pr_delivery else None
+        failure=closure_error
+        if not failure and (merge.get('error') or pr_error) and not merge.get('reverification_required'):
+            failure=(outcome.get('commit',{}).get('error') or outcome.get('push',{}).get('error')
+                     or merge.get('error') or pr_error)
+        if failure and not outcome.get('publication'):
             try:
-                recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description=('Git checkout closure remains pending after verified integration. Preserve actual remaining source/staging; do not repeat implementation or adopt unknown edits. ' if closure_error else '')+'Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+(closure_error or outcome['merge']['error']),acceptance_criteria=[('Canonical checkout is clean on its recorded parent without losing source/staging; existing integration/publication is preserved.' if closure_error else 'Target contains the source outcome, conflicts are resolved and verification is recorded.'),'Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
-                outcome['recovery_task']=recovery
-                import idle_signals
-                idle_signals.notify('git_recovery',{'project':project})
-            except Exception as error:outcome['recovery_error']=str(error)[:300]
+                import git_completion
+                receipt=git_completion.read_receipt(item['root'],item['task']['id']) if strict else None
+                target=destination or (receipt or {}).get('target') or '[origin not recorded]'
+                details=dict(source=outcome['branch'],target=target,error=failure,
+                             sha=outcome.get('verified_source_sha'),closure=bool(closure_error),
+                             remote=item['settings'].get('git_remote','origin'),pr=pr_delivery)
+                if receipt:
+                    receipt['recovery']=details
+                    git_completion.write_receipt(git_completion.location(item['root'],item['task']['id']),receipt)
+                recovery=call('git_delivery_recovery',dict(project=project,actor=item['actor'],
+                              id=item['task']['id'],failure=details,capability=FINALIZE_TOKEN))
+                if recovery:
+                    outcome['recovery_task']=recovery
+                    import idle_signals
+                    idle_signals.notify('git_recovery',{'project':project})
+            except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:
+                outcome['recovery_error']=str(error)[:300]
         try:call('git_note',dict(project=project,id=item['task']['id'],actor=item['actor'],text=describe(outcome)))
         except Exception:pass
         if 'push' in outcome and ('pushed' in outcome['push'] and (outcome['push'].get('pushed') or 'error' in outcome['push'])):
