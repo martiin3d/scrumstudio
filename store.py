@@ -418,6 +418,74 @@ def reconcile_checkout_blocks(db, project_row, actor):
         activity(db,row['id'],actor,'comment','Checkout obstruction no longer present: Git reports a clean working tree on '+current[0]+'. Reopened for verification using saved continuity; acceptance and publication have not been assumed.')
 
 
+def create_task(db,project,prefix,a):
+    initial=a.get('status','TODO')
+    if initial not in ('TODO','Backlog'):raise ValueError('New tasks start in TODO or Backlog')
+    if initial=='Backlog' and actor_user(db,a)['kind']!='human':raise ValueError('Only a human can place tasks in Backlog')
+    title = required(a.get('title'), 'title', 240)
+    scope = required(a.get('description'),'description',12000)
+    criteria = acceptance_criteria(a.get('acceptance_criteria'))
+    skills = validate_required_skills(a.get('required_skills',[]))
+    coord.validate_scope(a.get('scope_size','Unknown'),a.get('scope_reason',''))
+    same,differs=duplicate_task(db,project,title,a)
+    if same:
+        return {'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':differs} if differs else {}),'note':existing_note(differs)}
+    number = db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE project=?', (project,)).fetchone()[0]
+    cur = db.execute('INSERT INTO tasks(project,title,description,priority,updated,checklist,number,category,acceptance_criteria) VALUES(?,?,?,?,?,?,?,?,?)', (project, title, scope, priority(a.get('priority', 2)), now(), json.dumps(checklist(a.get('checklist', []))), number, required(a.get('category','General'), 'category', 80),json.dumps(criteria)))
+    import task_cost
+    cost=task_cost.update(task_cost.empty(),a,actor_user(db,a)['identity'] if any(k in a for k in ('estimated_tokens','estimated_quota_percent','usage_report')) else '')
+    db.execute('UPDATE tasks SET cost_data=? WHERE id=?',(json.dumps(cost),cur.lastrowid))
+    deps = dependencies(db, project, cur.lastrowid, a.get('dependencies', []))
+    db.execute('UPDATE tasks SET scope_size=?,scope_reason=? WHERE id=?',(a.get('scope_size','Unknown'),a.get('scope_reason',''),cur.lastrowid))
+    db.execute('UPDATE tasks SET dependencies=? WHERE id=?', (json.dumps(deps), cur.lastrowid))
+    db.execute('UPDATE tasks SET files=? WHERE id=?',(json.dumps(coord.file_plan(a.get('files',[]))),cur.lastrowid))
+    if skills:
+        db.execute('UPDATE tasks SET required_skills=? WHERE id=?',(json.dumps(skills),cur.lastrowid))
+    import model_routing
+    model_routing.validate(a.get('model',''),a.get('model_tier','auto'),a.get('model_reason',''))
+    if a.get('model') and actor_user(db,a)['kind']!='human':raise ValueError('Only a human can set a fixed task model')
+    db.execute('UPDATE tasks SET model=?,model_tier=?,model_reason=? WHERE id=?',(a.get('model',''),a.get('model_tier','auto'),a.get('model_reason',''),cur.lastrowid))
+    validate_verification(a.get('verification_level','auto'),a.get('verification_reason',''))
+    db.execute('UPDATE tasks SET verification_level=?,verification_reason=? WHERE id=?',(a.get('verification_level','auto'),a.get('verification_reason',''),cur.lastrowid))
+    db.execute('UPDATE tasks SET context_group=? WHERE id=?',(validate_context_group(a.get('context_group','')),cur.lastrowid))
+    db.execute('UPDATE tasks SET status=? WHERE id=?',(initial,cur.lastrowid))
+    telemetry.transition(db,cur.lastrowid,initial,a.get('actor'),source='created')
+    activity(db, cur.lastrowid, a.get('actor'), 'created', 'Task created in '+initial+'.')
+    if a.get('log'):
+        activity(db, cur.lastrowid, actor_user(db,a)['id'], 'work', required(a['log'], 'log', 2000))
+    return {'id': cur.lastrowid, 'code': f'{prefix}-{number}', 'status': initial}
+
+
+def register_delivery_recovery(db,project,prefix,actor,original,failure):
+    import git_completion
+    row=db.execute('SELECT status,blocked_reason FROM tasks WHERE project=? AND id=?',(project,original)).fetchone()
+    if not row or row['status'] not in ('Done','In Review'):
+        return
+    title=git_completion.RECOVERY_TITLE+failure['source']+' into '+failure['target']
+    existing=db.execute(
+        "SELECT id,number,status FROM tasks WHERE project=? AND category='Git recovery' "
+        "AND title=? AND status NOT IN ('Done','Cancelled') ORDER BY id LIMIT 1",
+        (project,title)).fetchone()
+    if not existing and row['blocked_reason'].startswith(f'Git delivery ({prefix}-'):
+        number=row['blocked_reason'].split(f'Git delivery ({prefix}-',1)[1].split(')',1)[0]
+        existing=db.execute("SELECT id,number,status FROM tasks WHERE project=? AND number=? "
+                            "AND category='Git recovery' AND title=? AND status='Done'",
+                            (project,number,title)).fetchone()
+        if existing:
+            # A recovery may have completed just before a process restart.
+            return {'id':existing['id'],'code':f"{prefix}-{existing['number']}",'status':'Done','existing':True}
+    if existing:
+        recovery={'id':existing['id'],'code':f"{prefix}-{existing['number']}",'status':existing['status'],'existing':True}
+    else:
+        recovery=create_task(db,project,prefix,git_completion.recovery_spec(actor,title,failure))
+    reason=f"Git delivery ({recovery['code']}): {failure['error']}"
+    if row['blocked_reason']!=reason:
+        if row['status']=='In Review':
+            db.execute("UPDATE tasks SET blocked_reason=?,blocked_reason_kind='external',updated=? WHERE id=?",(reason,now(),original))
+        activity(db,original,actor,'comment',reason)
+    return recovery
+
+
 def run(action, a):
     import git_sync
     with git_sync.transaction_jobs() as jobs:
@@ -452,8 +520,8 @@ def run(action, a):
     if action=='task_update' and isinstance(result,dict) and result.get('status')=='Done':
         task=_run('task_get',{'project':a['project'],'id':result['id']})
         if task.get('category')=='Git recovery' and task.get('title','').startswith('Resolve Git integration: '):
-            source=task['title'][len('Resolve Git integration: '):].split(' into ',1)[0]
-            try:result['integration_reconciled']=_run('git_reconcile',{'project':a['project'],'actor':a.get('actor'),'capability':git_sync.FINALIZE_TOKEN,'source':source})
+            source,_,target=task['title'][len('Resolve Git integration: '):].partition(' into ')
+            try:result['integration_reconciled']=_run('git_reconcile',{'project':a['project'],'actor':a.get('actor'),'capability':git_sync.FINALIZE_TOKEN,'source':source,'target':target})
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:result['integration_reconciliation_error']=str(error)[:300]
     if action=='agent_checkpoint' and a.get('action')=='offline' and 'run_exit_code' in a and isinstance(result,dict):
         policy=_run('project_settings',{'project':a['project']})
@@ -666,7 +734,7 @@ def legacy_run(action, a, path=None, locks=None):
             import git_completion
             if a.get('capability') is not git_sync.FINALIZE_TOKEN:raise ValueError('Native Git publication only')
             if runtime.reason(db,project,a['actor']):return None
-            return git_completion.retry_publication(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
+            return git_completion.retry_publication(db,project_row,prefix,activity,now,resolve_dependents,a['actor'],register_delivery_recovery)
         if action=='task_pull_request':
             if type(a.get('number')) is not int or not 1<=a['number']<=2147483647:
                 raise ValueError('Supply a valid GitHub PR number')
@@ -911,42 +979,13 @@ def legacy_run(action, a, path=None, locks=None):
             import planning
             return planning.apply(db,a,project)
         if action == 'task_create':
-            initial=a.get('status','TODO')
-            if initial not in ('TODO','Backlog'):raise ValueError('New tasks start in TODO or Backlog')
-            if initial=='Backlog' and actor_user(db,a)['kind']!='human':raise ValueError('Only a human can place tasks in Backlog')
-            title = required(a.get('title'), 'title', 240)
-            scope = required(a.get('description'),'description',12000)
-            criteria = acceptance_criteria(a.get('acceptance_criteria'))
-            skills = validate_required_skills(a.get('required_skills',[]))
-            coord.validate_scope(a.get('scope_size','Unknown'),a.get('scope_reason',''))
             db.execute('BEGIN IMMEDIATE')
-            same,differs=duplicate_task(db,project,title,a)
-            if same:
-                return {'id':same['id'],'code':f"{prefix}-{same['number']}",'status':same['status'],'existing':True,**({'differs':differs} if differs else {}),'note':existing_note(differs)}
-            number = db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE project=?', (project,)).fetchone()[0]
-            cur = db.execute('INSERT INTO tasks(project,title,description,priority,updated,checklist,number,category,acceptance_criteria) VALUES(?,?,?,?,?,?,?,?,?)', (project, title, scope, priority(a.get('priority', 2)), now(), json.dumps(checklist(a.get('checklist', []))), number, required(a.get('category','General'), 'category', 80),json.dumps(criteria)))
-            import task_cost
-            cost=task_cost.update(task_cost.empty(),a,actor_user(db,a)['identity'] if any(k in a for k in ('estimated_tokens','estimated_quota_percent','usage_report')) else '')
-            db.execute('UPDATE tasks SET cost_data=? WHERE id=?',(json.dumps(cost),cur.lastrowid))
-            deps = dependencies(db, project, cur.lastrowid, a.get('dependencies', []))
-            db.execute('UPDATE tasks SET scope_size=?,scope_reason=? WHERE id=?',(a.get('scope_size','Unknown'),a.get('scope_reason',''),cur.lastrowid))
-            db.execute('UPDATE tasks SET dependencies=? WHERE id=?', (json.dumps(deps), cur.lastrowid))
-            db.execute('UPDATE tasks SET files=? WHERE id=?',(json.dumps(coord.file_plan(a.get('files',[]))),cur.lastrowid))
-            if skills:
-                db.execute('UPDATE tasks SET required_skills=? WHERE id=?',(json.dumps(skills),cur.lastrowid))
-            import model_routing
-            model_routing.validate(a.get('model',''),a.get('model_tier','auto'),a.get('model_reason',''))
-            if a.get('model') and actor_user(db,a)['kind']!='human':raise ValueError('Only a human can set a fixed task model')
-            db.execute('UPDATE tasks SET model=?,model_tier=?,model_reason=? WHERE id=?',(a.get('model',''),a.get('model_tier','auto'),a.get('model_reason',''),cur.lastrowid))
-            validate_verification(a.get('verification_level','auto'),a.get('verification_reason',''))
-            db.execute('UPDATE tasks SET verification_level=?,verification_reason=? WHERE id=?',(a.get('verification_level','auto'),a.get('verification_reason',''),cur.lastrowid))
-            db.execute('UPDATE tasks SET context_group=? WHERE id=?',(validate_context_group(a.get('context_group','')),cur.lastrowid))
-            db.execute('UPDATE tasks SET status=? WHERE id=?',(initial,cur.lastrowid))
-            telemetry.transition(db,cur.lastrowid,initial,a.get('actor'),source='created')
-            activity(db, cur.lastrowid, a.get('actor'), 'created', 'Task created in '+initial+'.')
-            if a.get('log'):
-                activity(db, cur.lastrowid, actor_user(db,a)['id'], 'work', required(a['log'], 'log', 2000))
-            return {'id': cur.lastrowid, 'code': f'{prefix}-{number}', 'status': initial}
+            return create_task(db,project,prefix,a)
+        if action == 'git_delivery_recovery':
+            import git_sync
+            if a.get('capability') is not git_sync.FINALIZE_TOKEN:raise ValueError('Native Git recovery only')
+            db.execute('BEGIN IMMEDIATE')
+            return register_delivery_recovery(db,project,prefix,a['actor'],a['id'],a['failure'])
         if action in ('task_update','task_review'):
             db.execute('BEGIN IMMEDIATE')
             old = db.execute('SELECT * FROM tasks WHERE id=? AND project=?', (int(a['id']), project)).fetchone()
@@ -1313,8 +1352,8 @@ def legacy_run(action, a, path=None, locks=None):
                 stop=stop or 'Project parallel-agent limit reached.'
             if action=='worker_launch':
                 import git_completion
-                git_completion.retry_publication(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
                 git_completion.reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
+                git_completion.retry_publication(db,project_row,prefix,activity,now,resolve_dependents,a['actor'],register_delivery_recovery)
                 reconcile_checkout_blocks(db,project_row,a['actor'])
                 import file_plan_repair
                 file_plan_repair.at_launch(db,project_row,a['actor'],activity,now)

@@ -102,7 +102,43 @@ class CheckoutCloseTest(unittest.TestCase):
         self.assertEqual(current['publication']['state'],'exhausted')
         self.assertEqual(current['status'],'In Review')
         self.assertFalse(current['locked'])
-        self.assertEqual(len(run('task_search',dict(project=self.p))['items']),1)
+        items=run('task_search',dict(project=self.p))['items']
+        recovery,=[item for item in items if item['id']!=task['id']]
+        self.assertIn(recovery['code'],current['blocked_reason'])
+        self.assertIn('Could not resolve host',current['blocked_reason'])
+        self.assertEqual(current['evidence'],'Targeted behavior passed.')
+
+        # A later native boundary reloads the exhausted receipt from disk.
+        run('agent_checkpoint',dict(launch,action='observe',running=False))
+        self.assertEqual(len(run('task_search',dict(project=self.p))['items']),2)
+        dependent=run('task_create',dict(project=self.p,title='Consume delivery',
+                       description='Needs the verified product',acceptance_criteria=['Product available'],
+                       dependencies=[task['id']]))
+        source=claim['git']['branch']
+        source_tip=self.g('rev-parse',source)
+        recovery_claim=run('task_claim',dict(project=self.p,id=recovery['id'],actor=self.agent))
+        self.assertTrue(recovery_claim['claimed'])
+        with self.assertRaises(git_completion.RecoveryIncomplete):
+            self.finish(recovery,recovery_claim)
+        run('agent_checkpoint',dict(launch,action='pause',reason='Target publication requires a retry'))
+        saved=run('task_get',dict(project=self.p,id=recovery['id']))
+        self.assertFalse(saved['locked'])
+        recovery_claim=run('task_claim',dict(project=self.p,id=recovery['id'],actor=self.agent))
+        self.assertTrue(recovery_claim['claimed'])
+        self.g('push','origin',source)
+        self.g('switch','main')
+        self.g('merge','--ff-only',source)
+        self.g('push','origin','main')
+        with patch.object(git,'_commit',side_effect=AssertionError('must reuse verified content')):
+            self.finish(recovery,recovery_claim)
+        current=run('task_get',dict(project=self.p,id=task['id']))
+        self.assertEqual(current['status'],'Done')
+        self.assertEqual(current['blocked_reason'],'')
+        self.assertEqual(current['evidence'],'Targeted behavior passed.')
+        self.assertEqual(self.g('rev-parse','main'),source_tip)
+        self.assertEqual(run('task_get',dict(project=self.p,id=dependent['id']))['dependencies'],[task['id']])
+        dependent_claim=run('task_claim',dict(project=self.p,id=dependent['id'],actor=self.agent))
+        self.assertTrue(dependent_claim['claimed'])
 
     def test_pr_source_retry_waits_for_pr_policy(self):
         run('project_settings',dict(project=self.p,actor=self.human,git_merge='PR'))
@@ -118,6 +154,29 @@ class CheckoutCloseTest(unittest.TestCase):
         self.assertEqual(current['pull_request']['state'],'awaiting_pr')
         ref='refs/heads/'+claim['git']['branch']
         self.assertEqual(self.g('ls-remote','origin',ref).split()[0],current['pull_request']['head'])
+    def test_permanent_pr_source_failure_recovers_without_merging_protected_target(self):
+        run('project_settings',dict(project=self.p,actor=self.human,git_merge='PR'))
+        task,claim=self.start()
+        failure=subprocess.CompletedProcess([],1,'','Permission denied for source publication')
+        with patch.object(git,'publish_verified',return_value=(failure,1)):
+            result=self.finish(task,claim)
+        recovery=result['completed']['git']['recovery_task']
+        source=claim['git']['branch']
+        parent_tip=self.g('rev-parse','main')
+        request=dict(project=self.p,id=task['id'])
+        self.assertIn('Permission denied',run('task_get',request)['blocked_reason'])
+        recovery_claim=run('task_claim',dict(project=self.p,id=recovery['id'],actor=self.agent))
+        self.assertTrue(recovery_claim['claimed'])
+        with self.assertRaisesRegex(git_completion.RecoveryIncomplete,'PR source publication'):
+            self.finish(recovery,recovery_claim)
+        self.g('push','origin',source)
+        self.finish(recovery,recovery_claim)
+        original=run('task_get',request)
+        self.assertEqual(original['status'],'In Review')
+        self.assertEqual(original['pull_request']['state'],'awaiting_pr')
+        self.assertEqual(original['blocked_reason'],'')
+        self.assertEqual(self.g('rev-parse','main'),parent_tip)
+
     def test_generated_cache_and_output_are_retained_natively_without_recovery_task(self):
         task,claim=self.start();font=self.workspace/FONT_PATH
         generated=FONT.replace('    m_GlyphPairAdjustmentRecords: []','    m_GlyphPairAdjustmentRecords:\n    - cachedGlyph: 42')
