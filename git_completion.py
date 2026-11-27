@@ -34,6 +34,122 @@ def write_receipt(path,data):
     return data
 
 
+PUBLICATION_RETRIES = 3
+PUBLICATION_RETRY_DELAY = 60
+PUBLICATION_RETRY_OPTIONS = {'limit':1,'timeout':5}
+
+
+def defer_publication(root,task,settings,outcome):
+    for stage,key,count in (('source','push','source_publication_attempts'),
+                            ('target','merge','publication_attempts')):
+        result=outcome.get(key,{})
+        if not result.get('publication_transient'):
+            continue
+        receipt=read_receipt(root,task)
+        publication={'state':'pending','stage':stage,'error':result['error'],
+                     'attempts':outcome.get(count,result.get(count,1)), 'retries':0,
+                     'retry_limit':PUBLICATION_RETRIES,'retry_at':time.time()+PUBLICATION_RETRY_DELAY}
+        receipt['publication']=publication
+        receipt['publication_policy']=[settings['git_merge'],settings['git_remote'],settings['git_push']]
+        write_receipt(location(root,task),receipt)
+        outcome['publication']=publication
+        return
+
+
+def retry_publication(db,project_row,prefix,activity,now,resolve_dependents,actor):
+    """Retry at most one sealed delivery at an idle native boundary."""
+    import git_worktrees
+    import runtime
+    settings=dict(project_row)
+    project=settings['id']
+    if not git.integrated_completion(settings) or runtime.control(db,project)['paused']:
+        return
+    rows=db.execute("SELECT * FROM tasks WHERE project=? AND status='In Review' AND lock_until<=? ORDER BY id",
+                    (project,time.time())).fetchall()
+    for row in rows:
+        root=git_worktrees.workspace(settings['workspace_root'],git_worktrees.identity(row))
+        receipt=read_receipt(root,row['id'])
+        publication=(receipt or {}).get('publication',{})
+        if publication.get('state')!='pending' or publication['retry_at']>time.time():
+            continue
+        path=location(root,row['id'])
+        if receipt['basis']!=git.completion_basis(dict(row)):
+            continue
+        if not db.in_transaction:db.execute('BEGIN IMMEDIATE')
+        if runtime.control(db,project)['paused'] or runtime.reason(db,project,actor):
+            return
+        current=db.execute('SELECT * FROM tasks WHERE id=?',(row['id'],)).fetchone()
+        if current['status']!='In Review' or current['lock_until']>time.time() or git.completion_basis(dict(current))!=receipt['basis']:
+            continue
+        if settings['git_mode']=='Branches' and db.execute(
+                'SELECT 1 FROM tasks WHERE project=? AND lock_until>? UNION ALL '
+                'SELECT 1 FROM file_locks WHERE project=? AND lock_until>? LIMIT 1',
+                (project,time.time(),project,time.time())).fetchone():
+            return
+        with git.checkout_lock(root):
+            # The original finish may have completed while launch was waiting.
+            if read_receipt(root,row['id'])!=receipt:
+                continue
+            publication['retries']+=1
+            publication['retry_at']=time.time()+PUBLICATION_RETRY_DELAY
+            if publication['retries']>=PUBLICATION_RETRIES:
+                publication['state']='exhausted'
+            write_receipt(path,receipt)
+            outcome={}
+            try:
+                resume_publication(root,settings,receipt,outcome)
+            except (OSError,ValueError,subprocess.SubprocessError) as error:
+                publication.update(state='failed',error=str(error)[:300])
+            else:
+                result=outcome.get('merge') or outcome.get('push',{})
+                if result.get('error'):
+                    publication['error']=result['error']
+                    if not result.get('publication_transient'):
+                        publication['state']='failed'
+                else:
+                    publication.update(state='published',error='')
+                    if settings['git_merge']=='PR':
+                        receipt['pr']={'state':'awaiting_pr','head':receipt['sha'],'base':receipt['target']}
+            write_receipt(path,receipt)
+        activity(db,row['id'],actor,'comment',
+                 f"Git publication {publication['state']} after retry {publication['retries']}/{PUBLICATION_RETRIES}"
+                 + ('. '+publication['error'] if publication['error'] else '.'))
+        if publication['state']=='published' and settings['git_merge']=='Task':
+            finalize(db,dict(id=row['id'],actor=actor,root=root,expected=receipt['basis'],
+                             capability=git.FINALIZE_TOKEN,outcome=outcome),
+                     project_row,prefix,activity,now,resolve_dependents)
+        return dict(publication,task=row['id'])
+
+
+def resume_publication(root,settings,receipt,outcome):
+    publication=receipt['publication']
+    source,target,sha=receipt['source'],receipt['target'],receipt['sha']
+    if receipt['publication_policy']!=[settings['git_merge'],settings['git_remote'],settings['git_push']]:
+        raise ValueError('Project publication policy changed')
+    if not sha or git.parent_branch(root,source)!=target or not matches_commit(root,receipt['files'],sha):
+        raise ValueError('Verified source or its recorded destination changed')
+    tip=git._git(root,'rev-parse','--verify','refs/heads/'+source)
+    if tip.returncode or tip.stdout.strip()!=sha:
+        raise ValueError('Verified source branch changed')
+    if publication['stage']=='source':
+        remote=settings['git_remote']
+        result,attempts=git.publish_verified(root,remote,sha+':refs/heads/'+source,**PUBLICATION_RETRY_OPTIONS)
+        publication['attempts']+=attempts
+        if result.returncode:
+            outcome['push']={'error':result.stderr[-300:] or 'Source push failed',
+                             'publication_transient':git.transient_publication(result)}
+            return
+        for key,value in (('remote',remote),('merge','refs/heads/'+source)):
+            git._git(root,'config','--local','branch.'+source+'.'+key,value)
+    if settings['git_merge']=='Task':
+        retry_settings=dict(settings,_publication_retry_options=PUBLICATION_RETRY_OPTIONS)
+        merged=git.merge_completed(root,retry_settings,source,expected_source=sha,
+                                   expected_parent=target,verification=receipt)
+        publication['stage']='target'
+        publication['attempts']+=merged.get('publication_attempts',0)
+        outcome['merge']=merged
+
+
 def file_blobs(root,planned,include_ignored=False):
     result={};existing=[]
     for name in git.planned_paths(root,planned,include_ignored=include_ignored):
@@ -373,7 +489,9 @@ def reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,act
         path=location(root,row['id'])
         if path.exists():
             receipt=json.loads(path.read_text())
-            if receipt.get('checkout_pending') and receipt.get('basis')==git.completion_basis(dict(row)):
+            published=(receipt.get('publication',{}).get('state')=='published' and
+                       receipt.get('publication_policy')==['Task',project_row['git_remote'],project_row['git_push']])
+            if (receipt.get('checkout_pending') or published) and receipt.get('basis')==git.completion_basis(dict(row)):
                 sources.add(receipt['source'])
     completed=[]
     for source in sources:

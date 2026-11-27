@@ -415,23 +415,29 @@ def parent_branch(root,source):
     except (OSError,subprocess.SubprocessError):return ''
 
 
-def publish_verified(root,remote,refspec):
+def transient_publication(result):
+    return bool(result.returncode and re.search(
+        r'Could not resolve (?:host|proxy)|Failed to connect|Connection (?:reset|timed out|refused)|'
+        r'Push timed out|Operation timed out|(?:HTTP|returned error:) (?:500|502|503|504)',
+        result.stderr or '', re.I))
+
+
+def publish_verified(root,remote,refspec,*,limit=2,timeout=PUSH_TIMEOUT):
     """Retry one explicit transport failure with the same immutable refspec."""
     attempts=0
     while True:
         attempts+=1
         try:
-            result=_git(root,'push','--quiet',remote,refspec,timeout=PUSH_TIMEOUT)
+            result=_git(root,'push','--quiet',remote,refspec,timeout=timeout)
         except subprocess.TimeoutExpired:
             sha,ref=refspec.split(':',1)
-            try:observed=_git(root,'ls-remote','--refs',remote,ref,timeout=10)
+            try:observed=_git(root,'ls-remote','--refs',remote,ref,timeout=min(timeout,10))
             except (OSError,subprocess.SubprocessError):observed=None
             if observed and not observed.returncode and observed.stdout.strip()==sha+'\t'+ref:
                 return subprocess.CompletedProcess([],0,'',''),attempts
-            if attempts<2:continue
+            if attempts<limit:continue
             return subprocess.CompletedProcess([],1,'','Push timed out; remote publication could not be confirmed'),attempts
-        transient=re.search(r'Could not resolve host|Failed to connect|Connection (?:reset|timed out)|HTTP (?:500|502|503|504)',result.stderr or '',re.I)
-        if not result.returncode or attempts>=2 or not transient:return result,attempts
+        if attempts>=limit or not transient_publication(result):return result,attempts
 
 
 def merge_completed(root,settings,source,*,capture_before=False,expected_source=None,expected_parent=None,verification=None):
@@ -505,9 +511,10 @@ def _merge_completed_once(root,settings,source,base,tip,verification=None):
     if already:report['already_integrated']=True
     if settings.get('git_push')!='Never':
         try:
-            pushed,attempts=publish_verified(root,settings.get('git_remote','origin'),merged+':'+target)
+            retry_options=settings.get('_publication_retry_options',{})
+            pushed,attempts=publish_verified(root,settings.get('git_remote','origin'),merged+':'+target,**retry_options)
             report['publication_attempts']=attempts
-            if pushed.returncode:report.update(error='Merge exists locally, but target push failed: '+pushed.stderr[-300:],pushed=False)
+            if pushed.returncode:report.update(error='Merge exists locally, but target push failed: '+pushed.stderr[-300:],pushed=False,publication_transient=transient_publication(pushed))
             else:report['pushed']=True
         except (OSError,subprocess.SubprocessError) as error:report.update(error=str(error)[:300],pushed=False)
     return report
@@ -540,8 +547,11 @@ def merge_dependency_checkpoint(root,settings,source):
 
 
 def _finish(item):
+    import git_completion
     with checkout_lock(item['root']):
         report=_finish_locked(item)
+        if integrated_completion(item['settings']) and report.get('verified_source_sha'):
+            git_completion.defer_publication(item['root'],item['task']['id'],item['settings'],report)
     return finish_cleanup(item,report)
 
 
@@ -605,7 +615,7 @@ def _finish_locked(item):
                             report['tracking_error']='Published the source; could not configure upstream tracking'
                             break
             else:result=subprocess.CompletedProcess([],1,'','Could not resolve the source commit for publication')
-            report['push']={'pushed':True,'remote':remote,'branch':report['branch']} if not result.returncode else {'pushed':False,'error':(result.stderr or result.stdout).strip()[-300:] or 'push failed'}
+            report['push']={'pushed':True,'remote':remote,'branch':report['branch']} if not result.returncode else {'pushed':False,'error':(result.stderr or result.stdout).strip()[-300:] or 'push failed','publication_transient':transient_publication(result)}
         except (OSError,subprocess.SubprocessError) as error:
             report['push']={'pushed':False,'error':str(error)[:300]}
     else:report['push']={'pushed':False,'reason':'waiting for the rest of the context group'}
@@ -617,7 +627,9 @@ def _finish_locked(item):
         return report
     if settings.get('git_merge') in ('Group','Task') and unit_done:
         if (not commit.get('committed') and commit.get('reason')!='nothing to commit') or (settings.get('git_push')!='Never' and not report.get('push',{}).get('pushed')):
-            report['merge']={'merged':False,'error':'Commit or source publication failed; agent review required'}
+            error=('Verified source publication is pending' if strict and report.get('push',{}).get('publication_transient')
+                   else 'Commit or source publication failed; agent review required')
+            report['merge']={'merged':False,'error':error}
         elif commit.get('committed') or commit.get('reason')=='nothing to commit':
             try:
                 if strict:report['merge']=merge_completed(root,settings,report['branch'],expected_source=receipt['sha'],expected_parent=receipt['target'],verification=receipt)
@@ -734,7 +746,10 @@ def describe(report):
         parts.append('push queued')
     elif push.get('reason'):
         parts.append('push: ' + push['reason'])
-    if report.get('merge'):
+    if report.get('publication'):
+        publication=report['publication']
+        parts.append(f"publication pending ({publication['stage']}, {publication['attempts']} push attempts)")
+    elif report.get('merge'):
         merge=report['merge'];parts.append('merged into '+merge['target'] if merge.get('merged') and not merge.get('error') else 'MERGE FAILED: '+merge.get('error','unknown'))
         if merge.get('ancestor_merges'):
             parts.append('ancestor integration: '+', '.join(m.get('target','unknown') for m in merge['ancestor_merges'] if m.get('merged') and not m.get('error')))
@@ -766,7 +781,7 @@ def flush(call,jobs,result,external_project=None):
                 if result.get('id')==item['task']['id']:result.update(finalized)
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
         closure_error=outcome.get('checkout',{}).get('reason') if strict and outcome.get('checkout',{}).get('closed') is False else ''
-        if (outcome.get('merge',{}).get('error') and not outcome['merge'].get('reverification_required')) or closure_error:
+        if not outcome.get('publication') and ((outcome.get('merge',{}).get('error') and not outcome['merge'].get('reverification_required')) or closure_error):
             try:
                 recovery=call('task_create',dict(project=project,actor=item['actor'],title='Resolve Git integration: '+outcome['branch']+' into '+(destination or '[origin not recorded]'),description=('Git checkout closure remains pending after verified integration. Preserve actual remaining source/staging; do not repeat implementation or adopt unknown edits. ' if closure_error else '')+'Git recovery task. Integrate existing source '+outcome['branch']+' into '+(destination or '[origin not recorded]')+' using remote '+item['settings'].get('git_remote','origin')+('. Verified source commit: '+outcome['verified_source_sha']+'; do not include later unverified source commits' if outcome.get('verified_source_sha') else '')+'. Follow recorded parents in order; earlier edges may already be integrated. Never bypass intermediate branches. Preserve all existing work and staging. Inspect current refs and file reservations, plan and reserve any files before edits, resolve only real conflicts, run affected verification, and publish without force. Do not repeat the original completed implementation. Automatic Git is disabled for this recovery task; the agent is authorized to perform the scoped merge and push. Failure: '+(closure_error or outcome['merge']['error']),acceptance_criteria=[('Canonical checkout is clean on its recorded parent without losing source/staging; existing integration/publication is preserved.' if closure_error else 'Target contains the source outcome, conflicts are resolved and verification is recorded.'),'Publication succeeds without force, or an external blocker is recorded without retry loops.'],category='Git recovery',priority=1,scope_size='Small',scope_reason='One integration recovery for a completed outcome',model_tier='standard',model_reason='Scoped Git integration recovery'))
                 outcome['recovery_task']=recovery
@@ -777,7 +792,7 @@ def flush(call,jobs,result,external_project=None):
         except Exception:pass
         if 'push' in outcome and ('pushed' in outcome['push'] and (outcome['push'].get('pushed') or 'error' in outcome['push'])):
             push=dict(outcome['push'],task=item['task']['id']);pushes.append(push)
-            text=f"git: pushed {outcome['branch']} to {item['settings'].get('git_remote','origin')}." if push.get('pushed') else 'git: PUSH FAILED: '+push.get('error','')
+            text=f"git: pushed {outcome['branch']} to {item['settings'].get('git_remote','origin')}." if push.get('pushed') else ('git: publication pending: ' if outcome.get('publication') else 'git: PUSH FAILED: ')+push.get('error','')
             try:call('git_note',dict(project=project,id=item['task']['id'],actor=item['actor'],text=text))
             except Exception:pass
     return pushes

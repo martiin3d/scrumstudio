@@ -6,6 +6,7 @@ from unittest.mock import patch
 import test_storage
 from store import run
 import git_sync as git
+import git_completion
 
 FONT='''%YAML 1.1
 --- !u!114 &11400000
@@ -48,6 +49,75 @@ class CheckoutCloseTest(unittest.TestCase):
         self.assertEqual(git.state(self.workspace),('main',[]));self.assertEqual((self.workspace/'product.txt').read_text(),'verified result\n')
         self.assertEqual(self.g('rev-parse','HEAD'),self.g('ls-remote','origin','refs/heads/main').split()[0])
         self.assertTrue(git.is_ancestor(self.workspace,claim['git']['branch'],'main'))
+
+    def test_network_failure_reuses_verified_commit_at_native_launch(self):
+        for stage in ('source','target'):
+            with self.subTest(stage=stage):
+                task,claim=self.start()
+                failure=subprocess.CompletedProcess([],1,'','Failed to connect to github.com')
+                native=git._git
+                def disconnected(root,*args,**kwargs):
+                    if args[0]=='push' and (args[-1].endswith(':refs/heads/main')==(stage=='target')):
+                        return failure
+                    return native(root,*args,**kwargs)
+                with patch.object(git,'_git',side_effect=disconnected),patch.object(git_completion,'PUBLICATION_RETRY_DELAY',0):
+                    result=self.finish(task,claim)
+                completed=result['completed']
+                self.assertEqual(completed['status'],'In Review')
+                self.assertEqual(completed['git']['publication']['stage'],stage)
+                self.assertNotIn('recovery_task',completed['git'])
+                receipt=git_completion.read_receipt(self.workspace,task['id'])
+                self.assertEqual(receipt['sha'],self.g('rev-parse',claim['git']['branch']))
+                current=run('task_get',dict(project=self.p,id=task['id']))
+                self.assertFalse(current['locked'])
+                self.assertEqual(current['publication']['attempts'],2)
+                with patch.object(git,'_commit',side_effect=AssertionError('must reuse commit')):
+                    if stage=='source':
+                        run('worker_launch',dict(project=self.p,actor=self.agent,client='codex'))
+                    else:
+                        observed=run('agent_checkpoint',dict(project=self.p,actor=self.agent,client='codex',
+                                                             action='observe',running=False))
+                        self.assertEqual(observed['git_publication']['state'],'published')
+                current=run('task_get',dict(project=self.p,id=task['id']))
+                self.assertEqual(current['status'],'Done')
+                self.assertEqual(current['evidence'],'Targeted behavior passed.')
+                self.assertEqual(current['publication']['state'],'published')
+                self.assertEqual(self.g('ls-remote','origin','refs/heads/main').split()[0],receipt['sha'])
+                self.assertEqual(git.state(self.workspace),('main',[]))
+
+    def test_network_failure_retries_are_bounded_and_respect_stop(self):
+        task,claim=self.start()
+        failure=subprocess.CompletedProcess([],1,'','Could not resolve host: github.com')
+        launch=dict(project=self.p,actor=self.agent,client='codex')
+        with patch.object(git,'publish_verified',return_value=(failure,1)) as push,patch.object(git_completion,'PUBLICATION_RETRY_DELAY',0):
+            self.finish(task,claim)
+            run('project_control',dict(project=self.p,actor=self.human,action='stop'))
+            run('worker_launch',launch)
+            self.assertEqual(push.call_count,1)
+            run('project_control',dict(project=self.p,actor=self.human,action='wakeup',start_agents=False))
+            for _ in range(git_completion.PUBLICATION_RETRIES+1):
+                run('worker_launch',launch)
+            self.assertEqual(push.call_count,1+git_completion.PUBLICATION_RETRIES)
+        current=run('task_get',dict(project=self.p,id=task['id']))
+        self.assertEqual(current['publication']['state'],'exhausted')
+        self.assertEqual(current['status'],'In Review')
+        self.assertFalse(current['locked'])
+        self.assertEqual(len(run('task_search',dict(project=self.p))['items']),1)
+
+    def test_pr_source_retry_waits_for_pr_policy(self):
+        run('project_settings',dict(project=self.p,actor=self.human,git_merge='PR'))
+        task,claim=self.start()
+        failure=subprocess.CompletedProcess([],1,'','Failed to connect to github.com')
+        with patch.object(git,'publish_verified',return_value=(failure,1)),patch.object(git_completion,'PUBLICATION_RETRY_DELAY',0):
+            self.finish(task,claim)
+        request=dict(project=self.p,id=task['id'])
+        self.assertEqual(run('task_get',request)['pull_request']['state'],'publication_pending')
+        run('worker_launch',dict(project=self.p,actor=self.agent,client='codex'))
+        current=run('task_get',request)
+        self.assertEqual(current['status'],'In Review')
+        self.assertEqual(current['pull_request']['state'],'awaiting_pr')
+        ref='refs/heads/'+claim['git']['branch']
+        self.assertEqual(self.g('ls-remote','origin',ref).split()[0],current['pull_request']['head'])
     def test_generated_cache_and_output_are_retained_natively_without_recovery_task(self):
         task,claim=self.start();font=self.workspace/FONT_PATH
         generated=FONT.replace('    m_GlyphPairAdjustmentRecords: []','    m_GlyphPairAdjustmentRecords:\n    - cachedGlyph: 42')

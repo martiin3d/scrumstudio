@@ -423,6 +423,13 @@ def run(action, a):
     with git_sync.transaction_jobs() as jobs:
         result=_run(action,a)
     if action=='agent_checkpoint' and a.get('action')=='observe' and isinstance(result,dict):
+        if not a.get('running') and not result.get('should_stop'):
+            try:
+                publication=_run('git_publication_retry',{'project':a['project'],'actor':a['actor'],
+                                                           'capability':git_sync.FINALIZE_TOKEN})
+                if publication:result['git_publication']=publication
+            except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:
+                result['git_publication_error']=str(error)[:300]
         candidate=_run('git_recovery_next',{'project':a['project']})
         if candidate:result['git_recovery_id']=candidate['id']
     import idle_signals
@@ -654,6 +661,12 @@ def legacy_run(action, a, path=None, locks=None):
         if action=='git_reconcile':
             import git_completion
             return git_completion.reconcile(db,a,project_row,prefix,activity,now,resolve_dependents)
+        if action=='git_publication_retry':
+            import git_sync
+            import git_completion
+            if a.get('capability') is not git_sync.FINALIZE_TOKEN:raise ValueError('Native Git publication only')
+            if runtime.reason(db,project,a['actor']):return None
+            return git_completion.retry_publication(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
         if action=='task_pull_request':
             if type(a.get('number')) is not int or not 1<=a['number']<=2147483647:
                 raise ValueError('Supply a valid GitHub PR number')
@@ -743,13 +756,19 @@ def legacy_run(action, a, path=None, locks=None):
                         if knowledge or spec or delta or changes:task['version']=context_tools.digest(task)
                 import task_decisions
                 relevant=task_decisions.context(db,project,task,prefix,a)
-                if project_row['git_merge']=='PR' and task['status'] in ('In Review','Done'):
+                if project_row['git_merge'] in ('Task','PR') and task['status'] in ('In Review','Done'):
                     import git_completion
                     workspace=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(row))
                     receipt=git_completion.read_receipt(workspace,task['id'])
                     if receipt and receipt.get('sha'):
-                        task['pull_request']=receipt.get('pr',{'state':'awaiting_pr','head':receipt['sha'],'base':receipt['target']})
-                        task['version']=context_tools.digest(task)
+                        publication=receipt.get('publication')
+                        if publication:
+                            task['publication']=publication
+                        if project_row['git_merge']=='PR':
+                            state='publication_'+publication['state'] if publication and publication['state']!='published' else 'awaiting_pr'
+                            task['pull_request']=receipt.get('pr',{'state':state,'head':receipt['sha'],'base':receipt['target']})
+                        if publication or 'pull_request' in task:
+                            task['version']=context_tools.digest(task)
                 if relevant:
                     task['decision_context']=relevant
                     task['version']=context_tools.digest(task)
@@ -1294,6 +1313,7 @@ def legacy_run(action, a, path=None, locks=None):
                 stop=stop or 'Project parallel-agent limit reached.'
             if action=='worker_launch':
                 import git_completion
+                git_completion.retry_publication(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
                 git_completion.reconcile_finished(db,project_row,prefix,activity,now,resolve_dependents,a['actor'])
                 reconcile_checkout_blocks(db,project_row,a['actor'])
                 import file_plan_repair
