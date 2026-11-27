@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 import unittest
 import test_app
@@ -60,6 +63,61 @@ class NativeCliTest(unittest.TestCase):
     setUp=test_app.WorkflowTest.setUp
     tearDown=test_app.WorkflowTest.tearDown
     task=test_app.WorkflowTest.task
+
+    def run_cli(self, *arguments, payload=None):
+        env = os.environ.copy()
+        env.pop('SCRUM_CLI_CONTEXT', None)
+        env['PYTHONIOENCODING'] = 'cp1252'
+        entry = Path(cli.__file__).with_name('scrum.py')
+        actor = [] if arguments[0] == 'show' else ['--actor', str(self.actor)]
+        return subprocess.run(
+            [sys.executable, str(entry), *arguments, '--project', str(self.p), *actor],
+            input=payload, capture_output=True, env=env,
+        )
+
+    def test_utf8_registration_and_edit_round_trip(self):
+        accents = '\u00bf\u00e1\u00e9\u00ed\u00f3\u00fa\u00fc\u00f1? \u00a1S\u00ed!'
+        fields = dict(title=accents, description=f'Description {accents}', acceptance_criteria=[f'Criterion {accents}'])
+        plan = json.dumps([dict(fields, key='accented')], ensure_ascii=False).encode('utf-8')
+        result = self.run_cli('register', '--stdin', payload=plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        task = json.loads(result.stdout.decode('ascii'))['items'][0]['id']
+        shown = self.run_cli('show', '--task', str(task))
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        created = json.loads(shown.stdout.decode('ascii'))
+        for key, value in fields.items():
+            self.assertEqual(created[key], value)
+        for source in ('stdin', 'file'):
+            edited = dict(title=f'{source} {accents}', description=f'{accents} {source}', acceptance_criteria=[f'{source}: {accents}'])
+            payload = json.dumps(edited, ensure_ascii=False).encode('utf-8-sig')
+            path = Path(self.temp.name) / 'edit.json'
+            path.write_bytes(payload)
+            arguments = ('--stdin',) if source == 'stdin' else ('--input', str(path))
+            result = self.run_cli('update', '--task', str(task), *arguments, payload=payload if source == 'stdin' else None)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shown = self.run_cli('show', '--task', str(task))
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            stored = json.loads(shown.stdout.decode('ascii'))
+            board = next(item for item in run('snapshot', {'project': self.p})['tasks'] if item['id'] == task)
+            for key, value in edited.items():
+                self.assertEqual(stored[key], value)
+                self.assertEqual(board[key], value)
+
+    def test_invalid_utf8_is_rejected_before_registration(self):
+        payload = b'[{"title":"invalid \xff","description":"test","acceptance_criteria":["test"]}]'
+        path = Path(self.temp.name) / 'invalid.json'
+        path.write_bytes(payload)
+        for option, arguments, stdin in (
+            ('--stdin', ('--stdin',), payload),
+            ('--input', ('--input', str(path)), None),
+        ):
+            result = self.run_cli('register', *arguments, payload=stdin)
+            self.assertEqual(result.returncode, 1)
+            detail = json.loads(result.stderr)['error']
+            self.assertEqual(detail['code'], 'VALIDATION_ERROR')
+            self.assertIn(f'{option} requires UTF-8 JSON', detail['message'])
+        self.assertEqual(run('snapshot', {'project': self.p})['tasks'], [])
+
     def context(self):
         path=Path(self.temp.name)/'private.json'
         cli.atomic(path,dict(schema=1,project=self.p,actor=self.actor,client='claude',batch=False,current=None,receipts=[]))

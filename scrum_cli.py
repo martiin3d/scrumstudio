@@ -190,13 +190,27 @@ def parser():
     p.add_argument('--project',help='Project ID, UUID or checkout path; defaults to cwd outside managed runs')
     p.add_argument('--actor',type=int);p.add_argument('--client',choices=['codex','claude'])
     p.add_argument('--task',help='Explicit task ID/code; required for finish and task mutations')
-    p.add_argument('--input',type=Path,help='UTF-8 JSON arguments (or task-plan items array)')
-    p.add_argument('--stdin',action='store_true',help='Read JSON arguments from stdin, never shell-built JSON')
+    p.add_argument('--input',type=Path,help='UTF-8 JSON file (optional BOM, or task-plan items array)')
+    p.add_argument('--stdin',action='store_true',help='Read UTF-8 JSON from stdin (optional BOM)')
     for field in ('evidence','continuity','reason','query','status','file'):p.add_argument('--'+field)
     for field in ('evidence','continuity'):p.add_argument('--'+field+'-file',type=Path)
     p.add_argument('--decisions-file',type=Path)
     p.add_argument('--paths',nargs='+');p.add_argument('--action');p.add_argument('--limit',type=int);p.add_argument('--after',type=int)
     return p
+
+
+def read_json_input(path, from_stdin):
+    try:
+        if path is not None:
+            return path.read_text(encoding='utf-8-sig')
+        if from_stdin:
+            if hasattr(sys.stdin, 'buffer'):
+                return sys.stdin.buffer.read().decode('utf-8-sig')
+            return sys.stdin.read().removeprefix('\ufeff')
+    except UnicodeDecodeError as error:
+        source = '--input' if path is not None else '--stdin'
+        raise ValueError(f'{source} requires UTF-8 JSON (optional BOM); invalid byte at offset {error.start}') from error
+    return '{}'
 
 
 def main(argv=None):
@@ -209,7 +223,7 @@ def main(argv=None):
         from coordination_api import specification
         spec=specification(name)
         if ns.command=='help':print(json.dumps({'operation':name,'arguments':spec},separators=(',',':')));return 0
-        raw=ns.input.read_text(encoding='utf-8-sig') if ns.input else sys.stdin.read() if ns.stdin else '{}'
+        raw=read_json_input(ns.input, ns.stdin)
         if len(raw)>1024*1024:raise ValueError('Input too large')
         args=json.loads(raw)
         if ns.command in ('plan','register') and isinstance(args,list):args={'items':args}
@@ -277,7 +291,7 @@ def main(argv=None):
             if 'actor' not in args:
                 if not invoke('project_mode',{'project':args['project']})['enabled']:
                     result=coordinated(name,args)
-                    print(json.dumps(result,separators=(',',':'),ensure_ascii=False));return 0
+                    print(json.dumps(result,separators=(',',':')));return 0
                 if 'identity' in args or 'name' in args:
                     from mcp_server import _validate
                     _validate(args,spec)
@@ -288,7 +302,7 @@ def main(argv=None):
                 args['actor']=invoke('user_register',registration)['id']
             atomic(ns.context,{'schema':1,'machine_scope':machine_scope(),'project':args['project'],'actor':args['actor'],'client':args['client'],'current':None,'batch':False,'receipts':[]})
         result=coordinated(name,args,ns.context)
-        print(json.dumps(result,separators=(',',':'),ensure_ascii=False));return 0
+        print(json.dumps(result,separators=(',',':')));return 0
     except Exception as error:
         if isinstance(error,ValueError):
             from planning import PlanRejected

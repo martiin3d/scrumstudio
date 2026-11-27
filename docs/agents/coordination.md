@@ -11,6 +11,8 @@
 
 When a task names a wiki section, pass its page path and heading anchor as `page` and `section` to `scrum.py call project_knowledge --stdin`. The response includes the original page path so relative links still resolve. Omit `section` for the full page and navigation.
 
+The native CLI reads JSON from `--input` and `--stdin` as UTF-8, with or without a byte-order mark. Invalid UTF-8 fails before dispatch. In Windows PowerShell, set `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` before piping JSON strings to `--stdin`. For files, use `Set-Content -Encoding UTF8` and pass the path to `--input`. Windows PowerShell's default pipeline encoding can replace characters before the CLI receives them. CLI output uses ASCII-safe JSON escapes so PowerShell can restore the original characters with `ConvertFrom-Json`.
+
 For a smaller Codex worker catalog on this checkout, put a JSON array of skill directory names in `.scrum/local/codex-skills.json`, for example `["codebase-memory"]`. Add the specialists this project needs. The filter keeps `scrum-work` and preserves explicit Codex skill rules. It covers the immediate skill directories in Codex home, the user's `.agents/skills`, and the project. A skill omitted from the catalog can still be read from its known path.
 
 For changes to this flow, run the relevant CLI, bridge, workflow or context tests listed by `python scripts/verify.py --files PATH`.
