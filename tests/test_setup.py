@@ -94,6 +94,15 @@ class SetupTest(unittest.TestCase):
                 setup.main()
             home.assert_not_called()
 
+    def test_claude_hook_commands_parse_in_powershell_and_posix_shells(self):
+        with patch.object(setup.sys,'executable',r'C:\Tools\py312\python.exe'):
+            command=setup.merged_claude_hooks({})['hooks']['Stop'][0]['hooks'][0]['command']
+        self.assertNotIn('"',command)
+        self.assertNotIn('\\',command)
+        self.assertTrue(command.startswith('C:/Tools/py312/python.exe '))
+        self.assertTrue(command.endswith('/scripts/claude_hooks.py stop') or ' ' in str(ROOT))
+        self.assertEqual(setup.hook_command(r'C:\Program Files\py\python.exe','x.py','stop'),'"C:/Program Files/py/python.exe" x.py stop')
+
     def test_claude_installs_skills_and_uses_user_stdio_scope(self):
         with tempfile.TemporaryDirectory(dir=ROOT/'data') as temp:
             profile=Path(temp)

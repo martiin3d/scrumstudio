@@ -268,6 +268,18 @@ def install_claude_hooks(settings_path,backup):
     temporary.write_text(json.dumps(settings,indent=2),encoding='utf-8');os.replace(temporary,settings_path)
 
 
+SHELL_SAFE=re.compile(r'[A-Za-z0-9_.:/+@%=,-]+')
+def hook_command(*parts):
+    """One command line that parses the same in PowerShell, cmd and POSIX shells.
+
+    Claude Code on Windows may run hooks through PowerShell, which rejects a
+    quoted executable path without the & call operator, while sh/bash would
+    take & as a background operator. Forward-slash paths without spaces need
+    no quoting in any of them; only paths with spaces fall back to quotes.
+    """
+    words=[str(part).replace('\\','/') for part in parts]
+    return ' '.join(word if SHELL_SAFE.fullmatch(word) else '"'+word+'"' for word in words)
+
 def merged_claude_hooks(settings,events=HOOK_EVENTS):
     hooks=settings.setdefault('hooks',{})
     script=ROOT/'scripts'/'claude_hooks.py'
@@ -277,7 +289,7 @@ def merged_claude_hooks(settings,events=HOOK_EVENTS):
         for group in hooks.get(event,[]):
             remaining=[hook for hook in group.get('hooks',[]) if 'claude_hooks.py' not in hook.get('command','')]
             if remaining:groups.append({**group,'hooks':remaining})
-        groups.append({'hooks':[{'type':'command','command':f'"{sys.executable}" "{script}" {action}','timeout':15}]})
+        groups.append({'hooks':[{'type':'command','command':hook_command(sys.executable,script,action),'timeout':15}]})
         hooks[event]=groups
     return settings
 
