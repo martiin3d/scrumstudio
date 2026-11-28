@@ -458,7 +458,8 @@ def create_task(db,project,prefix,a):
 
 def register_delivery_recovery(db,project,prefix,actor,original,failure):
     import git_completion
-    row=db.execute('SELECT status,blocked_reason FROM tasks WHERE project=? AND id=?',(project,original)).fetchone()
+    import git_audit
+    row=db.execute('SELECT number,status,blocked_reason FROM tasks WHERE project=? AND id=?',(project,original)).fetchone()
     if not row or row['status'] not in ('Done','In Review'):
         return
     title=git_completion.RECOVERY_TITLE+failure['source']+' into '+failure['target']
@@ -478,7 +479,13 @@ def register_delivery_recovery(db,project,prefix,actor,original,failure):
         recovery={'id':existing['id'],'code':f"{prefix}-{existing['number']}",'status':existing['status'],'existing':True}
     else:
         recovery=create_task(db,project,prefix,git_completion.recovery_spec(actor,title,failure))
-    reason=f"Git delivery ({recovery['code']}): {failure['error']}"
+    source_code=f"{prefix}-{row['number']}"
+    trigger=git_audit.error_summary(failure['error'])
+    link=f'Git recovery for {source_code}. '+git_audit.refs(failure['source'],failure['target'])+f' Trigger: {trigger}.'
+    if not db.execute("SELECT 1 FROM task_activity WHERE task=? AND kind='Git history' AND text=?",
+                      (recovery['id'],link)).fetchone():
+        activity(db,recovery['id'],actor,'Git history',link)
+    reason=f"Git delivery ({recovery['code']}): {trigger}"
     if row['blocked_reason']!=reason:
         if row['status']=='In Review':
             db.execute("UPDATE tasks SET blocked_reason=?,blocked_reason_kind='external',updated=? WHERE id=?",(reason,now(),original))
@@ -487,9 +494,17 @@ def register_delivery_recovery(db,project,prefix,actor,original,failure):
 
 
 def run(action, a):
+    import git_completion
     import git_sync
-    with git_sync.transaction_jobs() as jobs:
-        result=_run(action,a)
+    try:
+        with git_sync.transaction_jobs() as jobs:
+            result=_run(action,a)
+    except git_completion.RecoveryIncomplete as error:
+        actions=getattr(error,'history',None)
+        if actions:
+            _run('git_history',dict(project=a['project'],id=a['id'],actor=a['actor'],
+                 heading='Native recovery verification failed.',actions=actions,capability=git_sync.FINALIZE_TOKEN))
+        raise
     if action=='agent_checkpoint' and a.get('action')=='observe' and isinstance(result,dict):
         if not a.get('running') and not result.get('should_stop'):
             try:
@@ -521,7 +536,7 @@ def run(action, a):
         task=_run('task_get',{'project':a['project'],'id':result['id']})
         if task.get('category')=='Git recovery' and task.get('title','').startswith('Resolve Git integration: '):
             source,_,target=task['title'][len('Resolve Git integration: '):].partition(' into ')
-            try:result['integration_reconciled']=_run('git_reconcile',{'project':a['project'],'actor':a.get('actor'),'capability':git_sync.FINALIZE_TOKEN,'source':source,'target':target})
+            try:result['integration_reconciled']=_run('git_reconcile',{'project':a['project'],'actor':a.get('actor'),'capability':git_sync.FINALIZE_TOKEN,'source':source,'target':target,'recovery_task':task['id']})
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:result['integration_reconciliation_error']=str(error)[:300]
     if action=='agent_checkpoint' and a.get('action')=='offline' and 'run_exit_code' in a and isinstance(result,dict):
         policy=_run('project_settings',{'project':a['project']})
@@ -765,6 +780,16 @@ def legacy_run(action, a, path=None, locks=None):
         if action=='git_note':  # internal: record a post-transaction git outcome
             activity(db,a['id'],a.get('actor'),'comment',a['text'])
             return {'saved':True}
+        if action=='git_history':
+            import git_audit
+            import git_sync
+            if a.get('capability') is not git_sync.FINALIZE_TOKEN:raise ValueError('Native Git history only')
+            row=db.execute('SELECT * FROM tasks WHERE project=? AND id=?',(project,a['id'])).fetchone()
+            if not row or (a.get('worker') and
+                           (row['category']!='Git recovery' or row['owner_id']!=a['actor'])):
+                return {'saved':False}
+            git_audit.append_history(activity,db,row['id'],a.get('actor'),a['heading'],a['actions'])
+            return {'saved':True}
         if action=='git_cleanup_pending':  # native-only, no model context
             rows=[dict(r) for r in db.execute('SELECT id,uid,number,title,context_group,dependencies,status FROM tasks WHERE project=?',(project,))]
             return git_worktrees.related_pending(project_row['workspace_root'],a['branch'],rows,coord.settings(project_row),prefix)
@@ -831,7 +856,8 @@ def legacy_run(action, a, path=None, locks=None):
                     if receipt and receipt.get('sha'):
                         publication=receipt.get('publication')
                         if publication:
-                            task['publication']=publication
+                            import git_audit
+                            task['publication']=dict(publication,error=git_audit.error_summary(publication['error']) if publication.get('error') else '')
                         if project_row['git_merge']=='PR':
                             state='publication_'+publication['state'] if publication and publication['state']!='published' else 'awaiting_pr'
                             task['pull_request']=receipt.get('pr',{'state':state,'head':receipt['sha'],'base':receipt['target']})
@@ -1161,7 +1187,7 @@ def legacy_run(action, a, path=None, locks=None):
             awaiting_review=reviews.transition(db,old,a,t,claiming,completion_requested)
             if completion_requested and t['category']=='Git recovery':
                 import git_completion
-                git_completion.validate_recovery(db,project_row,t,prefix)
+                git_completion.validate_recovery(db,project_row,t,prefix,activity,a['actor'])
             strict_completion=completion_requested and t['category']!='Git recovery' and git_sync.integrated_completion(coord.settings(project_row))
             if strict_completion or awaiting_review:
                 # Persist verification before Git, but do not unblock dependents yet.

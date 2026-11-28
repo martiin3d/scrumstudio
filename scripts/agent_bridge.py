@@ -24,6 +24,7 @@ from cli_runtime import codex_executable,model_name,worker_python
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 import execution_usage
+import git_audit
 import idle_signals
 import overhead
 import run_cost
@@ -137,7 +138,7 @@ def queue_checkout_recovery(rpc,project,actor,offer,attempted):
     return recovery['id']
 
 
-def interactive_command(cmd,client,project,actor,folder,model,policy):
+def interactive_command(cmd,client,project,actor,folder,model,policy,recovery_task=None):
     if client!='codex' or 'exec' not in cmd:return cmd
     split=cmd.index('exec')
     reviewer='user' if policy.get('agent_approval_mode')=='Ask in chat' else 'auto_review'
@@ -147,7 +148,12 @@ def interactive_command(cmd,client,project,actor,folder,model,policy):
     full=policy.get('agent_approval_mode')=='Full access'
     if full:
         server=[('approval_policy="never"' if arg.startswith('approval_policy=') else 'default_permissions=":danger-full-access"' if arg.startswith('default_permissions=') else arg) for arg in server]
-    return [sys.executable,str(ROOT/'scripts/codex_interactive.py'),'--project',str(project),'--actor',str(actor),'--cwd',str(folder),'--signals',str(policy.get('workspace_root') or folder),'--reviewer',reviewer,*(['--full-access'] if full else []),*(['--model',model] if model else []),'--',*server,'app-server']
+    return [sys.executable,str(ROOT/'scripts/codex_interactive.py'),'--project',str(project),'--actor',str(actor),'--cwd',str(folder),'--signals',str(policy.get('workspace_root') or folder),'--reviewer',reviewer,*(['--full-access'] if full else []),*(['--model',model] if model else []),*(['--recovery-task',str(recovery_task)] if recovery_task else []),'--',*server,'app-server']
+
+
+def recovery_events(client,project,actor,task):
+    if client=='claude' and task.get('category')=='Git recovery':
+        return git_audit.ClaudeRecovery(project,actor,task['id'])
 
 
 def worker_filesystem(folder):
@@ -906,7 +912,8 @@ class ParallelRun:
         options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {'start_new_session': True}
         launch = interactive_command(
             command(args.client, directory, prompt, self.model, policy_folder=folder, coordination_channel='cli'),
-            args.client, args.project, actor, directory, self.model, policy)
+            args.client, args.project, actor, directory, self.model, policy,
+            task_id if started['task'].get('category')=='Git recovery' else None)
         env = os.environ | {'SCRUM_BRIDGE_WORKER': '1', 'SCRUM_CLI_CONTEXT': str(context),
                             'SCRUM_RUN_COST_STATE': str(cost_path)}
         with tempfile.TemporaryFile(mode='w+b') as source:
@@ -914,7 +921,8 @@ class ParallelRun:
             source.seek(0)
             self.child = subprocess.Popen(launch, cwd=directory, stdin=source, stdout=self.output,
                                           stderr=subprocess.STDOUT, env=env, **options)
-        self.cost = run_cost.Watch(self.log, 0, cost_path, self.id, [task_id], policy, args.client)
+        self.cost = run_cost.Watch(self.log, 0, cost_path, self.id, [task_id], policy, args.client,
+                                  event_sink=recovery_events(args.client,args.project,actor,started['task']))
         overhead.record_startup(args.project, actor, self.id, args.client, self.model, started.get('measurement_session'),
                                 [task_id], len(prompt.encode('utf-8')), sections)
 
@@ -1267,13 +1275,14 @@ def main():
                             worker_env['SCRUM_CLI_CONTEXT']=str(context_path)
                         with tempfile.TemporaryFile(mode='w+b') as prompt_input:
                             prompt_input.write(prompt.encode('utf-8'));prompt_input.seek(0)
-                            launch=interactive_command(command(args.client,run_folder,prompt,selected_model,policy_folder=folder,coordination_channel=channel),args.client,args.project,actor,run_folder,selected_model,policy)
+                            launch=interactive_command(command(args.client,run_folder,prompt,selected_model,policy_folder=folder,coordination_channel=channel),args.client,args.project,actor,run_folder,selected_model,policy,offered_task if started['task'].get('category')=='Git recovery' else None)
                             cost_path=Path(folder)/'.scrum/local/run-cost'/f'{actor}.json'
                             if rpc.call('project_settings',{'project':args.project}).get(args.client+'_enabled') is False:
                                 raise ValueError(args.client+' is disabled in Project Settings')
                             child=subprocess.Popen(launch,cwd=run_folder,stdin=prompt_input,stdout=output,stderr=subprocess.STDOUT,env={**worker_env,'SCRUM_RUN_COST_STATE':str(cost_path)},**options)
                             overhead.record_startup(args.project,actor,run_id,args.client,selected_model,started.get('measurement_session'),run_tasks,len(prompt.encode('utf-8')),prompt_sections)
-                            cost_watch=run_cost.Watch(log_path,log_offset,cost_path,run_id,run_tasks,policy,args.client)
+                            cost_watch=run_cost.Watch(log_path,log_offset,cost_path,run_id,run_tasks,policy,args.client,
+                                                     event_sink=recovery_events(args.client,args.project,actor,started['task']))
                     except (OSError,RuntimeError,ValueError) as error:
                         run_id=''
                         release_launch(rpc,args.project,actor)

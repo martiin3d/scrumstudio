@@ -8,6 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 import git_sync as git
+import git_audit
 
 
 class RecoveryIncomplete(ValueError):
@@ -77,7 +78,7 @@ def recovery_spec(actor,title,failure):
                 description=f"{action}{sha} Remote: {failure['remote']}. "
                             "Preserve existing files and staging. Resolve only the recorded obstruction, "
                             "verify affected changes and publish without force. "
-                            f"Failure: {failure['error']}",
+                            f"Failure: {git_audit.error_summary(failure['error'])}.",
                 acceptance_criteria=[criterion])
 
 
@@ -129,24 +130,39 @@ def retry_publication(db,project_row,prefix,activity,now,resolve_dependents,acto
                 publication['state']='exhausted'
             write_receipt(path,receipt)
             outcome={}
-            try:
-                resume_publication(root,settings,receipt,outcome)
-            except (OSError,ValueError,subprocess.SubprocessError) as error:
-                publication.update(state='failed',error=str(error)[:300])
-            else:
-                result=outcome.get('merge') or outcome.get('push',{})
-                if result.get('error'):
-                    publication['error']=result['error']
-                    if not result.get('publication_transient'):
-                        publication['state']='failed'
+            stage=publication['stage']
+            verified=''
+            with git_audit.capture() as actions:
+                try:
+                    resume_publication(root,settings,receipt,outcome)
+                    result=outcome.get('merge') or outcome.get('push',{})
+                    if not result.get('error') and settings['git_push']!='Never':
+                        ref='refs/heads/'+(receipt['source'] if settings['git_merge']=='PR' else result.get('target',receipt['target']))
+                        expected=result.get('sha',receipt['sha'])
+                        observed=git._git(root,'ls-remote','--refs',settings['git_remote'],ref,timeout=PUBLICATION_RETRY_OPTIONS['timeout'])
+                        if git_audit.remote_sha(observed,ref)==expected:
+                            verified=f'Verified remote {ref} at {expected}.'
+                        else:
+                            result.update(error='Remote publication could not be verified',publication_transient=True)
+                except (OSError,ValueError,subprocess.SubprocessError) as error:
+                    publication.update(state='failed',error=str(error)[:300])
                 else:
-                    publication.update(state='published',error='')
-                    if settings['git_merge']=='PR':
-                        receipt['pr']={'state':'awaiting_pr','head':receipt['sha'],'base':receipt['target']}
+                    if result.get('error'):
+                        publication['error']=result['error']
+                        if not result.get('publication_transient'):
+                            publication['state']='failed'
+                    else:
+                        publication.update(state='published',error='')
+                        if settings['git_merge']=='PR':
+                            receipt['pr']={'state':'awaiting_pr','head':receipt['sha'],'base':receipt['target']}
             write_receipt(path,receipt)
+        heading=(f"Automatic Git publication retry {publication['retries']} ({stage}) · "
+                 +git_audit.refs(receipt['source'],receipt['target']))
+        if verified:actions.append(verified)
+        git_audit.append_history(activity,db,row['id'],actor,heading,actions)
         activity(db,row['id'],actor,'comment',
                  f"Git publication {publication['state']} after retry {publication['retries']}/{PUBLICATION_RETRIES}"
-                 + ('. '+publication['error'] if publication['error'] else '.'))
+                 + ('. '+git_audit.error_summary(publication['error']) if publication['error'] else '.'))
         if publication['state']=='published' and settings['git_merge']=='Task':
             finalized=finalize(db,dict(id=row['id'],actor=actor,root=root,expected=receipt['basis'],
                                        capability=git.FINALIZE_TOKEN,outcome=outcome),
@@ -401,7 +417,23 @@ def already_integrated(root,settings,task,branch,record=True):
     return {'branch':branch,'commit':{'committed':False,'reason':'nothing to commit'},'push':{'pushed':False,'reason':'Existing task commit already integrated; publication verified on target'},'merge':merged,'verified_source_sha':receipt['sha']}
 
 
-def validate_recovery(db,project_row,task,prefix):
+def validate_recovery(db,project_row,task,prefix,activity=None,actor=None):
+    with git_audit.capture() as actions:
+        try:
+            for original, remote_result in _validate_recovery(db,project_row,task,prefix):
+                if activity is None:
+                    continue
+                heading=f"Native verification of {prefix}-{original['number']} recovery."
+                entries=[*actions, remote_result] if remote_result else list(actions)
+                for task_id in (task['id'],original['id']):
+                    git_audit.append_history(activity,db,task_id,actor,heading,entries)
+                actions.clear()
+        except RecoveryIncomplete as error:
+            error.history=actions
+            raise
+
+
+def _validate_recovery(db,project_row,task,prefix):
     """Equal branch tips do not prove that a task's outputs were committed."""
     marker=RECOVERY_TITLE
     if task.get('category')!='Git recovery' or not task['title'].startswith(marker):return
@@ -409,7 +441,7 @@ def validate_recovery(db,project_row,task,prefix):
     if not separator:raise RecoveryIncomplete('Git recovery requires its recorded source and target')
     import git_worktrees
     settings=dict(project_row)
-    for original in db.execute("SELECT * FROM tasks WHERE project=? AND status='In Review' AND category!='Git recovery'",(project_row['id'],)).fetchall():
+    for original in db.execute("SELECT * FROM tasks WHERE project=? AND status IN ('In Review','Done') AND category!='Git recovery'",(project_row['id'],)).fetchall():
         original=dict(original)
         root=git_worktrees.workspace(project_row['workspace_root'],git_worktrees.identity(original))
         path=location(root,original['id'])
@@ -431,6 +463,7 @@ def validate_recovery(db,project_row,task,prefix):
             sha=(receipt.get('sha') or recovered_tip(root,receipt)) if receipt else None
             if not sha or tip.stdout.strip()!=sha or not source_published(root,settings,source,sha):
                 raise RecoveryIncomplete('Git recovery incomplete: verified PR source publication is not verified')
+            yield original, f'Verified remote refs/heads/{source} at {sha}.'
             continue
         sha=receipt.get('sha') if receipt else None
         if sha and tip.stdout.strip()!=sha:
@@ -439,16 +472,21 @@ def validate_recovery(db,project_row,task,prefix):
             raise RecoveryIncomplete('Git recovery incomplete: return the checkout to the recorded parent and preserve remaining work')
         if not git.is_ancestor(root,tip.stdout.strip(),'refs/heads/'+target):
             raise RecoveryIncomplete('Git recovery incomplete: target does not contain the verified source')
+        remote_result=''
         if settings.get('git_push')!='Never':
-            published=git._git(root,'ls-remote','--heads',settings.get('git_remote','origin'),'refs/heads/'+target,timeout=git.PUSH_TIMEOUT)
-            remote_sha=published.stdout.split()[0] if not published.returncode and published.stdout.strip() else ''
+            ref='refs/heads/'+target
+            published=git._git(root,'ls-remote','--heads',settings.get('git_remote','origin'),ref,timeout=git.PUSH_TIMEOUT)
+            remote_sha=git_audit.remote_sha(published,ref)
             if not remote_sha or not git.is_ancestor(root,tip.stdout.strip(),remote_sha):
                 raise RecoveryIncomplete('Git recovery incomplete: remote target publication is not verified')
+            remote_result=f'Verified remote {ref} at {remote_sha}.'
+        yield original, remote_result
 
 
 def source_published(root,settings,source,sha):
-    published=git._git(root,'ls-remote','--heads',settings['git_remote'],'refs/heads/'+source,timeout=git.PUSH_TIMEOUT)
-    return not published.returncode and published.stdout.split()[:1]==[sha]
+    ref='refs/heads/'+source
+    published=git._git(root,'ls-remote','--heads',settings['git_remote'],ref,timeout=git.PUSH_TIMEOUT)
+    return bool(sha and git_audit.remote_sha(published,ref)==sha)
 
 
 def finalize(db,a,project_row,prefix,activity,now,resolve_dependents):
@@ -565,10 +603,18 @@ def reconcile(db,a,project_row,prefix,activity,now,resolve_dependents):
             if known.returncode or not git.is_ancestor(root,sha,remote):continue
             merge['pushed']=True
         elif project_row['git_push']!='Never':
-            # A scoped recovery may have published manually; normal push is
-            # idempotent and verifies publication without any inference turn.
-            published=git._git(root,'push','--quiet',project_row['git_remote'],target+':'+target,timeout=git.PUSH_TIMEOUT)
-            if published.returncode:continue
+            with git_audit.capture() as actions:
+                pushed=git._git(root,'push','--quiet',project_row['git_remote'],target+':'+target,timeout=git.PUSH_TIMEOUT)
+                observed=''
+                if not pushed.returncode:
+                    published=git._git(root,'ls-remote','--refs',project_row['git_remote'],target,timeout=git.PUSH_TIMEOUT)
+                    observed=git_audit.remote_sha(published,target)
+                verified=bool(observed and git.is_ancestor(root,sha,observed))
+            if verified:actions.append(f'Verified remote {target} at {observed}.')
+            heading='Native recovery reconciliation · '+git_audit.refs(receipt['source'],receipt['target'])
+            for task_id in {row['id'],a.get('recovery_task',row['id'])}:
+                git_audit.append_history(activity,db,task_id,a.get('actor'),heading,actions)
+            if not verified:continue
             merge['pushed']=True
         result=finalize(db,dict(a,id=row['id'],root=root,expected=receipt['basis'],outcome={'merge':merge}),project_row,prefix,activity,now,resolve_dependents)
         if result['status']=='Done':completed.append(row['id'])

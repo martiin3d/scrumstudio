@@ -84,6 +84,10 @@ class CheckoutCloseTest(unittest.TestCase):
                 self.assertEqual(current['publication']['state'],'published')
                 self.assertEqual(self.g('ls-remote','origin','refs/heads/main').split()[0],receipt['sha'])
                 self.assertEqual(git.state(self.workspace),('main',[]))
+                history='\n'.join(item['text'] for item in run('task_activity',dict(project=self.p,id=task['id']))['items'])
+                self.assertIn('Automatic Git publication retry 1',history)
+                self.assertIn('git push · succeeded · Native publisher · Sandbox: Unknown',history)
+                self.assertIn(f"Verified remote refs/heads/main at {receipt['sha']}.",history)
 
     def test_network_failure_retries_are_bounded_and_respect_stop(self):
         task,claim=self.start()
@@ -105,7 +109,7 @@ class CheckoutCloseTest(unittest.TestCase):
         items=run('task_search',dict(project=self.p))['items']
         recovery,=[item for item in items if item['id']!=task['id']]
         self.assertIn(recovery['code'],current['blocked_reason'])
-        self.assertIn('Could not resolve host',current['blocked_reason'])
+        self.assertIn('DNS resolution failed',current['blocked_reason'])
         self.assertEqual(current['evidence'],'Targeted behavior passed.')
 
         # A later native boundary reloads the exhausted receipt from disk.
@@ -164,7 +168,7 @@ class CheckoutCloseTest(unittest.TestCase):
         source=claim['git']['branch']
         parent_tip=self.g('rev-parse','main')
         request=dict(project=self.p,id=task['id'])
-        self.assertIn('Permission denied',run('task_get',request)['blocked_reason'])
+        self.assertIn('access denied',run('task_get',request)['blocked_reason'])
         recovery_claim=run('task_claim',dict(project=self.p,id=recovery['id'],actor=self.agent))
         self.assertTrue(recovery_claim['claimed'])
         with self.assertRaisesRegex(git_completion.RecoveryIncomplete,'PR source publication'):

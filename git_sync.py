@@ -16,6 +16,7 @@ import unicodedata
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+import git_audit
 
 GIT_DEFAULTS = {'git_pause_blocked':False, 'git_cleanup':False, 'git_merge':'Off', 'git_mode': 'Off', 'git_commit': 'Task', 'git_push': 'Group', 'git_base_branch': '', 'git_branch_prefix': 'scrum/', 'git_remote': 'origin'}
 _jobs = threading.local()
@@ -105,7 +106,13 @@ def _git(root, *args, timeout=3, input_text=None, index_file=None, literal_paths
     if not literal_paths:
         for key in ('GIT_LITERAL_PATHSPECS','GIT_GLOB_PATHSPECS','GIT_NOGLOB_PATHSPECS','GIT_ICASE_PATHSPECS'):env.pop(key,None)
     extra={'input':input_text} if input_text is not None else {}
-    return subprocess.run(['git', *(['--literal-pathspecs'] if literal_paths else []), '-C', str(root), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=flags,env=env,**extra)
+    try:
+        result=subprocess.run(['git', *(['--literal-pathspecs'] if literal_paths else []), '-C', str(root), *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, creationflags=flags,env=env,**extra)
+    except (OSError,subprocess.SubprocessError) as error:
+        git_audit.native(args,error)
+        raise
+    git_audit.native(args,result)
+    return result
 
 
 def is_ancestor(root,source,target):
@@ -431,9 +438,10 @@ def publish_verified(root,remote,refspec,*,limit=2,timeout=PUSH_TIMEOUT):
             result=_git(root,'push','--quiet',remote,refspec,timeout=timeout)
         except subprocess.TimeoutExpired:
             sha,ref=refspec.split(':',1)
+            if not ref.startswith('refs/'):ref='refs/heads/'+ref
             try:observed=_git(root,'ls-remote','--refs',remote,ref,timeout=min(timeout,10))
             except (OSError,subprocess.SubprocessError):observed=None
-            if observed and not observed.returncode and observed.stdout.strip()==sha+'\t'+ref:
+            if observed and git_audit.remote_sha(observed,ref)==sha:
                 return subprocess.CompletedProcess([],0,'',''),attempts
             if attempts<limit:continue
             return subprocess.CompletedProcess([],1,'','Push timed out; remote publication could not be confirmed'),attempts
@@ -765,9 +773,10 @@ def flush(call,jobs,result,external_project=None):
     """Run request-local jobs after database commit; never retain failed requests."""
     pushes=[]
     for item in jobs:
-        try:outcome=_finish(item)
-        except (OSError,ValueError,subprocess.SubprocessError) as error:
-            outcome={'branch':branch_for(item['settings'],item['task']),'error':str(error)[:300]}
+        with git_audit.capture() as actions:
+            try:outcome=_finish(item)
+            except (OSError,ValueError,subprocess.SubprocessError) as error:
+                outcome={'branch':branch_for(item['settings'],item['task']),'error':str(error)[:300]}
         strict=integrated_completion(item['settings'])
         if outcome.get('error') and item['settings'].get('git_merge') in ('Group','Task') and (strict or item['group_done'] or item.get('dependency_checkpoint')):
             outcome['merge']={'merged':False,'error':outcome['error']}
@@ -776,10 +785,12 @@ def flush(call,jobs,result,external_project=None):
         project=external_project if external_project is not None else item['project']
         destination=(outcome.get('merge',{}).get('pending_target') or parent_branch(item['root'],outcome['branch'])) if item['settings'].get('git_merge') in ('Group','Task') else ''
         if strict:
-            try:
-                finalized=call('git_finalize',dict(project=project,id=item['task']['id'],actor=item['actor'],capability=FINALIZE_TOKEN,expected=item['task'].get('completion_basis'),outcome=outcome,root=item['root']))
-                if result.get('id')==item['task']['id']:result.update(finalized)
-            except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
+            with git_audit.capture() as finalization:
+                try:
+                    finalized=call('git_finalize',dict(project=project,id=item['task']['id'],actor=item['actor'],capability=FINALIZE_TOKEN,expected=item['task'].get('completion_basis'),outcome=outcome,root=item['root']))
+                    if result.get('id')==item['task']['id']:result.update(finalized)
+                except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:outcome['completion_error']=str(error)[:300]
+            actions.extend(finalization)
         closure_error=outcome.get('checkout',{}).get('reason') if strict and outcome.get('checkout',{}).get('closed') is False else ''
         merge=outcome.get('merge',{})
         pr_delivery=item['settings'].get('git_merge')=='PR'
@@ -789,11 +800,17 @@ def flush(call,jobs,result,external_project=None):
         if not failure and (merge.get('error') or pr_error) and not merge.get('reverification_required'):
             failure=(outcome.get('commit',{}).get('error') or outcome.get('push',{}).get('error')
                      or merge.get('error') or pr_error)
+        target=destination or merge.get('target') or item['settings'].get('git_base_branch')
+        if failure or outcome.get('publication'):
+            heading='Original Git delivery · '+git_audit.refs(outcome['branch'],target)
+            if outcome.get('publication'):heading+=' Automatic retry scheduled.'
+            call('git_history',dict(project=project,id=item['task']['id'],actor=item['actor'],
+                                    heading=heading,actions=actions,capability=FINALIZE_TOKEN))
         if failure and not outcome.get('publication'):
             try:
                 import git_completion
                 receipt=git_completion.read_receipt(item['root'],item['task']['id']) if strict else None
-                target=destination or (receipt or {}).get('target') or '[origin not recorded]'
+                target=destination or (receipt or {}).get('target') or target or '[origin not recorded]'
                 details=dict(source=outcome['branch'],target=target,error=failure,
                              sha=outcome.get('verified_source_sha'),closure=bool(closure_error),
                              remote=item['settings'].get('git_remote','origin'),pr=pr_delivery)
@@ -808,11 +825,13 @@ def flush(call,jobs,result,external_project=None):
                     idle_signals.notify('git_recovery',{'project':project})
             except (OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as error:
                 outcome['recovery_error']=str(error)[:300]
-        try:call('git_note',dict(project=project,id=item['task']['id'],actor=item['actor'],text=describe(outcome)))
+        summary=describe(outcome) if not failure and not outcome.get('publication') else (
+            'Git delivery: '+git_audit.error_summary(failure or outcome['publication']['error']))
+        try:call('git_note',dict(project=project,id=item['task']['id'],actor=item['actor'],text=summary))
         except Exception:pass
         if 'push' in outcome and ('pushed' in outcome['push'] and (outcome['push'].get('pushed') or 'error' in outcome['push'])):
             push=dict(outcome['push'],task=item['task']['id']);pushes.append(push)
-            text=f"git: pushed {outcome['branch']} to {item['settings'].get('git_remote','origin')}." if push.get('pushed') else ('git: publication pending: ' if outcome.get('publication') else 'git: PUSH FAILED: ')+push.get('error','')
+            text=f"git: pushed {outcome['branch']} to {item['settings'].get('git_remote','origin')}." if push.get('pushed') else ('git: publication pending: ' if outcome.get('publication') else 'git: PUSH FAILED: ')+git_audit.error_summary(push.get('error'))
             try:call('git_note',dict(project=project,id=item['task']['id'],actor=item['actor'],text=text))
             except Exception:pass
     return pushes

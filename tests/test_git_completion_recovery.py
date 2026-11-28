@@ -147,14 +147,28 @@ class CompletionRecoveryTest(unittest.TestCase):
                 self.assertEqual(git('ls-files','new-output.py'),'')
 
     def test_local_integration_without_required_remote_publication_cannot_complete_recovery(self):
+        import git_audit
         project,root,git,task,branch,recovery=self.failed_commit()
         claim=self.recover(project,root,git,branch,recovery)
         run('project_settings',dict(project=project,actor=self.human,git_push='Task'))
         with self.assertRaisesRegex(git_completion.RecoveryIncomplete,'remote target publication'):
             run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Only locally integrated'))
         git('push','origin','main')
+        git_audit.save_worker(project,self.agent,recovery,
+                              git_audit.worker(dict(command='git push origin main',status='completed',exitCode=0),
+                                               'scrum-worker',True))
         run('work_finish',dict(project=project,id=recovery,actor=self.agent,token=claim['token'],evidence='Original outputs committed, integrated and published'))
         self.assertEqual(run('task_get',dict(project=project,id=task))['status'],'Done')
+        recovered_history='\n'.join(item['text'] for item in run('task_activity',dict(project=project,id=recovery))['items'])
+        original_history='\n'.join(item['text'] for item in run('task_activity',dict(project=project,id=task))['items'])
+        original_code=run('task_get',dict(project=project,id=task))['code']
+        recovery_code=run('task_get',dict(project=project,id=recovery))['code']
+        self.assertIn('Git recovery for '+original_code,recovered_history)
+        self.assertIn('Git delivery ('+recovery_code+')',original_history)
+        self.assertIn('Native recovery verification failed.',recovered_history)
+        self.assertIn('git push · completed (shell exit 0) · Approved execution outside the sandbox',recovered_history)
+        for history in (recovered_history,original_history):
+            self.assertIn('Verified remote refs/heads/main at '+git('rev-parse','main'),history)
 
     def test_changed_acceptance_does_not_reuse_old_intent(self):
         project,root,git,task,branch,recovery=self.failed_commit()

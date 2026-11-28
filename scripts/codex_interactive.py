@@ -15,6 +15,7 @@ from mcp_client import ScrumClient
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import idle_signals
+import git_audit
 
 
 APPROVALS={'item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval'}
@@ -45,10 +46,14 @@ def event(kind,**fields):
     print(json.dumps({'type':kind,**fields}),flush=True)
 
 
-def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=None,signals=None,full_access=False):
+def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=None,signals=None,full_access=False,recovery_task=None):
     owned=rpc is None
     child=None;pending={};messages=queue.Queue();usage={};exit_code=1;items={}
     permission_profile=':danger-full-access' if full_access else 'scrum-worker'
+    thread=None
+    observed_profile=None
+    approved_commands=set()
+    recovery_commands={}
     def send(value):
         child.stdin.write(json.dumps(value)+'\n');child.stdin.flush()
     def request(name,params,key):send({'jsonrpc':'2.0','id':key,'method':name,'params':params})
@@ -85,12 +90,16 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
                     if active and active.get('id')!=permission_profile:
                         raise RuntimeError('Expected permission profile '+permission_profile+', received '+str(active.get('id'))+'; worker inference was not started')
                     thread=result['thread']['id'];event('thread.started',thread_id=thread)
+                    observed_profile=(active or {}).get('id')
+                    if observed_profile is None:
+                        observed_profile={'workspaceWrite':'scrum-worker','readOnly':'scrum-worker',
+                                          'dangerFullAccess':':danger-full-access'}.get((result.get('sandbox') or {}).get('type'))
                     if result.get('model'):event('system',subtype='init',model=result['model'])
                     request('turn/start',{'threadId':thread,'permissions':permission_profile,'input':[{'type':'text','text':prompt}]},'scrum:turn')
             method=message.get('method','');params=message.get('params',{})
             # App-server also broadcasts delegated threads. Their completion must
             # never close the owning worker or replace its answer/usage report.
-            if method in ('item/started','item/completed','thread/tokenUsage/updated','turn/completed') and params.get('threadId')!=thread:
+            if method in ('item/started','item/completed','item/autoApprovalReview/completed','thread/tokenUsage/updated','turn/completed') and params.get('threadId')!=thread:
                 continue
             if 'id' in message and method:
                 keys=[]
@@ -111,6 +120,20 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
                 item=params.get('item',{})
                 if item.get('id') and item.get('type')=='fileChange':items[item['id']]=item
                 if method=='item/completed' and item.get('type')=='agentMessage':event('item.completed',item={'type':'agent_message','text':item.get('text','')})
+                if recovery_task and item.get('type')=='commandExecution':
+                    item_id=item.get('id')
+                    if method=='item/started':
+                        recovery_commands[item_id]=item
+                    else:
+                        recovery_commands.pop(item_id,None)
+                        actions=git_audit.worker(item,observed_profile,item_id in approved_commands)
+                        approved_commands.discard(item_id)
+                        if actions:
+                            git_audit.save_worker(project,actor,recovery_task,actions)
+            elif method=='item/autoApprovalReview/completed':
+                if (recovery_task and params.get('targetItemId') and params.get('action',{}).get('type')=='command'
+                        and params.get('review',{}).get('status')=='approved'):
+                    approved_commands.add(params['targetItemId'])
             elif method=='thread/tokenUsage/updated':
                 total=params.get('tokenUsage',{}).get('total',{})
                 usage={out:total.get(key) for out,key in [('input_tokens','inputTokens'),('output_tokens','outputTokens'),('cached_input_tokens','cachedInputTokens'),('reasoning_output_tokens','reasoningOutputTokens')]}
@@ -128,6 +151,11 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
                         result=approval_result(item['method'],item['params'],['Cancel run']) if item['method'] in APPROVALS else {'answers':{}}
                     elif all(r['state']=='answered' for r in rows):result=approval_result(item['method'],item['params'],[r['answer'] for r in rows])
                     else:continue
+                    approval=item['params']
+                    if (recovery_task and item['method']=='item/commandExecution/requestApproval'
+                            and result.get('decision')=='accept' and approval.get('kind','command')=='command'
+                            and not approval.get('networkApprovalContext')):
+                        approved_commands.add(approval['itemId'])
                     send({'jsonrpc':'2.0','id':callback,'result':result});del pending[callback]
                     items.pop(item['params'].get('itemId'),None)
                     if any(r['state'] in ('expired','cancelled') or r.get('answer')=='Cancel run' for r in rows):
@@ -143,6 +171,10 @@ def run(command,project,actor,cwd,prompt,model='',reviewer='auto_review',rpc=Non
             except subprocess.TimeoutExpired:child.kill();child.wait(timeout=5)
             if child.stdout:child.stdout.close()
         if owned and rpc is not None:rpc.close()
+        for item in recovery_commands.values():
+            actions=git_audit.worker(dict(item,status=None,exitCode=None),None,False)
+            if actions:
+                git_audit.save_worker(project,actor,recovery_task,actions)
 
 
 def main():
@@ -151,13 +183,14 @@ def main():
     parser.add_argument('--cwd',required=True);parser.add_argument('--model',default='')
     parser.add_argument('--signals')
     parser.add_argument('--full-access',action='store_true')
+    parser.add_argument('--recovery-task',type=int)
     parser.add_argument('--reviewer',choices=['user','auto_review'],default='auto_review')
     parser.add_argument('command',nargs=argparse.REMAINDER)
     args=parser.parse_args();command=args.command[1:] if args.command[:1]==['--'] else args.command
     if hasattr(signal,'SIGBREAK'):
         def interrupt(*_):raise KeyboardInterrupt
         signal.signal(signal.SIGBREAK,interrupt)
-    try:return run(command,args.project,args.actor,args.cwd,sys.stdin.buffer.read().decode('utf-8'),args.model,args.reviewer,signals=args.signals,full_access=args.full_access)
+    try:return run(command,args.project,args.actor,args.cwd,sys.stdin.buffer.read().decode('utf-8'),args.model,args.reviewer,signals=args.signals,full_access=args.full_access,recovery_task=args.recovery_task)
     except KeyboardInterrupt:return 130
     except (OSError,ValueError,RuntimeError) as error:event('error',message=str(error)[:700]);return 1
 

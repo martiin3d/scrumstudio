@@ -1174,11 +1174,20 @@ function mountActivity(t){
   async function load(older=false){
     const result=await api('task_activity',{project:selected,id:t.id,...(older&&oldest?{before:oldest}:{})});
     if(!section.isConnected)return;
-    const html=result.items.map(e=>`<article class="activity-entry"><small>${esc(e.kind)} · ${esc(users.find(u=>u.id===e.actor)?.name||'System')} · ${esc(new Date(e.created).toLocaleString())}</small><p>${esc(e.text)}</p></article>`).join('');
+    const html=result.items.map(e=>{
+      const link=e.text.match(/^(Git (?:delivery \(|recovery for ))([^\s).]+-\d+)/u);
+      const related=link&&state.tasks.find(task=>task.code===link[2]);
+      const body=related?`${esc(link[1])}<button type="button" class="link-button" data-git-task="${related.id}">${esc(related.code)}</button>${esc(e.text.slice(link[0].length))}`:esc(e.text);
+      return `<article class="activity-entry"><small>${esc(e.kind)} · ${esc(users.find(u=>u.id===e.actor)?.name||'System')} · ${esc(new Date(e.created).toLocaleString())}</small><p>${body}</p></article>`;
+    }).join('');
     if(older)$('#activity-list').insertAdjacentHTML('afterbegin',html);else $('#activity-list').innerHTML=html||'<p>No activity yet.</p>';
     oldest=result.oldest;$('#activity-older').hidden=!result.has_more;
   }
   $('#activity-older').onclick=()=>load(true).catch(e=>message.textContent=e.message);
+  section.querySelector('#activity-list').onclick=e=>{
+    const button=e.target.closest('[data-git-task]');
+    if(button&&leaveInspector()){editor.close();openTask({id:Number(button.dataset.gitTask)}).catch(error);}
+  };
   $('#activity-add').onclick=async()=>{
     const button=$('#activity-add');button.disabled=true;
     try{await api('task_activity',{project:selected,id:t.id,...credentials(t.id),text:entry.value,kind:section.querySelector('#activity-kind').value});entry.value='';message.textContent='';await load();}

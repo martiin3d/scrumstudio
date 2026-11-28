@@ -15,9 +15,10 @@ def atomic(path,value):
 
 
 class Watch:
-    def __init__(self,log,offset,target,run_id,tasks,policy,client,clock=time.monotonic):
+    def __init__(self,log,offset,target,run_id,tasks,policy,client,clock=time.monotonic,event_sink=None):
         self.log=Path(log);self.offset=offset;self.target=Path(target);self.clock=clock;self.started=clock()
         self.policy={k:policy.get(k,v) for k,v in DEFAULTS.items()}
+        self.event_sink=event_sink
         self.state={'run_id':run_id,'tasks':tasks,'client':client,'tools':0,'output_tokens':None,'input_tokens':None,'cached_input_tokens':None,'limited':False}
         self.tick()
 
@@ -37,6 +38,8 @@ class Watch:
                     try:e=json.loads(line)
                     except ValueError:continue
                     if not isinstance(e,dict):continue
+                    if self.event_sink:
+                        self.event_sink(e)
                     item=e.get('item') or {}
                     if not isinstance(item,dict):item={}
                     if e.get('type')=='item.completed' and item.get('type') in ('command_execution','mcp_tool_call','web_search'):
