@@ -326,3 +326,5 @@ html[data-theme=dark] #chat-error { color: #ffb8ad; }
   .project-chat { grid-template-columns: minmax(0, 1fr); }
   .chat-requests { max-height: none; }
 }
+.settings-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px;padding-bottom:8px;border-bottom:1px solid var(--border-color)}
+.settings-tabs [role=tab][aria-selected=true]{background:var(--selection-bg);color:var(--accent);border-color:currentColor;font-weight:700}
